@@ -13,11 +13,15 @@ use fx_auth::credential_store::CredentialStore as CredentialStoreTrait;
 use fx_bus::{BusStore, SessionBus};
 use fx_config::manager::ConfigManager;
 use fx_config::{
-    parse_log_level as parse_config_log_level, FawxConfig, ImprovementToolsConfig, LoggingConfig,
+    load_provider_model_cache, parse_log_level as parse_config_log_level, FawxConfig,
+    ImprovementToolsConfig, LoggingConfig, ProviderModelCache,
 };
 use fx_consensus::ProgressCallback;
 use fx_core::memory::{MemoryProvider, MemoryStore};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
+use fx_core::tool_routing::{
+    ResourceKind, RouteAdvisory, RouteAdvisoryOutcome, RouteAdvisorySource,
+};
 use fx_core::EventBus;
 use fx_embeddings::EmbeddingModel;
 use fx_fleet::{NodeRegistry, NodeTransport, SshTransport};
@@ -28,13 +32,16 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::context_manager::ContextCompactor;
 use fx_kernel::loop_engine::{LoopEngine, LoopEngineBuilder, ScratchpadProvider};
 use fx_kernel::streaming::{StreamCallback, StreamEvent};
+use fx_kernel::system_prompt::runtime_agent_preferences_from_config;
 use fx_kernel::ErrorCategory;
 use fx_kernel::{
-    AuthorityCoordinator, CachingExecutor, PermissionGateExecutor, PermissionPolicy,
+    AuthorityCoordinator, CachingExecutor, ExecutionRoot, PermissionGateExecutor, PermissionPolicy,
     PermissionPromptState, ProcessConfig, ProcessRegistry, ProposalGateExecutor, ProposalGateState,
+    SharedExecutionRoot,
 };
 use fx_llm::{
-    AnthropicProvider, CompletionRequest, ModelRouter, OpenAiProvider, OpenAiResponsesProvider,
+    AnthropicProvider, CompletionProvider, CompletionRequest, ModelRouter, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
 use fx_loadable::watcher::{ReloadEvent, SkillWatcher};
 use fx_loadable::{
@@ -58,6 +65,7 @@ use std::fs;
 use std::io;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -78,47 +86,15 @@ const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
  raw value), use exactly that format — do not reformat into a 'friendlier' version unless \
  explicitly asked. If they asked a simple question, give a simple answer. If they asked \
  for a listing or search results, present it cleanly formatted.";
-const DEFAULT_ANTHROPIC_MODELS: &[&str] = &[
-    "claude-opus-4-6-20250929",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6-20250929",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5-20251101",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
-    "claude-opus-4-20250514",
-    "claude-sonnet-4-20250514",
-];
-const DEFAULT_OPENAI_MODELS: &[&str] = &[
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "o3",
-    "o4-mini",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-    "gpt-4o",
-    "gpt-4o-mini",
-];
-const DEFAULT_OPENAI_SUBSCRIPTION_MODELS: &[&str] = &[
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.2",
-    "gpt-5.1",
-    "o4-mini",
-];
-const DEFAULT_OPENROUTER_MODELS: &[&str] = &[
-    "openai/gpt-4o-mini",
-    "anthropic/claude-3.5-sonnet",
-    "google/gemini-2.0-flash-001",
-];
 const DEFAULT_FILE_LEVEL: &str = "info";
 const DEFAULT_STDERR_LEVEL: &str = "warn";
 const DEFAULT_MAX_LOG_FILES: usize = 7;
 const DEFAULT_LOG_DIR: &str = "~/.fawx/logs";
 const LOG_FILE_PREFIX: &str = "fawx";
 const LOG_FILE_SUFFIX: &str = "log";
+// Startup only needs a bounded slice of recent routing outcomes to break ties;
+// keeping the newest 128 entries caps lock hold time and avoids stale history.
+const MAX_ROUTE_ADVISORY_ENTRIES: usize = 128;
 
 pub(crate) type SharedMemoryStore = Arc<Mutex<dyn MemoryStore>>;
 pub(crate) type SharedEmbeddingIndex = Arc<Mutex<EmbeddingIndex>>;
@@ -373,6 +349,7 @@ pub struct LoopEngineBundle {
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
+    pub execution_root: SharedExecutionRoot,
     /// Signature policy loaded once at startup, shared with skill watcher.
     pub signature_policy: SignaturePolicy,
     pub cron_store: Option<fx_cron::SharedCronStore>,
@@ -389,6 +366,8 @@ pub struct LoopEngineBundle {
 pub struct HeadlessLoopBuildOptions {
     pub working_dir: Option<PathBuf>,
     pub memory_enabled: bool,
+    pub disable_skill_watcher: bool,
+    pub signal_session_id: Option<String>,
     pub subagent_control: Option<Arc<dyn SubagentControl>>,
     pub config_manager: Option<Arc<Mutex<ConfigManager>>>,
     pub cancel_token: Option<CancellationToken>,
@@ -399,6 +378,7 @@ pub struct HeadlessLoopBuildOptions {
     pub ripcord_journal: Option<Arc<RipcordJournal>>,
     pub credential_store: Option<SharedCredentialStore>,
     pub token_broker: Option<SharedTokenBroker>,
+    pub cron_store: Option<fx_cron::SharedCronStore>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -408,6 +388,8 @@ impl HeadlessLoopBuildOptions {
         Self {
             working_dir: None,
             memory_enabled: true,
+            disable_skill_watcher: false,
+            signal_session_id: None,
             subagent_control: Some(subagent_control),
             config_manager: None,
             cancel_token: None,
@@ -418,6 +400,7 @@ impl HeadlessLoopBuildOptions {
             ripcord_journal: None,
             credential_store: None,
             token_broker: None,
+            cron_store: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -427,6 +410,8 @@ impl HeadlessLoopBuildOptions {
         Self {
             working_dir,
             memory_enabled: false,
+            disable_skill_watcher: false,
+            signal_session_id: None,
             subagent_control: None,
             config_manager: None,
             cancel_token: Some(cancel_token),
@@ -437,6 +422,7 @@ impl HeadlessLoopBuildOptions {
             ripcord_journal: None,
             credential_store: None,
             token_broker: None,
+            cron_store: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -446,7 +432,9 @@ impl HeadlessLoopBuildOptions {
 #[derive(Clone)]
 struct SkillRegistryBuildOptions {
     working_dir: PathBuf,
+    execution_root: SharedExecutionRoot,
     memory_enabled: bool,
+    disable_skill_watcher: bool,
     subagent_control: Option<Arc<dyn SubagentControl>>,
     config_manager: Option<Arc<Mutex<ConfigManager>>>,
     experiment_progress: Option<ProgressCallback>,
@@ -456,6 +444,7 @@ struct SkillRegistryBuildOptions {
     stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
     credential_store: Option<SharedCredentialStore>,
     token_broker: Option<SharedTokenBroker>,
+    cron_store: Option<fx_cron::SharedCronStore>,
     #[cfg(feature = "http")]
     experiment_registry: Option<SharedExperimentRegistry>,
 }
@@ -517,6 +506,7 @@ fn build_loop_engine_with_options(
 ) -> Result<LoopEngineBundle, StartupError> {
     let event_bus = EventBus::new(EVENT_BUS_CAPACITY);
     let stream_callback_slot = Arc::new(std::sync::Mutex::new(None));
+    let runtime_skill_prompt_revision = Arc::new(AtomicU64::new(0));
     let kernel_budget = BudgetConfig::default();
     let budget = BudgetTracker::new(kernel_budget.clone(), current_time_ms(), 0);
     let context = ContextCompactor::new(DEFAULT_CONTEXT_MAX_TOKENS, DEFAULT_CONTEXT_COMPACT_TARGET);
@@ -526,14 +516,22 @@ fn build_loop_engine_with_options(
         &kernel_budget,
         Arc::clone(&stream_callback_slot),
     );
+    let execution_root = Arc::clone(&registry_options.execution_root);
     let working_dir = registry_options.working_dir.clone();
     let improvement_provider_for_bundle = improvement_provider.clone();
-    let skills = build_skill_registry(&data_dir, &config, improvement_provider, registry_options);
+    let skills = build_skill_registry(
+        &data_dir,
+        &config,
+        improvement_provider,
+        registry_options,
+        Arc::clone(&runtime_skill_prompt_revision),
+    );
     let synthesis = config
         .model
         .synthesis_instruction
         .clone()
         .unwrap_or_else(|| DEFAULT_SYNTHESIS_INSTRUCTION.to_string());
+    let agent_preferences = runtime_agent_preferences_from_config(&config.agent);
 
     let bridge: Arc<dyn ScratchpadProvider> = Arc::new(ScratchpadBridge {
         scratchpad: Arc::clone(&skills.scratchpad),
@@ -549,7 +547,11 @@ fn build_loop_engine_with_options(
         &config.permissions,
     );
     let proposals_dir = data_dir.join("proposals");
-    let gate_state = ProposalGateState::new(self_modify_config, working_dir.clone(), proposals_dir);
+    let gate_state = ProposalGateState::with_execution_root(
+        self_modify_config,
+        Arc::clone(&execution_root),
+        proposals_dir,
+    );
     let permission_policy = permissions_to_policy(&config.permissions);
     let authority = Arc::new(AuthorityCoordinator::new(permission_policy, gate_state));
     authority.attach_runtime_info(Arc::clone(&skills.runtime_info));
@@ -577,15 +579,35 @@ fn build_loop_engine_with_options(
         .max_iterations(config.general.max_iterations)
         .tool_executor(Arc::clone(&tool_executor))
         .synthesis_instruction(synthesis)
+        .agent_preferences(agent_preferences.unwrap_or_default())
         .event_bus(event_bus.clone())
         .iteration_counter(Arc::clone(&skills.iteration_counter))
         .session_memory(Arc::clone(&skills.session_memory))
-        .scratchpad_provider(bridge);
+        .runtime_info(Arc::clone(&skills.runtime_info))
+        .scratchpad_provider(bridge)
+        .runtime_skill_prompt_revision(Arc::clone(&runtime_skill_prompt_revision));
+    if let Some(session_id) = options.signal_session_id.as_deref() {
+        match SignalStore::open(&data_dir, session_id) {
+            Ok(signal_store) => {
+                builder = builder.signal_store(signal_store);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "signal store unavailable; continuing without persistent signal history"
+                );
+            }
+        }
+    }
     if let Some(cancel_token) = options.cancel_token {
         builder = builder.cancel_token(cancel_token);
     }
     if let Some(snapshot_text) = skills.memory_snapshot {
         builder = builder.memory_context(snapshot_text);
+    }
+    if let Some(journal) = &skills.journal {
+        builder = builder.route_advisories(load_route_advisories_from_journal(journal));
     }
     let thinking_budget = config.general.thinking.unwrap_or_default();
     let model_id = config.model.default_model.as_deref().unwrap_or("");
@@ -612,6 +634,7 @@ fn build_loop_engine_with_options(
         tool_executor,
         credential_store: skills.credential_store,
         config_manager: options.config_manager.clone(),
+        execution_root,
         signature_policy: skills.signature_policy,
         cron_store: skills.cron_store,
         startup_warnings: skills.startup_warnings,
@@ -628,12 +651,15 @@ fn build_skill_registry_options(
     kernel_budget: &BudgetConfig,
     stream_callback_slot: Arc<std::sync::Mutex<Option<StreamCallback>>>,
 ) -> SkillRegistryBuildOptions {
+    let working_dir = options
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| configured_working_dir(config));
     SkillRegistryBuildOptions {
-        working_dir: options
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| configured_working_dir(config)),
+        execution_root: Arc::new(ExecutionRoot::new(working_dir.clone())),
+        working_dir,
         memory_enabled: options.memory_enabled,
+        disable_skill_watcher: options.disable_skill_watcher,
         subagent_control: options.subagent_control.clone(),
         config_manager: options.config_manager.clone(),
         experiment_progress: options.experiment_progress.clone(),
@@ -643,6 +669,7 @@ fn build_skill_registry_options(
         stream_callback_slot,
         credential_store: options.credential_store.clone(),
         token_broker: options.token_broker.clone(),
+        cron_store: options.cron_store.clone(),
         #[cfg(feature = "http")]
         experiment_registry: options.experiment_registry.clone(),
     }
@@ -713,6 +740,18 @@ pub(crate) fn open_credential_store(data_dir: &Path) -> Result<SharedCredentialS
     .map(Arc::new)
 }
 
+pub(crate) fn credential_provider_from_store(
+    data_dir: &Path,
+    credential_store: SharedCredentialStore,
+    token_broker: Option<SharedTokenBroker>,
+) -> Arc<dyn CredentialProvider> {
+    Arc::new(CredentialStoreBridge {
+        data_dir: data_dir.to_path_buf(),
+        store: credential_store,
+        token_broker,
+    }) as Arc<dyn CredentialProvider>
+}
+
 pub(crate) fn build_token_broker(
     config: &FawxConfig,
     credential_store: Option<&SharedCredentialStore>,
@@ -732,6 +771,78 @@ fn build_loop_engine_from_builder(builder: LoopEngineBuilder) -> Result<LoopEngi
             error.stage, error.reason
         ))
     })
+}
+
+fn load_route_advisories_from_journal(
+    journal: &Arc<Mutex<fx_journal::Journal>>,
+) -> Vec<RouteAdvisory> {
+    let journal = journal.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("journal mutex was poisoned during route advisory load; recovering");
+        poisoned.into_inner()
+    });
+
+    journal
+        .list(Some(MAX_ROUTE_ADVISORY_ENTRIES))
+        .into_iter()
+        .filter_map(parse_route_advisory_entry)
+        .collect()
+}
+
+fn parse_route_advisory_entry(entry: &fx_journal::JournalEntry) -> Option<RouteAdvisory> {
+    // Advisory routing memory must be explicit and typed. Free-form journal prose
+    // never influences the planner unless the entry opts into the routing tags.
+    if !entry
+        .tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "routing" | "route-advisory"))
+    {
+        return None;
+    }
+
+    let tool_name = entry
+        .tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("tool:"))
+        .map(str::trim)
+        .filter(|tool_name| !tool_name.is_empty())?
+        .to_string();
+    let outcome = parse_route_advisory_outcome(&entry.tags);
+    let resource_kind = parse_route_advisory_resource_kind(&entry.applies_to)?;
+
+    Some(RouteAdvisory {
+        resource_kind,
+        tool_name: Some(tool_name),
+        outcome,
+        source: RouteAdvisorySource::Journal,
+        note: entry.lesson.clone(),
+        observed_at_ms: entry.timestamp,
+    })
+}
+
+fn parse_route_advisory_outcome(tags: &[String]) -> RouteAdvisoryOutcome {
+    if tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "outcome:success" | "route-success"))
+    {
+        return RouteAdvisoryOutcome::Prefer;
+    }
+    if tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "outcome:failure" | "route-failure"))
+    {
+        return RouteAdvisoryOutcome::Avoid;
+    }
+    // Missing outcome tags still preserve a typed advisory record, but the
+    // neutral outcome keeps ranking unchanged until a stronger signal exists.
+    RouteAdvisoryOutcome::Neutral
+}
+
+fn parse_route_advisory_resource_kind(applies_to: &str) -> Option<ResourceKind> {
+    let normalized = applies_to
+        .trim()
+        .strip_prefix("routing:")
+        .unwrap_or(applies_to.trim());
+    normalized.parse::<ResourceKind>().ok()
 }
 
 /// Bridges `fx_scratchpad::Scratchpad` into the kernel's [`ScratchpadProvider`]
@@ -948,6 +1059,7 @@ fn build_skill_registry(
     config: &FawxConfig,
     improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,
     options: SkillRegistryBuildOptions,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) -> SkillRegistryBundle {
     let permission_policy = permissions_to_policy(&config.permissions);
     let tool_config = ToolConfig {
@@ -957,10 +1069,10 @@ fn build_skill_registry(
             || permission_policy.ask_required.contains("outside_workspace"),
         ..ToolConfig::default()
     };
-    let process_registry = Arc::new(ProcessRegistry::new(ProcessConfig {
-        allowed_dirs: vec![options.working_dir.clone()],
-        ..ProcessConfig::default()
-    }));
+    let process_registry = Arc::new(ProcessRegistry::new_with_execution_root(
+        ProcessConfig::default(),
+        Some(Arc::clone(&options.execution_root)),
+    ));
     ProcessRegistry::spawn_cleanup_task(&process_registry);
     let mut startup_warnings = Vec::new();
     let executor = build_tool_executor(&options, tool_config, process_registry)
@@ -992,7 +1104,7 @@ fn build_skill_registry(
         executor = executor.with_subagent_control(control);
     }
     if let Ok(auth_manager) = load_auth_manager() {
-        match build_router(&auth_manager) {
+        match build_router_for_data_dir(&auth_manager, data_dir) {
             Ok(router) => {
                 executor = executor.with_experiment(ExperimentToolState {
                     chain_path: data_dir.join("consensus").join("chain.json"),
@@ -1028,7 +1140,8 @@ fn build_skill_registry(
     )));
     let notify_skill = NotifySkill::new(notify_sender);
     registry.register(Arc::new(notify_skill));
-    let tx_skill = TransactionSkill::new(options.working_dir.clone(), sm.clone());
+    let tx_skill =
+        TransactionSkill::with_execution_root(Arc::clone(&options.execution_root), sm.clone());
     registry.register(Arc::new(tx_skill));
     let scratchpad = Arc::new(Mutex::new(Scratchpad::new()));
     let iteration_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1075,11 +1188,11 @@ fn build_skill_registry(
 
     let credential_provider: Option<Arc<dyn CredentialProvider>> =
         credential_store.as_ref().map(|store| {
-            Arc::new(CredentialStoreBridge {
-                data_dir: data_dir.to_path_buf(),
-                store: Arc::clone(store),
-                token_broker: options.token_broker.clone(),
-            }) as Arc<dyn CredentialProvider>
+            credential_provider_from_store(
+                data_dir,
+                Arc::clone(store),
+                options.token_broker.clone(),
+            )
         });
 
     // Wire GitSkill with GitHub token provider from credential bridge.
@@ -1088,8 +1201,9 @@ fn build_skill_registry(
             std::sync::Arc::new(move || cp.get_credential("github_token"))
                 as std::sync::Arc<dyn Fn() -> Option<zeroize::Zeroizing<String>> + Send + Sync>
         });
-    let git_skill = GitSkill::new(options.working_dir.clone(), sm, github_token_fn)
-        .with_protected_branches(config.git.protected_branches.clone());
+    let git_skill =
+        GitSkill::with_execution_root(Arc::clone(&options.execution_root), sm, github_token_fn)
+            .with_protected_branches(config.git.protected_branches.clone());
     registry.register(Arc::new(git_skill));
 
     let skills_dir = data_dir.join("skills");
@@ -1121,11 +1235,8 @@ fn build_skill_registry(
 
     // Register cron/scheduler skill.
     let cron_store_path = data_dir.join("cron.redb");
-    let cron_store = match open_with_retry("cron store", &cron_store_path, || {
-        fx_cron::CronStore::open(&cron_store_path)
-    }) {
-        Ok(store) => {
-            let arc = Arc::new(tokio::sync::Mutex::new(store));
+    let cron_store = match options.cron_store.clone() {
+        Some(arc) => {
             let cron_skill = Arc::new(fx_tools::CronSkill::new(
                 Arc::clone(&arc),
                 options.session_bus.clone(),
@@ -1133,23 +1244,43 @@ fn build_skill_registry(
             registry.register(cron_skill);
             Some(arc)
         }
-        Err(error) => {
-            tracing::warn!(error = %error, "cron store unavailable");
-            startup_warnings.push(StartupWarning {
-                category: ErrorCategory::System,
-                message: format!("Cron store unavailable: {error}"),
-            });
-            None
-        }
+        None => match open_with_retry("cron store", &cron_store_path, || {
+            fx_cron::CronStore::open(&cron_store_path)
+        }) {
+            Ok(store) => {
+                let arc = Arc::new(tokio::sync::Mutex::new(store));
+                let cron_skill = Arc::new(fx_tools::CronSkill::new(
+                    Arc::clone(&arc),
+                    options.session_bus.clone(),
+                ));
+                registry.register(cron_skill);
+                Some(arc)
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "cron store unavailable");
+                startup_warnings.push(StartupWarning {
+                    category: ErrorCategory::System,
+                    message: format!("Cron store unavailable: {error}"),
+                });
+                None
+            }
+        },
     };
 
-    apply_skill_summaries(&runtime_info, registry.as_ref());
-    start_skill_watcher(
-        skills_dir,
-        Arc::clone(&registry),
-        lifecycle,
-        Arc::clone(&runtime_info),
+    apply_skill_summaries(
+        &runtime_info,
+        registry.as_ref(),
+        runtime_skill_prompt_revision.as_ref(),
     );
+    if !options.disable_skill_watcher {
+        start_skill_watcher(
+            skills_dir,
+            Arc::clone(&registry),
+            lifecycle,
+            Arc::clone(&runtime_info),
+            Arc::clone(&runtime_skill_prompt_revision),
+        );
+    }
 
     SkillRegistryBundle {
         registry,
@@ -1174,6 +1305,7 @@ fn start_skill_watcher(
     registry: Arc<SkillRegistry>,
     lifecycle: Arc<Mutex<SkillLifecycleManager>>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) {
     if let Err(error) = fs::create_dir_all(&skills_dir) {
         tracing::warn!(path = %skills_dir.display(), error = %error, "failed to create skills directory for watcher");
@@ -1192,6 +1324,7 @@ fn start_skill_watcher(
         reload_event_rx,
         runtime_info,
         registry,
+        runtime_skill_prompt_revision,
     ));
     handle.spawn(async move {
         if let Err(error) = skill_watcher.run().await {
@@ -1204,10 +1337,15 @@ async fn handle_skill_reload_events(
     mut reload_event_rx: mpsc::Receiver<ReloadEvent>,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     registry: Arc<SkillRegistry>,
+    runtime_skill_prompt_revision: Arc<AtomicU64>,
 ) {
     while let Some(event) = reload_event_rx.recv().await {
         log_skill_reload_event(&event);
-        apply_skill_summaries(&runtime_info, registry.as_ref());
+        apply_skill_summaries(
+            &runtime_info,
+            registry.as_ref(),
+            runtime_skill_prompt_revision.as_ref(),
+        );
     }
 }
 
@@ -1254,6 +1392,7 @@ fn build_tool_executor(
     process_registry: Arc<ProcessRegistry>,
 ) -> FawxToolExecutor {
     let executor = FawxToolExecutor::new(options.working_dir.clone(), tool_config)
+        .with_execution_root(Arc::clone(&options.execution_root))
         .with_process_registry(process_registry)
         .with_kernel_budget(options.kernel_budget.clone());
     #[cfg(feature = "http")]
@@ -1325,7 +1464,7 @@ fn wire_improvement_tools(
     provider: Arc<dyn fx_llm::CompletionProvider + Send + Sync>,
     config: &ImprovementToolsConfig,
 ) -> Result<ImprovementToolsState, String> {
-    let signal_store = SignalStore::new(data_dir, "improvement-analysis")
+    let signal_store = SignalStore::open(data_dir, "improvement-analysis")
         .map_err(|e| format!("signal store for improvement tools: {e}"))?;
     Ok(ImprovementToolsState::new(
         Arc::new(signal_store),
@@ -1563,7 +1702,11 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
     }))
 }
 
-fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &SkillRegistry) {
+fn apply_skill_summaries(
+    runtime_info: &Arc<RwLock<RuntimeInfo>>,
+    registry: &SkillRegistry,
+    runtime_skill_prompt_revision: &AtomicU64,
+) {
     let skills = registry
         .skill_statuses()
         .into_iter()
@@ -1577,6 +1720,7 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
                 name: status.name,
                 description: Some(status.description),
                 tool_names: status.tool_names,
+                routing_tools: status.routing_tools,
                 capabilities: status.capabilities,
                 version: Some(version),
                 source: Some(status.activation.source.display()),
@@ -1590,7 +1734,10 @@ fn apply_skill_summaries(runtime_info: &Arc<RwLock<RuntimeInfo>>, registry: &Ski
         .collect::<Vec<_>>();
 
     match runtime_info.write() {
-        Ok(mut info) => info.skills = skills,
+        Ok(mut info) => {
+            info.skills = skills;
+            runtime_skill_prompt_revision.fetch_add(1, Ordering::Release);
+        }
         Err(error) => eprintln!("warning: runtime info lock poisoned: {error}"),
     }
 }
@@ -1642,6 +1789,8 @@ impl fx_llm::CompletionProvider for OwnedRouterProvider {
         fx_llm::ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
+            prompt_cache: Default::default(),
+            prompt_cache_affinity: Default::default(),
         }
     }
 }
@@ -1863,7 +2012,8 @@ pub fn build_improvement_provider(
     if !config.improvement.enabled {
         return None;
     }
-    match build_router(auth_manager) {
+    let data_dir = configured_data_dir(&fawx_data_dir(), config);
+    match build_router_for_data_dir(auth_manager, &data_dir) {
         Ok(router) => Some(Arc::new(OwnedRouterProvider { router })),
         Err(e) => {
             eprintln!("warning: improvement tools LLM unavailable: {e}");
@@ -1873,11 +2023,36 @@ pub fn build_improvement_provider(
 }
 
 pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupError> {
+    build_router_with_model_cache(auth_manager, &ProviderModelCache::default())
+}
+
+pub fn build_router_for_data_dir(
+    auth_manager: &AuthManager,
+    data_dir: &Path,
+) -> Result<ModelRouter, StartupError> {
+    let model_cache = match load_provider_model_cache(data_dir) {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::warn!(path = %data_dir.display(), error = %error, "failed to load provider model cache");
+            ProviderModelCache::default()
+        }
+    };
+    build_router_with_model_cache(auth_manager, &model_cache)
+}
+
+pub fn build_router_with_model_cache(
+    auth_manager: &AuthManager,
+    model_cache: &ProviderModelCache,
+) -> Result<ModelRouter, StartupError> {
     let mut router = ModelRouter::new();
 
     for provider in auth_manager.providers() {
         if let Some(auth_method) = auth_manager.get(&provider) {
-            register_auth_provider(&mut router, auth_method)?;
+            register_auth_provider(
+                &mut router,
+                auth_method,
+                model_cache.models_for(auth_method.provider_name()),
+            )?;
         }
     }
 
@@ -1887,25 +2062,24 @@ pub fn build_router(auth_manager: &AuthManager) -> Result<ModelRouter, StartupEr
 fn register_auth_provider(
     router: &mut ModelRouter,
     auth_method: &AuthMethod,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
-    register_auth_provider_with_models(router, auth_method, default_supported_models(auth_method))
+    register_auth_provider_with_models(router, auth_method, supported_models)
 }
 
 fn register_auth_provider_with_models(
     router: &mut ModelRouter,
     auth_method: &AuthMethod,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
-    let models = ensure_supported_models(auth_method, supported_models);
-
     match auth_method {
         AuthMethod::SetupToken { token } => {
             // Setup tokens (sk-ant-oat...) are usable directly with the Messages API
             // via Bearer auth. AnthropicProvider::detect() handles the auth mode.
-            register_keyed_provider(router, "anthropic", token, "setup_token", models)?;
+            register_keyed_provider(router, "anthropic", token, "setup_token", supported_models)?;
         }
         AuthMethod::ApiKey { provider, key } => {
-            register_api_key_provider(router, provider, key, models)?;
+            register_api_key_provider(router, provider, key, supported_models)?;
         }
         AuthMethod::OAuth {
             provider,
@@ -1918,7 +2092,7 @@ fn register_auth_provider_with_models(
                 provider,
                 access_token,
                 account_id.as_deref(),
-                models,
+                supported_models,
             )?;
         }
     }
@@ -1930,7 +2104,7 @@ fn register_api_key_provider(
     router: &mut ModelRouter,
     provider: &str,
     key: &str,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     register_keyed_provider(router, provider, key, "api_key", supported_models)
 }
@@ -1940,24 +2114,27 @@ fn register_keyed_provider(
     provider: &str,
     key: &str,
     auth_label: &str,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     if provider == "anthropic" {
         let anthropic = AnthropicProvider::new(base_url_for_provider("anthropic"), key.to_string())
             .map_err(|error| {
                 StartupError::Router(format!("failed to configure Anthropic provider: {error}"))
-            })?
-            .with_supported_models(supported_models);
+            })?;
+        let resolved_models = resolve_supported_models(&anthropic, supported_models);
+        let anthropic = anthropic.with_supported_models(resolved_models);
         router.register_provider(Box::new(anthropic));
         return Ok(());
     }
 
-    let provider_client = build_openai_provider(provider, key, auth_label, supported_models)
-        .map_err(|error| {
-            StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-        })?;
+    let provider_client = build_openai_provider(provider, key, auth_label).map_err(|error| {
+        StartupError::Router(format!("failed to configure {provider} provider: {error}"))
+    })?;
+    let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-    router.register_provider(Box::new(provider_client));
+    router.register_provider(Box::new(
+        provider_client.with_supported_models(resolved_models),
+    ));
     Ok(())
 }
 
@@ -1966,7 +2143,7 @@ fn register_oauth_provider(
     provider: &str,
     access_token: &str,
     account_id: Option<&str>,
-    supported_models: Vec<String>,
+    supported_models: Option<Vec<String>>,
 ) -> Result<(), StartupError> {
     if let Some(account_id) = account_id {
         let provider_client =
@@ -1975,21 +2152,24 @@ fn register_oauth_provider(
                     StartupError::Router(format!(
                         "failed to configure {provider} Responses provider: {error}"
                     ))
-                })?
-                .with_supported_models(supported_models);
+                })?;
+        let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-        router.register_provider(Box::new(provider_client));
+        router.register_provider(Box::new(
+            provider_client.with_supported_models(resolved_models),
+        ));
         return Ok(());
     }
 
     let provider_client =
-        build_openai_provider(provider, access_token, "subscription", supported_models).map_err(
-            |error| {
-                StartupError::Router(format!("failed to configure {provider} provider: {error}"))
-            },
-        )?;
+        build_openai_provider(provider, access_token, "subscription").map_err(|error| {
+            StartupError::Router(format!("failed to configure {provider} provider: {error}"))
+        })?;
+    let resolved_models = resolve_supported_models(&provider_client, supported_models);
 
-    router.register_provider(Box::new(provider_client));
+    router.register_provider(Box::new(
+        provider_client.with_supported_models(resolved_models),
+    ));
     Ok(())
 }
 
@@ -1997,17 +2177,15 @@ fn build_openai_provider(
     provider: &str,
     credential: &str,
     auth_method: &str,
-    supported_models: Vec<String>,
 ) -> Result<OpenAiProvider, fx_llm::ProviderError> {
     let base_url = base_url_for_provider(provider);
     let provider = match provider {
         "openai" => OpenAiProvider::openai(base_url, credential.to_string())?,
         "openrouter" => OpenAiProvider::openrouter(base_url, credential.to_string())?,
+        "fireworks" => OpenAiProvider::fireworks(base_url, credential.to_string())?,
         _ => OpenAiProvider::compatible(base_url, credential.to_string(), provider.to_string())?,
     };
-    Ok(provider
-        .with_auth_method(canonical_auth_method(auth_method))
-        .with_supported_models(supported_models))
+    Ok(provider.with_auth_method(canonical_auth_method(auth_method)))
 }
 
 fn canonical_auth_method(auth_method: &str) -> &'static str {
@@ -2019,30 +2197,24 @@ fn canonical_auth_method(auth_method: &str) -> &'static str {
     }
 }
 
-fn default_supported_models(auth_method: &AuthMethod) -> Vec<String> {
-    match auth_method {
-        AuthMethod::SetupToken { .. } => to_strings(DEFAULT_ANTHROPIC_MODELS),
-        AuthMethod::ApiKey { provider, .. } => models_for_provider(provider),
-        AuthMethod::OAuth {
-            account_id,
-            provider,
-            ..
-        } => {
-            if account_id.is_some() {
-                to_strings(DEFAULT_OPENAI_SUBSCRIPTION_MODELS)
-            } else {
-                models_for_provider(provider)
-            }
-        }
+fn resolve_supported_models(
+    provider: &dyn CompletionProvider,
+    supported_models: Option<Vec<String>>,
+) -> Vec<String> {
+    // Provider fallbacks are startup safety rails, not just defaults for an
+    // empty cache. Cached dynamic catalogs extend that baseline so stale cache
+    // entries cannot hide configured defaults such as OpenRouter GLM 5.1.
+    let mut models = provider
+        .fallback_models()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(supported_models) = supported_models {
+        models.extend(supported_models);
     }
-}
-
-fn ensure_supported_models(auth_method: &AuthMethod, supported_models: Vec<String>) -> Vec<String> {
-    if supported_models.is_empty() {
-        default_supported_models(auth_method)
-    } else {
-        supported_models
-    }
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn base_url_for_provider(provider: &str) -> String {
@@ -2061,24 +2233,12 @@ fn base_url_for_provider(provider: &str) -> String {
         "anthropic" => "https://api.anthropic.com".to_string(),
         "openrouter" => "https://openrouter.ai/api".to_string(),
         "openai" => "https://api.openai.com".to_string(),
+        "fireworks" => "https://api.fireworks.ai/inference/v1".to_string(),
         _ => std::env::var("FAWX_OPENAI_COMPAT_BASE_URL")
             .ok()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(|| "https://api.openai.com".to_string()),
     }
-}
-
-fn models_for_provider(provider: &str) -> Vec<String> {
-    match provider {
-        "anthropic" => to_strings(DEFAULT_ANTHROPIC_MODELS),
-        "openrouter" => to_strings(DEFAULT_OPENROUTER_MODELS),
-        "openai" => to_strings(DEFAULT_OPENAI_MODELS),
-        _ => vec!["gpt-4o-mini".to_string()],
-    }
-}
-
-fn to_strings(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 fn current_time_ms() -> u64 {
@@ -2123,11 +2283,19 @@ fn permissions_to_policy(config: &fx_config::PermissionsConfig) -> PermissionPol
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use fx_config::manager::ConfigManager;
     use fx_core::memory::MemoryProvider;
+    use fx_core::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolReadinessSummary,
+        ToolRoutingMetadata, ToolRoutingSummary,
+    };
     use fx_embeddings::test_support::create_test_model_dir;
+    use fx_llm::ToolDefinition;
     use fx_loadable::test_support::write_test_skill;
+    use fx_loadable::Skill;
     use fx_subagent::test_support::StubSubagentControl;
+    use fx_tools::CronSkill;
     use std::cell::Cell;
     use std::io;
     use std::io::Write;
@@ -2226,6 +2394,55 @@ mod tests {
         .expect("skill watcher should register the new skill");
     }
 
+    #[derive(Debug)]
+    struct RoutingTestSkill;
+
+    #[async_trait]
+    impl Skill for RoutingTestSkill {
+        fn name(&self) -> &str {
+            "browser"
+        }
+
+        fn description(&self) -> &str {
+            "Browser skill"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "web_fetch".to_string(),
+                description: "Fetch a web page".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+            vec![ToolRoutingSummary {
+                tool_name: "web_fetch".to_string(),
+                metadata: ToolRoutingMetadata {
+                    resource_kinds: vec![ResourceKind::GenericUrl],
+                    operations: vec![RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                },
+                readiness: ToolReadinessSummary {
+                    available: true,
+                    ready: true,
+                    readiness_reason: None,
+                },
+            }]
+        }
+
+        async fn execute(
+            &self,
+            _tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, String>> {
+            None
+        }
+    }
+
     fn test_fleet_node_config() -> fx_config::NodeConfig {
         fx_config::NodeConfig {
             id: "build-node".to_string(),
@@ -2237,6 +2454,181 @@ mod tests {
             user: Some("joseph".to_string()),
             ssh_key: Some("~/.ssh/id_ed25519".to_string()),
         }
+    }
+
+    #[test]
+    fn apply_skill_summaries_surfaces_builtin_skill_descriptions() {
+        let (config, temp_dir) = test_config_with_temp_dir();
+        let root = temp_dir.path();
+        let registry = SkillRegistry::new();
+
+        registry.register(Arc::new(GitSkill::new(root.to_path_buf(), None, None)));
+
+        let cron_store = fx_cron::CronStore::open(&root.join("cron.redb")).expect("cron store");
+        registry.register(Arc::new(CronSkill::new(
+            Arc::new(tokio::sync::Mutex::new(cron_store)),
+            None,
+        )));
+
+        registry.register(Arc::new(SessionMemorySkill::new(Arc::new(Mutex::new(
+            fx_session::SessionMemory::default(),
+        )))));
+        registry.register(Arc::new(TransactionSkill::new(root.to_path_buf(), None)));
+        registry.register(Arc::new(BuiltinToolsSkill::new(FawxToolExecutor::new(
+            root.to_path_buf(),
+            ToolConfig::default(),
+        ))));
+        registry.register(Arc::new(ScratchpadSkill::new(
+            Arc::new(Mutex::new(Scratchpad::new())),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        )));
+
+        let journal = fx_journal::Journal::load(root.join("journal.jsonl")).expect("journal");
+        registry.register(Arc::new(JournalSkill::new(Arc::new(Mutex::new(journal)))));
+
+        let runtime_info = new_runtime_info(&config, false);
+        let runtime_skill_prompt_revision = AtomicU64::new(0);
+        apply_skill_summaries(&runtime_info, &registry, &runtime_skill_prompt_revision);
+
+        let runtime_info = runtime_info.read().expect("runtime info");
+        let expected = [
+            (
+                "git",
+                "Inspect and manage git repos, branches, merges, pushes, and pull requests.",
+            ),
+            (
+                "cron",
+                "Schedule, inspect, run, and remove recurring cron jobs.",
+            ),
+            (
+                "session_memory",
+                "Keep durable session context about the project, decisions, and active files.",
+            ),
+            (
+                "transaction_skill",
+                "Stage multi-file edits and commit or roll them back as one transaction.",
+            ),
+            (
+                "fawx-builtin",
+                "Use core local tools like file, shell, search, time, and memory operations.",
+            ),
+            (
+                "scratchpad",
+                "Keep working notes, hypotheses, observations, and conclusions during a task.",
+            ),
+            (
+                "journal",
+                "Record and search lessons and prior session context.",
+            ),
+        ];
+
+        for (name, description) in expected {
+            let skill = runtime_info
+                .skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .unwrap_or_else(|| panic!("missing runtime skill summary for {name}"));
+            assert_eq!(skill.description.as_deref(), Some(description));
+        }
+    }
+
+    #[test]
+    fn apply_skill_summaries_carries_routing_tool_readiness() {
+        let (config, temp_dir) = test_config_with_temp_dir();
+        let registry = SkillRegistry::new();
+        registry.register(Arc::new(RoutingTestSkill));
+
+        let runtime_info = new_runtime_info(&config, false);
+        let runtime_skill_prompt_revision = AtomicU64::new(0);
+        apply_skill_summaries(&runtime_info, &registry, &runtime_skill_prompt_revision);
+
+        let runtime_info = runtime_info.read().expect("runtime info");
+        let skill = runtime_info
+            .skills
+            .iter()
+            .find(|skill| skill.name == "browser")
+            .expect("browser skill");
+
+        assert_eq!(skill.routing_tools.len(), 1);
+        assert_eq!(skill.routing_tools[0].tool_name, "web_fetch");
+        assert!(skill.routing_tools[0].readiness.ready);
+        assert_eq!(
+            skill.routing_tools[0].metadata.resource_kinds,
+            vec![ResourceKind::GenericUrl]
+        );
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn load_route_advisories_from_journal_ignores_unstructured_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut journal =
+            fx_journal::Journal::load(temp_dir.path().join("journal.jsonl")).expect("journal");
+        journal
+            .write(
+                "Prefer small review batches".to_string(),
+                vec!["review".to_string()],
+                "github_pull_request".to_string(),
+                None,
+            )
+            .expect("write entry");
+        let journal = Arc::new(Mutex::new(journal));
+
+        let advisories = load_route_advisories_from_journal(&journal);
+        assert!(advisories.is_empty());
+    }
+
+    #[test]
+    fn load_route_advisories_from_journal_parses_structured_routing_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut journal =
+            fx_journal::Journal::load(temp_dir.path().join("journal.jsonl")).expect("journal");
+        let entry = journal
+            .write(
+                "Probe file inventory first".to_string(),
+                vec![
+                    "routing".to_string(),
+                    "outcome:success".to_string(),
+                    "tool:list_pr_files".to_string(),
+                ],
+                "github_pull_request".to_string(),
+                None,
+            )
+            .expect("write entry");
+        let journal = Arc::new(Mutex::new(journal));
+
+        let advisories = load_route_advisories_from_journal(&journal);
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].resource_kind, ResourceKind::GitHubPullRequest);
+        assert_eq!(advisories[0].tool_name.as_deref(), Some("list_pr_files"));
+        assert_eq!(advisories[0].outcome, RouteAdvisoryOutcome::Prefer);
+        assert_eq!(advisories[0].source, RouteAdvisorySource::Journal);
+        assert_eq!(advisories[0].observed_at_ms, entry.timestamp);
+    }
+
+    #[test]
+    fn load_route_advisories_from_journal_keeps_neutral_routing_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut journal =
+            fx_journal::Journal::load(temp_dir.path().join("journal.jsonl")).expect("journal");
+        let entry = journal
+            .write(
+                "Used repository listing before deciding".to_string(),
+                vec!["routing".to_string(), "tool:view_repo".to_string()],
+                "routing:github_repository".to_string(),
+                None,
+            )
+            .expect("write entry");
+        let journal = Arc::new(Mutex::new(journal));
+
+        let advisories = load_route_advisories_from_journal(&journal);
+
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].resource_kind, ResourceKind::GitHubRepository);
+        assert_eq!(advisories[0].tool_name.as_deref(), Some("view_repo"));
+        assert_eq!(advisories[0].outcome, RouteAdvisoryOutcome::Neutral);
+        assert_eq!(advisories[0].observed_at_ms, entry.timestamp);
     }
 
     #[test]
@@ -3281,7 +3673,9 @@ mod tests {
         let working_dir = temp_dir.path().to_path_buf();
         let options = SkillRegistryBuildOptions {
             working_dir: working_dir.clone(),
+            execution_root: Arc::new(ExecutionRoot::new(working_dir.clone())),
             memory_enabled: false,
+            disable_skill_watcher: false,
             subagent_control: None,
             config_manager: None,
             experiment_progress: None,
@@ -3291,6 +3685,7 @@ mod tests {
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
             credential_store: None,
             token_broker: None,
+            cron_store: None,
             experiment_registry: Some(
                 build_shared_experiment_registry(temp_dir.path()).expect("shared registry"),
             ),
@@ -3456,8 +3851,11 @@ mod tests {
     }
 
     #[test]
-    fn default_anthropic_models_include_claude_opus_4_6() {
-        assert!(DEFAULT_ANTHROPIC_MODELS.contains(&"claude-opus-4-6"));
+    fn anthropic_provider_fallback_models_include_claude_opus_4_6() {
+        let provider =
+            AnthropicProvider::new(AnthropicProvider::default_base_url(), "test-key").unwrap();
+
+        assert!(provider.fallback_models().contains(&"claude-opus-4-6"));
     }
 
     #[test]
@@ -3517,6 +3915,66 @@ mod tests {
     }
 
     #[test]
+    fn build_router_openrouter_fallback_includes_glm51() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "openrouter-key-glm51".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+        let models = router.available_models();
+
+        assert!(
+            models.iter().any(|model| model.provider_name == "openrouter"
+                && model.model_id == "z-ai/glm-5.1"),
+            "OpenRouter static fallback should include GLM 5.1 so HTTP startup can honor configured defaults before dynamic catalog refresh"
+        );
+    }
+
+    #[test]
+    fn build_router_merges_stale_openrouter_cache_with_static_fallbacks() {
+        let mut cache = ProviderModelCache::default();
+        cache.set_models(
+            "openrouter",
+            &[
+                "anthropic/claude-opus-4.5".to_string(),
+                "openai/gpt-5.4-pro".to_string(),
+            ],
+        );
+
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "openrouter-key-stale-cache".to_string(),
+            },
+        );
+
+        let router =
+            build_router_with_model_cache(&auth_manager, &cache).expect("router should build");
+        let openrouter_models = router
+            .available_models()
+            .into_iter()
+            .filter(|model| model.provider_name == "openrouter")
+            .map(|model| model.model_id)
+            .collect::<Vec<_>>();
+
+        assert!(
+            openrouter_models.contains(&"anthropic/claude-opus-4.5".to_string()),
+            "cached OpenRouter catalog entries should still be registered"
+        );
+        assert!(
+            openrouter_models.contains(&"z-ai/glm-5.1".to_string()),
+            "stale OpenRouter caches must not hide static fallbacks needed during startup"
+        );
+    }
+
+    #[test]
     fn build_router_with_oauth_credentials_registers_openai_subscription_models() {
         let mut auth_manager = AuthManager::new();
         auth_manager.store(
@@ -3562,6 +4020,63 @@ mod tests {
             !router.available_models().is_empty(),
             "setup token should register Anthropic models"
         );
+    }
+
+    #[test]
+    fn build_router_for_data_dir_registers_cached_fireworks_models() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let cached_models = vec!["accounts/fireworks/routers/kimi-k2p5-turbo".to_string()];
+        fx_config::update_provider_model_cache(temp_dir.path(), "fireworks", &cached_models)
+            .expect("write provider model cache");
+
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "fireworks",
+            AuthMethod::ApiKey {
+                provider: "fireworks".to_string(),
+                key: "fireworks-key".to_string(),
+            },
+        );
+
+        let router =
+            build_router_for_data_dir(&auth_manager, temp_dir.path()).expect("router should build");
+        let models = router
+            .available_models()
+            .into_iter()
+            .filter(|model| model.provider_name == "fireworks")
+            .map(|model| model.model_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(models, cached_models);
+    }
+
+    #[test]
+    fn fireworks_provider_uses_documented_openai_compatible_base_url() {
+        assert_eq!(
+            base_url_for_provider("fireworks"),
+            "https://api.fireworks.ai/inference/v1"
+        );
+    }
+
+    #[test]
+    fn build_router_without_cache_does_not_guess_fireworks_models() {
+        let mut auth_manager = AuthManager::new();
+        auth_manager.store(
+            "fireworks",
+            AuthMethod::ApiKey {
+                provider: "fireworks".to_string(),
+                key: "fireworks-key".to_string(),
+            },
+        );
+
+        let router = build_router(&auth_manager).expect("router should build");
+        let fireworks_models = router
+            .available_models()
+            .into_iter()
+            .filter(|model| model.provider_name == "fireworks")
+            .collect::<Vec<_>>();
+
+        assert!(fireworks_models.is_empty());
     }
 
     #[test]

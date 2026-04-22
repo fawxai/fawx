@@ -4,6 +4,12 @@ pub mod dag;
 pub mod dispatcher;
 pub mod engine;
 pub mod error;
+pub mod graph_builder;
+pub mod graph_dispatcher;
+pub mod graph_topology;
+pub mod operations;
+pub mod reasoning_mode;
+pub mod thought;
 
 use fx_core::signals::Signal;
 use serde::{Deserialize, Serialize};
@@ -486,6 +492,8 @@ fn looks_unresolved_action_response(task: &str, response: &str) -> bool {
 pub struct DecompositionPlan {
     pub sub_goals: Vec<SubGoal>,
     pub strategy: AggregationStrategy,
+    #[serde(default)]
+    pub reasoning_mode: reasoning_mode::ReasoningMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated_from: Option<usize>,
 }
@@ -495,6 +503,26 @@ pub enum AggregationStrategy {
     Sequential,
     Parallel,
     Custom(String),
+}
+
+impl DecompositionPlan {
+    pub fn standard(sub_goals: Vec<SubGoal>, strategy: AggregationStrategy) -> Self {
+        Self {
+            sub_goals,
+            strategy,
+            reasoning_mode: reasoning_mode::ReasoningMode::Standard,
+            truncated_from: None,
+        }
+    }
+
+    pub fn graph_of_thoughts(graph: reasoning_mode::GraphOfOperationsSpec) -> Self {
+        Self {
+            sub_goals: Vec::new(),
+            strategy: AggregationStrategy::Sequential,
+            reasoning_mode: reasoning_mode::ReasoningMode::GraphOfThoughts { graph },
+            truncated_from: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -536,6 +564,19 @@ pub use engine::{
     format_fitness_context, parse_plan_json, validate_plan, Decomposer, LlmDecomposer,
 };
 pub use error::DecomposeError;
+pub use graph_builder::GraphBuilder;
+pub use graph_dispatcher::{
+    ConcatMerger, GeneratedThoughts, GraphDispatcher, GraphExecutionResult, HeuristicThoughtScorer,
+    LlmThoughtGenerator, LlmThoughtMerger, LlmThoughtScorer, MergedThought, ThoughtGenerator,
+    ThoughtMerger, ThoughtScore, ThoughtScorer,
+};
+pub use graph_topology::{GraphEdge, GraphNode, GraphOfOperations, GraphTopologyError};
+pub use operations::{GraphOperation, MergeStrategy, ScoringStrategy, ValidationStrategy};
+pub use reasoning_mode::{EdgeSpec, GoTPreset, GraphOfOperationsSpec, ReasoningMode};
+pub use thought::{
+    GraphNodeId, ThoughtId, ThoughtIdAllocator, ThoughtMetadata, ThoughtMetadataValue, ThoughtPool,
+    ThoughtState,
+};
 
 #[cfg(test)]
 mod tests {
@@ -552,13 +593,13 @@ mod tests {
     }
 
     fn sample_signal() -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Success,
-            message: "sub-goal completed".to_string(),
-            metadata: serde_json::json!({"test": true}),
-            timestamp_ms: 42,
-        }
+        Signal::new(
+            LoopStep::Act,
+            SignalKind::Success,
+            "sub-goal completed",
+            serde_json::json!({"test": true}),
+            42,
+        )
     }
 
     #[test]
@@ -574,6 +615,7 @@ mod tests {
         let original = DecompositionPlan {
             sub_goals: vec![sample_sub_goal()],
             strategy: AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
 
@@ -635,6 +677,7 @@ mod tests {
         let plan = DecompositionPlan {
             sub_goals: Vec::new(),
             strategy: AggregationStrategy::Sequential,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         };
 

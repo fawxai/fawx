@@ -111,6 +111,19 @@ impl SessionArchiveFilter {
     }
 }
 
+/// Persistent workspace/worktree ownership for a thread-backed session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionThreadBinding {
+    /// Stable workspace identity for the owning project lane.
+    pub workspace_id: String,
+    /// Concrete execution root for this thread, independent of global config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
+    /// Concrete git worktree checkout when the thread owns an isolated lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+}
+
 /// Summary metadata for a session (returned by list operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -130,6 +143,9 @@ pub struct SessionInfo {
     pub preview: Option<String>,
     /// Model identifier used by this session.
     pub model: String,
+    /// Optional per-session thinking level override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// Unix epoch seconds when session was created.
     pub created_at: u64,
     /// Unix epoch seconds of last activity.
@@ -137,6 +153,9 @@ pub struct SessionInfo {
     /// Unix epoch seconds when the session was archived, if archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<u64>,
+    /// Optional workspace/worktree binding for thread-first shells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_binding: Option<SessionThreadBinding>,
     /// Number of messages in the conversation.
     pub message_count: usize,
 }
@@ -201,6 +220,8 @@ pub struct SessionConfig {
     pub label: Option<String>,
     /// Model to use for this session.
     pub model: String,
+    /// Optional thinking level to use for this session.
+    pub thinking: Option<String>,
 }
 
 #[cfg(test)]
@@ -216,9 +237,15 @@ mod tests {
             title: Some("Hello world".to_string()),
             preview: Some("Latest message".to_string()),
             model: "gpt-4".to_string(),
+            thinking: None,
             created_at: 1000,
             updated_at: 2000,
             archived_at,
+            thread_binding: Some(SessionThreadBinding {
+                workspace_id: "workspace-general".to_string(),
+                execution_root: Some("/tmp/general".to_string()),
+                worktree_path: None,
+            }),
             message_count: 5,
         }
     }
@@ -333,6 +360,10 @@ mod tests {
         assert_eq!(parsed["title"], "Hello world");
         assert_eq!(parsed["preview"], "Latest message");
         assert_eq!(parsed["archived_at"], 3000);
+        assert_eq!(
+            parsed["thread_binding"]["workspace_id"],
+            "workspace-general"
+        );
         assert_eq!(parsed["message_count"], 5);
     }
 
@@ -346,9 +377,15 @@ mod tests {
             title: None,
             preview: None,
             model: "claude-3".to_string(),
+            thinking: Some("high".to_string()),
             created_at: 100,
             updated_at: 200,
             archived_at: Some(1234),
+            thread_binding: Some(SessionThreadBinding {
+                workspace_id: "ws-repo".to_string(),
+                execution_root: Some("/tmp/repo/.worktrees/fix-thread".to_string()),
+                worktree_path: Some("/tmp/repo/.worktrees/fix-thread".to_string()),
+            }),
             message_count: 10,
         };
         let json = serde_json::to_string(&info).expect("serialize");
@@ -360,6 +397,7 @@ mod tests {
         assert_eq!(restored.preview, info.preview);
         assert_eq!(restored.model, info.model);
         assert_eq!(restored.archived_at, info.archived_at);
+        assert_eq!(restored.thread_binding, info.thread_binding);
         assert!(restored.is_archived());
     }
 
@@ -381,6 +419,7 @@ mod tests {
         assert!(info.title.is_none());
         assert!(info.preview.is_none());
         assert!(info.archived_at.is_none());
+        assert!(info.thread_binding.is_none());
         assert!(!info.is_archived());
     }
 

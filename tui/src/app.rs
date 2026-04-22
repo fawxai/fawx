@@ -3,14 +3,17 @@ use crate::embedded_backend::EmbeddedBackend;
 use crate::experiment_panel::ExperimentPanel;
 use crate::fawx_backend::{
     friendly_error_message, BackendEvent, EngineBackend, EngineStatus, HttpBackend,
+    TranscriptPhaseBoundary,
 };
 use crate::markdown_render::render_markdown_text_with_width;
 use crate::render::line_utils::{line_to_static, prefix_lines};
 use crate::wrapping::{adaptive_wrap_line, RtOptions};
 use anyhow::Context;
+use base64::Engine as _;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CEvent, EventStream, KeyCode, KeyEvent,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CEvent, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,22 +31,78 @@ use regex_lite::Regex;
 use serde_json::Value;
 use sparx::{render_file, RenderConfig};
 use std::cmp::min;
+use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use unicode_width::UnicodeWidthChar;
+
+mod transcript_render;
+use transcript_render::{
+    phase_separator_line, render_activity_group_entry, render_tool_result_entry,
+    render_tool_use_entry,
+};
 
 const INPUT_PLACEHOLDER: &str = "Ask Fawx anything...";
 const SHORTCUT_HINT: &str =
-    "Ctrl+C: cancel | /help: commands | /clear: clear transcript | /quit: exit";
-const THINKING_FRAMES: [&str; 3] = [".", "..", "..."];
+    "Ctrl+C: cancel | Ctrl+Y: copy | Tab: activity | /clear: clear | /quit: exit";
+const UNICODE_ACTIVE_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+const ASCII_ACTIVE_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+const ACTIVE_FRAME_TICKS: usize = 4;
+const SYNTHETIC_ACTIVITY_GROUP_PREFIX: &str = "__fawx_tui_legacy_activity:";
 
 type AppBackend = Arc<dyn EngineBackend>;
 type SharedPanel = Arc<Mutex<ExperimentPanel>>;
 type BuiltBackend = (AppBackend, String, SharedPanel);
 type BackendBuildResult = anyhow::Result<BuiltBackend>;
+
+fn select_active_spinner_frames() -> &'static [&'static str; 4] {
+    let force_ascii = std::env::var("FAWX_TUI_ASCII_SPINNER").ok();
+    let term = std::env::var("TERM").ok();
+    let locale = std::env::var("LC_ALL")
+        .ok()
+        .or_else(|| std::env::var("LC_CTYPE").ok())
+        .or_else(|| std::env::var("LANG").ok());
+    active_spinner_frames_for_env(force_ascii.as_deref(), term.as_deref(), locale.as_deref())
+}
+
+fn active_spinner_frames_for_env(
+    force_ascii: Option<&str>,
+    term: Option<&str>,
+    locale: Option<&str>,
+) -> &'static [&'static str; 4] {
+    let force_ascii = force_ascii
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && value != "0");
+    if force_ascii {
+        return &ASCII_ACTIVE_FRAMES;
+    }
+
+    if term
+        .map(|value| matches!(value, "dumb" | "linux"))
+        .unwrap_or(false)
+    {
+        return &ASCII_ACTIVE_FRAMES;
+    }
+
+    if locale
+        .map(|value| {
+            let value = value.to_ascii_uppercase();
+            !(value.contains("UTF-8") || value.contains("UTF8"))
+        })
+        .unwrap_or(false)
+    {
+        return &ASCII_ACTIVE_FRAMES;
+    }
+
+    &UNICODE_ACTIVE_FRAMES
+}
 
 const WIDE_WELCOME_BREAKPOINT: usize = 100;
 const MEDIUM_WELCOME_BREAKPOINT: usize = 60;
@@ -81,6 +140,10 @@ const TOOL_USE_FIELD_LIMIT: usize = 3;
 const TOOL_USE_MAX_LINES: usize = 5;
 const TOOL_RESULT_MAX_LINES: usize = 20;
 const TOOL_VALUE_PREVIEW_CHARS: usize = 80;
+// This bounds only the TUI render buffer. Engine conversation history is owned by
+// the backend/session layer and is not truncated here.
+const MAX_TRANSCRIPT_ENTRIES: usize = 400;
+const COPY_SELECTION_HINT: &str = "selection: Ctrl+Y copy • Esc clear";
 static ANSI_CSI_RE: LazyLock<Regex> =
     LazyLock::new(|| match Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]") {
         Ok(regex) => regex,
@@ -95,6 +158,11 @@ static ANSI_ESC_RE: LazyLock<Regex> = LazyLock::new(|| match Regex::new(r"\x1b[@
     Ok(regex) => regex,
     Err(error) => panic!("invalid ANSI escape regex: {error}"),
 });
+static CLICKABLE_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"https?://[^\s<>()]+") {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid clickable URL regex: {error}"),
+    });
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -155,24 +223,196 @@ enum EntryRole {
     Welcome,
     User,
     Assistant,
+    WorkingNarration,
+    FinalAnswer,
     System,
     Error,
+    ActivityGroup,
+    CompletedSummary,
     ToolUse,
+    // TODO(tui-transcript): keep this flat legacy role only for the
+    // standalone renderer regression tests until the legacy tool renderer is
+    // fully deleted in favor of normalized activity groups.
+    #[allow(dead_code)]
     ToolResult,
+    // TODO(tui-transcript): see ToolResult; production backend events should
+    // normalize failures into TuiActivityGroup rather than constructing this.
+    #[allow(dead_code)]
     ToolError,
 }
 
+// TODO(tui-transcript): retained only to exercise the legacy flat tool result
+// renderer in tests while production tool events are normalized into activity
+// groups. Delete with EntryRole::ToolResult/ToolError once those tests move to
+// activity-group fixtures.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum ToolOutcome {
     Success,
     Error,
 }
 
+#[derive(Clone)]
 struct Entry {
     role: EntryRole,
     text: String,
     tool_name: Option<String>,
     tool_arguments: Option<Value>,
+    activity_group: Option<TuiActivityGroup>,
+    render_phase: Option<TuiRenderPhase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiActivityGroup {
+    id: String,
+    title: Option<String>,
+    kind: Option<String>,
+    narration: Option<String>,
+    tool_calls: Vec<TuiToolCall>,
+    is_live: bool,
+    collapsed: bool,
+    synthetic: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiToolCall {
+    id: String,
+    name: String,
+    arguments: Option<Value>,
+    result: Option<String>,
+    success: Option<bool>,
+    progress: Option<TuiToolProgress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiToolProgress {
+    category: String,
+    target: Option<String>,
+    advances_slot: Option<String>,
+    outcome: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiRenderPhase {
+    Working,
+    Activity,
+    Summary,
+    Response,
+}
+
+impl TuiRenderPhase {
+    fn from_boundary(boundary: &TranscriptPhaseBoundary) -> Option<Self> {
+        match boundary {
+            TranscriptPhaseBoundary::CollectingWork => Some(Self::Working),
+            TranscriptPhaseBoundary::ExecutingTools => Some(Self::Activity),
+            TranscriptPhaseBoundary::Summarizing => Some(Self::Summary),
+            TranscriptPhaseBoundary::Finalizing => Some(Self::Response),
+            TranscriptPhaseBoundary::Completed | TranscriptPhaseBoundary::Other(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TuiTranscriptRenderModel {
+    turns: Vec<TuiTranscriptRenderTurn>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TuiTranscriptRenderTurn {
+    sections: Vec<TuiTranscriptRenderSection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiTranscriptRenderSection {
+    phase: Option<TuiRenderPhase>,
+    entry_indices: Vec<usize>,
+}
+
+impl TuiTranscriptRenderModel {
+    fn reduce(entries: &[Entry]) -> Self {
+        let mut model = Self::default();
+        let mut turn = TuiTranscriptRenderTurn::default();
+
+        for (index, entry) in entries.iter().enumerate() {
+            if matches!(entry.role, EntryRole::User) && !turn.is_empty() {
+                model.turns.push(turn);
+                turn = TuiTranscriptRenderTurn::default();
+            }
+            turn.push(index, entry.render_phase);
+        }
+
+        if !turn.is_empty() {
+            model.turns.push(turn);
+        }
+
+        model
+    }
+}
+
+impl TuiTranscriptRenderTurn {
+    fn is_empty(&self) -> bool {
+        self.sections
+            .iter()
+            .all(|section| section.entry_indices.is_empty())
+    }
+
+    fn push(&mut self, entry_index: usize, phase: Option<TuiRenderPhase>) {
+        if let Some(section) = self
+            .sections
+            .last_mut()
+            .filter(|section| section.phase == phase)
+        {
+            section.entry_indices.push(entry_index);
+            return;
+        }
+
+        self.sections.push(TuiTranscriptRenderSection {
+            phase,
+            entry_indices: vec![entry_index],
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TranscriptPoint {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TranscriptSelection {
+    anchor: TranscriptPoint,
+    focus: TranscriptPoint,
+    dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TranscriptSelectionRange {
+    start: TranscriptPoint,
+    end: TranscriptPoint,
+}
+
+impl TranscriptSelection {
+    fn new(point: TranscriptPoint) -> Self {
+        Self {
+            anchor: point,
+            focus: point,
+            dragging: true,
+        }
+    }
+
+    fn range(self) -> Option<TranscriptSelectionRange> {
+        if self.anchor == self.focus {
+            return None;
+        }
+
+        let (start, end) = if transcript_point_leq(self.anchor, self.focus) {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        };
+        Some(TranscriptSelectionRange { start, end })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,8 +475,12 @@ impl fmt::Display for EntryRole {
             Self::Welcome => "welcome",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::WorkingNarration => "working_narration",
+            Self::FinalAnswer => "final_answer",
             Self::System => "system",
             Self::Error => "error",
+            Self::ActivityGroup => "activity_group",
+            Self::CompletedSummary => "completed_summary",
             Self::ToolUse => "tool_use",
             Self::ToolResult => "tool_result",
             Self::ToolError => "tool_error",
@@ -258,29 +502,138 @@ impl Entry {
             text: text.into(),
             tool_name: None,
             tool_arguments: None,
+            activity_group: None,
+            render_phase: None,
         }
     }
 
+    fn with_render_phase(mut self, phase: Option<TuiRenderPhase>) -> Self {
+        self.render_phase = phase;
+        self
+    }
+
+    fn working_narration(text: impl Into<String>) -> Self {
+        Self::plain(EntryRole::WorkingNarration, text)
+    }
+
+    fn final_answer(text: impl Into<String>) -> Self {
+        Self::plain(EntryRole::FinalAnswer, text)
+    }
+
+    fn completed_summary(text: impl Into<String>) -> Self {
+        Self::plain(EntryRole::CompletedSummary, text)
+    }
+
+    fn activity_group(group: TuiActivityGroup) -> Self {
+        Self {
+            role: EntryRole::ActivityGroup,
+            text: group.title.clone().unwrap_or_default(),
+            tool_name: None,
+            tool_arguments: None,
+            activity_group: Some(group),
+            render_phase: None,
+        }
+    }
+
+    // TODO(tui-transcript): test-only fixture constructor for the legacy flat
+    // tool-use renderer. Runtime events should go through TuiActivityGroup.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn tool_use(name: String, arguments: Value) -> Self {
         Self {
             role: EntryRole::ToolUse,
             text: name.clone(),
             tool_name: Some(name),
             tool_arguments: normalize_tool_arguments(arguments),
+            activity_group: None,
+            render_phase: None,
         }
     }
 
+    // TODO(tui-transcript): test-only fixture constructor for legacy flat tool
+    // results. Runtime success/failure state belongs on TuiToolCall.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn tool_result(outcome: ToolOutcome, name: Option<String>, content: String) -> Self {
         Self {
             role: outcome.role(),
             text: content,
             tool_name: name,
             tool_arguments: None,
+            activity_group: None,
+            render_phase: None,
+        }
+    }
+}
+
+impl TuiActivityGroup {
+    fn new(
+        id: String,
+        title: Option<String>,
+        kind: Option<String>,
+        narration: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            title: title.and_then(non_empty_trimmed),
+            kind: kind.and_then(non_empty_trimmed),
+            narration: narration.and_then(non_empty_trimmed),
+            tool_calls: Vec::new(),
+            is_live: true,
+            collapsed: true,
+            synthetic: false,
+        }
+    }
+
+    fn synthetic(id: String, narration: Option<String>) -> Self {
+        Self {
+            id,
+            title: Some("Tool activity".to_string()),
+            kind: Some("legacy_tool_events".to_string()),
+            narration: narration.and_then(non_empty_trimmed),
+            tool_calls: Vec::new(),
+            is_live: true,
+            collapsed: true,
+            synthetic: true,
+        }
+    }
+
+    fn error_count(&self) -> usize {
+        self.tool_calls
+            .iter()
+            .filter(|call| call.success == Some(false))
+            .count()
+    }
+
+    fn running_count(&self) -> usize {
+        self.tool_calls
+            .iter()
+            .filter(|call| call.success.is_none())
+            .count()
+    }
+}
+
+impl TuiToolCall {
+    fn new(id: Option<String>, name: Option<String>) -> Self {
+        let name = name
+            .and_then(non_empty_trimmed)
+            .unwrap_or_else(|| "tool".to_string());
+        let id = id
+            .and_then(non_empty_trimmed)
+            .unwrap_or_else(|| format!("{}:pending", name));
+        Self {
+            id,
+            name,
+            arguments: None,
+            result: None,
+            success: None,
+            progress: None,
         }
     }
 }
 
 impl ToolOutcome {
+    // TODO(tui-transcript): remove with Entry::tool_result once the final flat
+    // tool-result renderer tests are migrated to activity-group fixtures.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn role(self) -> EntryRole {
         match self {
             Self::Success => EntryRole::ToolResult,
@@ -353,6 +706,9 @@ struct App {
     input: String,
     connection: ConnectionState,
     streaming_text: Option<String>,
+    response_preview_text: String,
+    final_answer_text: Option<String>,
+    transcript_phase: Option<TranscriptPhaseBoundary>,
     logo_art: String,
     installed_skills: Vec<LocalSkillSummary>,
     pending_request: bool,
@@ -361,12 +717,18 @@ struct App {
     scroll: u16,
     input_scroll: u16,
     spinner_frame: usize,
+    spinner_frames: &'static [&'static str; 4],
     last_meta: Option<String>,
     last_tokens: Option<TokenUsageSummary>,
     active_tool_name: Option<String>,
+    active_legacy_activity_id: Option<String>,
+    focused_activity_group_id: Option<String>,
+    expanded_activity_group_ids: BTreeSet<String>,
+    next_synthetic_activity_id: usize,
     should_quit: bool,
     transcript_area: Rect,
     input_area: Rect,
+    transcript_selection: Option<TranscriptSelection>,
 }
 
 impl App {
@@ -387,6 +749,9 @@ impl App {
             input: String::new(),
             connection: ConnectionState::Connecting,
             streaming_text: None,
+            response_preview_text: String::new(),
+            final_answer_text: None,
+            transcript_phase: None,
             logo_art: String::new(),
             installed_skills: discover_installed_skills(),
             pending_request: false,
@@ -395,12 +760,18 @@ impl App {
             scroll: 0,
             input_scroll: 0,
             spinner_frame: 0,
+            spinner_frames: select_active_spinner_frames(),
             last_meta: None,
             last_tokens: None,
             active_tool_name: None,
+            active_legacy_activity_id: None,
+            focused_activity_group_id: None,
+            expanded_activity_group_ids: BTreeSet::new(),
+            next_synthetic_activity_id: 0,
             should_quit: false,
             transcript_area: Rect::default(),
             input_area: Rect::default(),
+            transcript_selection: None,
         }
     }
 
@@ -447,9 +818,14 @@ impl App {
     }
 
     fn advance_spinner(&mut self) {
-        if self.pending_request && self.awaiting_stream_start {
-            self.spinner_frame = (self.spinner_frame + 1) % (THINKING_FRAMES.len() * 4);
+        if self.pending_request {
+            self.spinner_frame =
+                (self.spinner_frame + 1) % (self.spinner_frames.len() * ACTIVE_FRAME_TICKS);
         }
+    }
+
+    fn active_spinner(&self) -> &'static str {
+        self.spinner_frames[(self.spinner_frame / ACTIVE_FRAME_TICKS) % self.spinner_frames.len()]
     }
 
     fn update_experiment_panel(&self) {
@@ -462,6 +838,7 @@ impl App {
     fn handle_terminal_event(&mut self, event: CEvent) {
         match event {
             CEvent::Key(key) => self.handle_key_event(key),
+            CEvent::Paste(text) => self.insert_pasted_text(&text),
             CEvent::Mouse(mouse) => self.handle_mouse_event(mouse),
             CEvent::Resize(_, _) => self.follow_output = true,
             _ => {}
@@ -470,10 +847,26 @@ impl App {
 
     fn handle_key_event(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.transcript_selection.is_some() {
+                    self.transcript_selection = None;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.copy_transcript_selection();
+            }
+            KeyCode::Tab if self.input.is_empty() => {
+                self.focus_activity_group(false);
+            }
+            KeyCode::BackTab if self.input.is_empty() => {
+                self.focus_activity_group(true);
+            }
+            KeyCode::Enter if self.input.is_empty() && self.toggle_focused_activity_group() => {}
             KeyCode::Enter => self.submit_input(),
             KeyCode::Backspace => {
                 self.input.pop();
@@ -503,8 +896,56 @@ impl App {
         }
     }
 
+    fn insert_pasted_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.input.push_str(&normalize_pasted_text(text));
+        self.scroll_input_to_bottom();
+    }
+
     fn handle_mouse_event(&mut self, mouse: MouseEvent) {
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(point) = self.transcript_point_for_mouse(mouse) {
+                    if self.toggle_activity_group_at_transcript_line(point.line) {
+                        self.transcript_selection = None;
+                        return;
+                    }
+                    self.transcript_selection = Some(TranscriptSelection::new(point));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(point) = self.transcript_point_for_mouse(mouse) {
+                    if let Some(selection) = &mut self.transcript_selection {
+                        selection.focus = point;
+                        selection.dragging = true;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let mut clicked_point = None;
+                if let Some(point) = self.transcript_point_for_mouse(mouse) {
+                    clicked_point = Some(point);
+                    if let Some(selection) = &mut self.transcript_selection {
+                        selection.focus = point;
+                        selection.dragging = false;
+                    }
+                }
+                if self
+                    .transcript_selection
+                    .and_then(TranscriptSelection::range)
+                    .is_none()
+                {
+                    if let Some(point) = clicked_point {
+                        if self.open_transcript_url_at_point(point) {
+                            self.transcript_selection = None;
+                            return;
+                        }
+                    }
+                    self.transcript_selection = None;
+                }
+            }
             MouseEventKind::ScrollUp => {
                 if self.event_is_over_input(mouse) {
                     self.input_scroll = self.input_scroll.saturating_sub(3);
@@ -529,11 +970,143 @@ impl App {
         rect_contains(self.input_area, mouse.column, mouse.row)
     }
 
+    fn transcript_point_for_mouse(&self, mouse: MouseEvent) -> Option<TranscriptPoint> {
+        let inner = transcript_inner_area(self.transcript_area);
+        if !rect_contains(inner, mouse.column, mouse.row) {
+            return None;
+        }
+
+        let row = mouse.row.saturating_sub(inner.y) as usize;
+        let line = self.scroll as usize + row;
+        let column = mouse.column.saturating_sub(inner.x) as usize;
+        Some(TranscriptPoint { line, column })
+    }
+
+    fn toggle_activity_group_at_transcript_line(&mut self, line: usize) -> bool {
+        let width = transcript_inner_width(self.transcript_area);
+        let Some(group_id) = self.activity_group_header_id_at_line(line, width) else {
+            return false;
+        };
+        self.focused_activity_group_id = Some(group_id.clone());
+        self.toggle_activity_group_by_id(&group_id);
+        self.follow_output = false;
+        true
+    }
+
+    fn open_transcript_url_at_point(&mut self, point: TranscriptPoint) -> bool {
+        let Some(url) = self.url_at_transcript_point(point) else {
+            return false;
+        };
+        if let Err(error) = open_url(&url) {
+            self.push_error(format!("Open link failed: {error}"));
+        }
+        true
+    }
+
+    fn url_at_transcript_point(&self, point: TranscriptPoint) -> Option<String> {
+        let width = transcript_inner_width(self.transcript_area);
+        let lines = self.rendered_transcript_lines(width);
+        let line = lines.get(point.line)?;
+        url_at_display_column(&line_text(line), point.column)
+    }
+
+    fn toggle_focused_activity_group(&mut self) -> bool {
+        self.normalize_activity_group_focus();
+        let Some(group_id) = self.focused_activity_group_id.clone() else {
+            return false;
+        };
+        self.toggle_activity_group_by_id(&group_id);
+        self.follow_output = false;
+        true
+    }
+
+    fn toggle_activity_group_by_id(&mut self, group_id: &str) {
+        let Some(is_expanded) = self.activity_group_mut(group_id).map(|group| {
+            group.collapsed = !group.collapsed;
+            !group.collapsed
+        }) else {
+            return;
+        };
+
+        if is_expanded {
+            self.expanded_activity_group_ids
+                .insert(group_id.to_string());
+        } else {
+            self.expanded_activity_group_ids.remove(group_id);
+        }
+    }
+
+    fn focus_activity_group(&mut self, reverse: bool) -> bool {
+        let ids = self.toggleable_activity_group_ids();
+        if ids.is_empty() {
+            self.focused_activity_group_id = None;
+            return false;
+        }
+
+        let next_index = self
+            .focused_activity_group_id
+            .as_deref()
+            .and_then(|focused_id| ids.iter().position(|id| id == focused_id))
+            .map(|index| {
+                if reverse {
+                    index.checked_sub(1).unwrap_or(ids.len() - 1)
+                } else {
+                    (index + 1) % ids.len()
+                }
+            })
+            .unwrap_or_else(|| if reverse { ids.len() - 1 } else { 0 });
+
+        self.focused_activity_group_id = Some(ids[next_index].clone());
+        self.follow_output = false;
+        true
+    }
+
+    fn normalize_activity_group_focus(&mut self) {
+        let Some(focused_id) = self.focused_activity_group_id.as_deref() else {
+            return;
+        };
+        if !self
+            .toggleable_activity_group_ids()
+            .iter()
+            .any(|id| id == focused_id)
+        {
+            self.focused_activity_group_id = None;
+        }
+    }
+
+    fn toggleable_activity_group_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.activity_group.as_ref())
+            .filter(|group| !group.is_live && !group.tool_calls.is_empty())
+            .map(|group| group.id.clone())
+            .collect()
+    }
+
+    fn active_render_phase(&self) -> Option<TuiRenderPhase> {
+        self.transcript_phase
+            .as_ref()
+            .and_then(TuiRenderPhase::from_boundary)
+    }
+
+    fn push_entry_with_phase(&mut self, entry: Entry, phase: Option<TuiRenderPhase>) {
+        self.entries.push(entry.with_render_phase(phase));
+    }
+
+    fn activity_group_header_id_at_line(&self, line: usize, width: usize) -> Option<String> {
+        self.rendered_transcript_lines_with_activity_headers(width)
+            .1
+            .get(line)
+            .cloned()
+            .flatten()
+    }
+
     fn submit_input(&mut self) {
         let input = self.input.trim().to_string();
         if input.is_empty() {
             return;
         }
+        self.transcript_selection = None;
 
         self.dismiss_welcome_entry(&input);
         if self.handle_local_command(&input) {
@@ -548,15 +1121,21 @@ impl App {
             return;
         }
 
-        self.entries
-            .push(Entry::plain(EntryRole::User, input.clone()));
+        self.push_entry_with_phase(Entry::plain(EntryRole::User, input.clone()), None);
+        self.prune_transcript_entries();
         self.streaming_text = Some(String::new());
+        self.response_preview_text.clear();
+        self.final_answer_text = None;
+        self.transcript_phase = None;
         self.pending_request = true;
         self.awaiting_stream_start = true;
         self.follow_output = true;
         self.spinner_frame = 0;
         self.last_meta = None;
         self.active_tool_name = None;
+        self.active_legacy_activity_id = None;
+        self.focused_activity_group_id = None;
+        self.expanded_activity_group_ids.clear();
         self.input.clear();
         self.input_scroll = 0;
 
@@ -595,11 +1174,19 @@ impl App {
         self.entries = initial_entries();
         self.installed_skills = discover_installed_skills();
         self.streaming_text = None;
+        self.response_preview_text.clear();
+        self.final_answer_text = None;
+        self.transcript_phase = None;
         self.pending_request = false;
         self.awaiting_stream_start = false;
         self.last_meta = None;
         self.last_tokens = None;
         self.active_tool_name = None;
+        self.active_legacy_activity_id = None;
+        self.focused_activity_group_id = None;
+        self.expanded_activity_group_ids.clear();
+        self.next_synthetic_activity_id = 0;
+        self.transcript_selection = None;
         self.input_scroll = 0;
         self.clear_experiment_panel();
         self.push_system("Transcript cleared.");
@@ -626,6 +1213,24 @@ impl App {
                 self.push_error(format!("Connection failed: {friendly}"));
                 self.connection = ConnectionState::Error(friendly);
             }
+            BackendEvent::WorkingNarrationDelta {
+                text,
+                voiceover_suppressed,
+            } => {
+                self.awaiting_stream_start = false;
+                if !voiceover_suppressed {
+                    self.append_working_narration(text);
+                }
+                self.follow_output = true;
+            }
+            BackendEvent::TextPreviewDelta(delta) => {
+                self.awaiting_stream_start = false;
+                self.append_response_preview_text(delta);
+                self.follow_output = true;
+            }
+            BackendEvent::TextReset => {
+                self.reset_response_preview_text();
+            }
             BackendEvent::TextDelta(delta) => {
                 self.awaiting_stream_start = false;
                 self.streaming_text
@@ -633,7 +1238,88 @@ impl App {
                     .push_str(&delta);
                 self.follow_output = true;
             }
+            BackendEvent::FinalAnswerDelta(delta) => {
+                self.awaiting_stream_start = false;
+                if !self.response_preview_text.is_empty()
+                    && self
+                        .streaming_text
+                        .as_deref()
+                        .map(|text| {
+                            text.ends_with(&self.response_preview_text)
+                                || self.response_preview_text.starts_with(&delta)
+                        })
+                        .unwrap_or(false)
+                {
+                    self.streaming_text = None;
+                }
+                self.response_preview_text.clear();
+                self.final_answer_text
+                    .get_or_insert_with(String::new)
+                    .push_str(&delta);
+                self.follow_output = true;
+            }
+            BackendEvent::TranscriptPhaseBoundary(phase) => {
+                self.transcript_phase = Some(phase.clone());
+                match phase {
+                    TranscriptPhaseBoundary::Finalizing | TranscriptPhaseBoundary::Completed => {
+                        self.settle_current_turn_activity();
+                    }
+                    TranscriptPhaseBoundary::CollectingWork
+                    | TranscriptPhaseBoundary::ExecutingTools
+                    | TranscriptPhaseBoundary::Summarizing
+                    | TranscriptPhaseBoundary::Other(_) => {}
+                }
+            }
+            BackendEvent::CompletedSummary(summary) => {
+                self.settle_current_turn_activity();
+                self.push_entry_with_phase(
+                    Entry::completed_summary(summary),
+                    Some(TuiRenderPhase::Summary),
+                );
+                self.follow_output = true;
+            }
             BackendEvent::ToolUse { name, arguments } => self.push_tool_use(name, arguments),
+            BackendEvent::ActivityStart { id, title, kind } => {
+                self.begin_activity_group(id, title, kind)
+            }
+            BackendEvent::ActivityEnd { id } => self.end_activity_group(&id),
+            BackendEvent::ActivityToolCallStart {
+                activity_id,
+                id,
+                name,
+            } => self.begin_activity_tool_call(&activity_id, id, name),
+            BackendEvent::ActivityToolCallComplete {
+                activity_id,
+                id,
+                name,
+                arguments,
+            } => self.complete_activity_tool_call(&activity_id, id, name, arguments),
+            BackendEvent::ActivityToolResult {
+                activity_id,
+                id,
+                tool_name,
+                success,
+                content,
+            } => self.finish_activity_tool_call(&activity_id, id, tool_name, success, content),
+            BackendEvent::ToolProgress {
+                activity_id,
+                id,
+                tool_name,
+                category,
+                target,
+                advances_slot,
+                outcome,
+            } => self.update_activity_tool_progress(
+                activity_id,
+                id,
+                tool_name,
+                TuiToolProgress {
+                    category,
+                    target,
+                    advances_slot,
+                    outcome,
+                },
+            ),
             BackendEvent::ToolResult {
                 name,
                 success,
@@ -645,9 +1331,25 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
+                self.response_preview_text.clear();
                 if let Some(text) = self.streaming_text.take() {
-                    self.entries.push(Entry::plain(EntryRole::Assistant, text));
+                    if !text.trim().is_empty() {
+                        self.push_entry_with_phase(
+                            Entry::plain(EntryRole::Assistant, text),
+                            self.active_render_phase().or(Some(TuiRenderPhase::Working)),
+                        );
+                    }
                 }
+                self.settle_current_turn_activity();
+                if let Some(text) = self.final_answer_text.take() {
+                    if !text.trim().is_empty() {
+                        self.push_entry_with_phase(
+                            Entry::final_answer(text),
+                            Some(TuiRenderPhase::Response),
+                        );
+                    }
+                }
+                self.transcript_phase = Some(TranscriptPhaseBoundary::Completed);
                 self.pending_request = false;
                 self.awaiting_stream_start = false;
                 self.follow_output = true;
@@ -667,9 +1369,21 @@ impl App {
                 }
             }
             BackendEvent::StreamError(error) => {
+                self.response_preview_text.clear();
                 if let Some(text) = self.streaming_text.take() {
                     if !text.is_empty() {
-                        self.entries.push(Entry::plain(EntryRole::Assistant, text));
+                        self.push_entry_with_phase(
+                            Entry::plain(EntryRole::Assistant, text),
+                            self.active_render_phase().or(Some(TuiRenderPhase::Working)),
+                        );
+                    }
+                }
+                if let Some(text) = self.final_answer_text.take() {
+                    if !text.is_empty() {
+                        self.push_entry_with_phase(
+                            Entry::final_answer(text),
+                            Some(TuiRenderPhase::Response),
+                        );
                     }
                 }
                 self.pending_request = false;
@@ -680,36 +1394,409 @@ impl App {
                 ));
             }
         }
+        self.prune_transcript_entries();
     }
 
     fn push_tool_use(&mut self, name: String, arguments: Value) {
         self.awaiting_stream_start = false;
         self.active_tool_name = Some(name.clone());
-        if let Some(entry) = self.entries.last_mut() {
-            if should_update_tool_use(entry, &name) {
-                *entry = Entry::tool_use(name, arguments);
-                self.follow_output = true;
-                return;
-            }
-        }
-        self.entries.push(Entry::tool_use(name, arguments));
+        let Some(group) = self.ensure_legacy_activity_group() else {
+            tracing::warn!(
+                tool_name = %name,
+                "failed to create synthetic TUI activity group for legacy tool_use"
+            );
+            return;
+        };
+        let arguments = normalize_tool_arguments(arguments);
+        let index = arguments
+            .as_ref()
+            .and_then(|_| {
+                group
+                    .tool_calls
+                    .iter()
+                    .rposition(|call| call.name == name && call.arguments.is_none())
+            })
+            .unwrap_or_else(|| {
+                let call_id = legacy_tool_call_id(&name, group.tool_calls.len());
+                group
+                    .tool_calls
+                    .push(TuiToolCall::new(Some(call_id), Some(name.clone())));
+                group.tool_calls.len() - 1
+            });
+        let call = &mut group.tool_calls[index];
+        call.name = name;
+        call.arguments = arguments;
         self.follow_output = true;
     }
 
     fn push_tool_result(&mut self, name: Option<String>, success: bool, content: String) {
         self.awaiting_stream_start = false;
-        let outcome = if success {
-            ToolOutcome::Success
-        } else {
-            ToolOutcome::Error
-        };
         let resolved_name = self
             .active_tool_name
             .take()
             .or(name.filter(|value| !value.is_empty()));
-        self.entries
-            .push(Entry::tool_result(outcome, resolved_name, content));
+        let Some(group) = self.ensure_legacy_activity_group() else {
+            tracing::warn!("failed to create synthetic TUI activity group for legacy tool_result");
+            return;
+        };
+        let index = resolved_name
+            .as_deref()
+            .and_then(|tool_name| {
+                activity_tool_call_index(
+                    group,
+                    &normalized_tool_call_id(None, Some(tool_name)),
+                    Some(tool_name),
+                )
+            })
+            .or_else(|| {
+                group
+                    .tool_calls
+                    .iter()
+                    .rposition(|call| call.success.is_none())
+            })
+            .unwrap_or_else(|| {
+                let call_id = legacy_tool_call_id(
+                    resolved_name.as_deref().unwrap_or("tool"),
+                    group.tool_calls.len(),
+                );
+                group
+                    .tool_calls
+                    .push(TuiToolCall::new(Some(call_id), resolved_name.clone()));
+                group.tool_calls.len() - 1
+            });
+        let call = &mut group.tool_calls[index];
+        if let Some(resolved_name) = resolved_name.and_then(non_empty_trimmed) {
+            call.name = resolved_name;
+        }
+        call.success = Some(success);
+        call.result = Some(content);
         self.follow_output = true;
+    }
+
+    fn append_working_narration(&mut self, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.append_working_narration_to_active_group(&delta) {
+            return;
+        }
+        if let Some(entry) = self.entries.last_mut() {
+            if matches!(entry.role, EntryRole::WorkingNarration) {
+                entry.text.push_str(&delta);
+                return;
+            }
+        }
+        self.push_entry_with_phase(
+            Entry::working_narration(delta),
+            Some(TuiRenderPhase::Working),
+        );
+    }
+
+    fn append_response_preview_text(&mut self, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        self.response_preview_text.push_str(&delta);
+        self.streaming_text
+            .get_or_insert_with(String::new)
+            .push_str(&delta);
+    }
+
+    fn reset_response_preview_text(&mut self) {
+        let preview = std::mem::take(&mut self.response_preview_text);
+        if self.final_answer_text.is_none() {
+            self.streaming_text = Some(String::new());
+        }
+        if let Some(preview) = non_empty_trimmed(preview) {
+            self.append_working_narration(preview);
+        }
+        self.follow_output = true;
+    }
+
+    fn append_working_narration_to_active_group(&mut self, delta: &str) -> bool {
+        let turn_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.role, EntryRole::User))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let Some(group) = self.entries[turn_start..]
+            .iter_mut()
+            .rev()
+            .find_map(|entry| entry.activity_group.as_mut().filter(|group| group.is_live))
+        else {
+            return false;
+        };
+
+        append_activity_group_narration(group, delta);
+        true
+    }
+
+    fn begin_activity_group(&mut self, id: String, title: Option<String>, kind: Option<String>) {
+        self.awaiting_stream_start = false;
+        let id = normalized_backend_activity_group_id(&id);
+        let narration = self.take_pending_working_narration();
+        if let Some(group) = self.activity_group_mut(&id) {
+            if group.title.is_none() {
+                group.title = title.and_then(non_empty_trimmed);
+            }
+            if group.kind.is_none() {
+                group.kind = kind.and_then(non_empty_trimmed);
+            }
+            if group.narration.is_none() {
+                group.narration = narration;
+            }
+        } else {
+            let mut group = TuiActivityGroup::new(id, title, kind, narration);
+            self.apply_activity_group_display_state(&mut group);
+            self.push_entry_with_phase(
+                Entry::activity_group(group),
+                Some(TuiRenderPhase::Activity),
+            );
+        }
+        self.follow_output = true;
+    }
+
+    fn end_activity_group(&mut self, id: &str) {
+        let id = normalized_backend_activity_group_id(id);
+        let should_expand = self.expanded_activity_group_ids.contains(&id);
+        if let Some(group) = self.activity_group_mut(&id) {
+            group.is_live = false;
+            group.collapsed = !should_expand;
+        } else {
+            tracing::warn!(
+                activity_id = %id,
+                "received TUI activity_end without a matching activity_start"
+            );
+        }
+        self.follow_output = true;
+    }
+
+    fn begin_activity_tool_call(
+        &mut self,
+        activity_id: &str,
+        id: Option<String>,
+        name: Option<String>,
+    ) {
+        self.awaiting_stream_start = false;
+        let activity_id = normalized_backend_activity_group_id(activity_id);
+        let Some(group) = self.ensure_activity_group(&activity_id) else {
+            tracing::warn!(
+                activity_id = %activity_id,
+                "failed to create TUI activity group for tool call start"
+            );
+            return;
+        };
+        let call_id = normalized_tool_call_id(id.as_deref(), name.as_deref());
+        if group.tool_calls.iter().any(|call| call.id == call_id) {
+            return;
+        }
+        group.tool_calls.push(TuiToolCall::new(Some(call_id), name));
+        self.follow_output = true;
+    }
+
+    fn complete_activity_tool_call(
+        &mut self,
+        activity_id: &str,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Value,
+    ) {
+        self.awaiting_stream_start = false;
+        let activity_id = normalized_backend_activity_group_id(activity_id);
+        let Some(group) = self.ensure_activity_group(&activity_id) else {
+            tracing::warn!(
+                activity_id = %activity_id,
+                "failed to create TUI activity group for tool call completion"
+            );
+            return;
+        };
+        let call_id = normalized_tool_call_id(id.as_deref(), name.as_deref());
+        let index =
+            activity_tool_call_index(group, &call_id, name.as_deref()).unwrap_or_else(|| {
+                group
+                    .tool_calls
+                    .push(TuiToolCall::new(Some(call_id.clone()), name.clone()));
+                group.tool_calls.len() - 1
+            });
+        let call = &mut group.tool_calls[index];
+        if let Some(name) = name.and_then(non_empty_trimmed) {
+            call.name = name;
+        }
+        call.arguments = normalize_tool_arguments(arguments);
+        self.follow_output = true;
+    }
+
+    fn finish_activity_tool_call(
+        &mut self,
+        activity_id: &str,
+        id: Option<String>,
+        tool_name: Option<String>,
+        success: bool,
+        content: String,
+    ) {
+        self.awaiting_stream_start = false;
+        let activity_id = normalized_backend_activity_group_id(activity_id);
+        let Some(group) = self.ensure_activity_group(&activity_id) else {
+            tracing::warn!(
+                activity_id = %activity_id,
+                "failed to create TUI activity group for tool result"
+            );
+            return;
+        };
+        let call_id = normalized_tool_call_id(id.as_deref(), tool_name.as_deref());
+        let index =
+            activity_tool_call_index(group, &call_id, tool_name.as_deref()).unwrap_or_else(|| {
+                group
+                    .tool_calls
+                    .push(TuiToolCall::new(Some(call_id.clone()), tool_name.clone()));
+                group.tool_calls.len() - 1
+            });
+        let call = &mut group.tool_calls[index];
+        if let Some(tool_name) = tool_name.and_then(non_empty_trimmed) {
+            call.name = tool_name;
+        }
+        call.success = Some(success);
+        call.result = Some(content);
+        self.follow_output = true;
+    }
+
+    fn update_activity_tool_progress(
+        &mut self,
+        activity_id: Option<String>,
+        id: Option<String>,
+        tool_name: Option<String>,
+        progress: TuiToolProgress,
+    ) {
+        let Some(activity_id) = activity_id.as_deref().and_then(non_empty_trimmed_str) else {
+            return;
+        };
+        let activity_id = normalized_backend_activity_group_id(&activity_id);
+        let Some(group) = self.ensure_activity_group(&activity_id) else {
+            tracing::warn!(
+                activity_id = %activity_id,
+                "failed to create TUI activity group for tool progress"
+            );
+            return;
+        };
+        let call_id = normalized_tool_call_id(id.as_deref(), tool_name.as_deref());
+        let index =
+            activity_tool_call_index(group, &call_id, tool_name.as_deref()).unwrap_or_else(|| {
+                group
+                    .tool_calls
+                    .push(TuiToolCall::new(Some(call_id.clone()), tool_name.clone()));
+                group.tool_calls.len() - 1
+            });
+        let call = &mut group.tool_calls[index];
+        call.progress = Some(progress);
+        self.follow_output = true;
+    }
+
+    fn ensure_activity_group(&mut self, id: &str) -> Option<&mut TuiActivityGroup> {
+        let id = normalized_backend_activity_group_id(id);
+        if let Some(index) = self.activity_group_index(&id) {
+            return self
+                .entries
+                .get_mut(index)
+                .and_then(|entry| entry.activity_group.as_mut());
+        }
+
+        let narration = self.take_pending_working_narration();
+        let mut group = TuiActivityGroup::new(id, None, None, narration);
+        self.apply_activity_group_display_state(&mut group);
+        self.push_entry_with_phase(Entry::activity_group(group), Some(TuiRenderPhase::Activity));
+        self.entries
+            .last_mut()
+            .and_then(|entry| entry.activity_group.as_mut())
+    }
+
+    fn ensure_legacy_activity_group(&mut self) -> Option<&mut TuiActivityGroup> {
+        if let Some(id) = self.active_legacy_activity_id.as_deref() {
+            if let Some(index) = self.activity_group_index(id) {
+                return self
+                    .entries
+                    .get_mut(index)
+                    .and_then(|entry| entry.activity_group.as_mut());
+            }
+            self.active_legacy_activity_id = None;
+        }
+
+        let id = self.next_unique_synthetic_activity_group_id();
+        let narration = self.take_pending_working_narration();
+        let mut group = TuiActivityGroup::synthetic(id.clone(), narration);
+        self.apply_activity_group_display_state(&mut group);
+        self.push_entry_with_phase(Entry::activity_group(group), Some(TuiRenderPhase::Activity));
+        self.active_legacy_activity_id = Some(id);
+        self.entries
+            .last_mut()
+            .and_then(|entry| entry.activity_group.as_mut())
+    }
+
+    fn next_unique_synthetic_activity_group_id(&mut self) -> String {
+        loop {
+            let id = format!(
+                "{SYNTHETIC_ACTIVITY_GROUP_PREFIX}{}",
+                self.next_synthetic_activity_id
+            );
+            self.next_synthetic_activity_id = self.next_synthetic_activity_id.saturating_add(1);
+            if self.activity_group_index(&id).is_none() {
+                return id;
+            }
+        }
+    }
+
+    fn apply_activity_group_display_state(&self, group: &mut TuiActivityGroup) {
+        if self.expanded_activity_group_ids.contains(&group.id) {
+            group.collapsed = false;
+        }
+    }
+
+    fn settle_current_turn_activity(&mut self) {
+        let turn_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.role, EntryRole::User))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let expanded_activity_group_ids = self.expanded_activity_group_ids.clone();
+        for entry in self.entries[turn_start..].iter_mut() {
+            if let Some(group) = entry.activity_group.as_mut() {
+                group.is_live = false;
+                group.collapsed = !expanded_activity_group_ids.contains(&group.id);
+            }
+        }
+        self.active_tool_name = None;
+        self.active_legacy_activity_id = None;
+    }
+
+    fn activity_group_index(&self, id: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry
+                .activity_group
+                .as_ref()
+                .map(|group| group.id == id)
+                .unwrap_or(false)
+        })
+    }
+
+    fn activity_group_mut(&mut self, id: &str) -> Option<&mut TuiActivityGroup> {
+        self.entries
+            .iter_mut()
+            .find_map(|entry| entry.activity_group.as_mut().filter(|group| group.id == id))
+    }
+
+    fn take_pending_working_narration(&mut self) -> Option<String> {
+        let is_pending = self
+            .entries
+            .last()
+            .map(|entry| matches!(entry.role, EntryRole::WorkingNarration))
+            .unwrap_or(false);
+        if !is_pending {
+            return None;
+        }
+        self.entries
+            .pop()
+            .and_then(|entry| non_empty_trimmed(entry.text))
     }
 
     fn show_skills_list(&mut self) {
@@ -722,12 +1809,27 @@ impl App {
 
     fn push_system(&mut self, message: impl Into<String>) {
         self.entries.push(Entry::plain(EntryRole::System, message));
+        self.prune_transcript_entries();
         self.follow_output = true;
     }
 
     fn push_error(&mut self, message: impl Into<String>) {
         self.entries.push(Entry::plain(EntryRole::Error, message));
+        self.prune_transcript_entries();
         self.follow_output = true;
+    }
+
+    fn prune_transcript_entries(&mut self) {
+        let overflow = self.entries.len().saturating_sub(MAX_TRANSCRIPT_ENTRIES);
+        if overflow == 0 {
+            return;
+        }
+
+        self.entries.drain(0..overflow);
+        self.scroll = self
+            .scroll
+            .saturating_sub(overflow.min(u16::MAX as usize) as u16);
+        self.transcript_selection = None;
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -811,11 +1913,15 @@ impl App {
             ),
         };
         let mut details = Vec::new();
-        if self.pending_request && self.awaiting_stream_start {
-            details.push(format!(
-                "Fawx is thinking{}",
-                THINKING_FRAMES[(self.spinner_frame / 4) % THINKING_FRAMES.len()]
-            ));
+        if self.pending_request {
+            let status_text = if self.awaiting_stream_start {
+                format!("{} Fawx is thinking", self.active_spinner())
+            } else {
+                format!("{} Fawx is working", self.active_spinner())
+            };
+            details.push(status_text);
+        } else if self.transcript_selection.is_some() {
+            details.push(COPY_SELECTION_HINT.to_string());
         } else if let Some(meta) = &self.last_meta {
             details.push(meta.clone());
         }
@@ -843,8 +1949,9 @@ impl App {
     }
 
     fn render_transcript(&mut self, area: Rect) -> Paragraph<'static> {
-        let lines = self.transcript_lines_for_area(area);
+        let mut lines = self.transcript_lines_for_area(area);
         let scroll = self.sync_transcript_scroll(area, transcript_content_line_count(&lines));
+        apply_transcript_selection(&mut lines, self.transcript_selection);
         Paragraph::new(lines)
             .scroll((scroll, 0))
             .block(transcript_block())
@@ -958,25 +2065,120 @@ impl App {
         self.input_scroll = self.input_max_scroll(self.input_area, total_lines);
     }
 
+    fn copy_transcript_selection(&mut self) {
+        let Some(text) = self.selected_transcript_text() else {
+            self.push_system("No transcript selection to copy.");
+            return;
+        };
+
+        match copy_text_to_clipboard(&text) {
+            Ok(()) => self.push_system("Copied selected transcript text."),
+            Err(error) => self.push_error(format!("Copy failed: {error}")),
+        }
+    }
+
+    fn selected_transcript_text(&self) -> Option<String> {
+        let range = self
+            .transcript_selection
+            .and_then(TranscriptSelection::range)?;
+        let lines = self.rendered_transcript_lines(transcript_inner_width(self.transcript_area));
+        selected_text_from_lines(&lines, range)
+    }
+
     fn rendered_transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
+        self.rendered_transcript_lines_with_activity_headers(width)
+            .0
+    }
+
+    fn rendered_transcript_lines_with_activity_headers(
+        &self,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<Option<String>>) {
         let mut out = Vec::new();
-        for entry in &self.entries {
-            if !out.is_empty() {
-                out.push(Line::default());
+        let mut activity_header_ids = Vec::new();
+        let mut render_phase = None;
+        let render_model = TuiTranscriptRenderModel::reduce(&self.entries);
+        for turn in &render_model.turns {
+            for section in &turn.sections {
+                for entry_index in &section.entry_indices {
+                    let Some(entry) = self.entries.get(*entry_index) else {
+                        continue;
+                    };
+                    self.push_rendered_entry_lines(
+                        entry,
+                        width,
+                        section.phase,
+                        &mut render_phase,
+                        &mut out,
+                        &mut activity_header_ids,
+                    );
+                }
             }
-            self.render_entry(entry, width, &mut out);
         }
         if let Some(text) = &self.streaming_text {
-            if !out.is_empty() {
-                out.push(Line::default());
+            if !text.is_empty() {
+                let entry = Entry::plain(EntryRole::Assistant, text.clone());
+                self.push_rendered_entry_lines(
+                    &entry,
+                    width,
+                    self.active_render_phase().or(Some(TuiRenderPhase::Working)),
+                    &mut render_phase,
+                    &mut out,
+                    &mut activity_header_ids,
+                );
             }
-            self.render_entry(
-                &Entry::plain(EntryRole::Assistant, text.clone()),
-                width,
-                &mut out,
-            );
         }
-        out
+        if let Some(text) = &self.final_answer_text {
+            if !text.is_empty() {
+                let entry = Entry::final_answer(text.clone());
+                self.push_rendered_entry_lines(
+                    &entry,
+                    width,
+                    Some(TuiRenderPhase::Response),
+                    &mut render_phase,
+                    &mut out,
+                    &mut activity_header_ids,
+                );
+            }
+        }
+        (out, activity_header_ids)
+    }
+
+    fn push_rendered_entry_lines(
+        &self,
+        entry: &Entry,
+        width: usize,
+        entry_phase: Option<TuiRenderPhase>,
+        render_phase: &mut Option<TuiRenderPhase>,
+        out: &mut Vec<Line<'static>>,
+        activity_header_ids: &mut Vec<Option<String>>,
+    ) {
+        if !out.is_empty() {
+            out.push(Line::default());
+            activity_header_ids.push(None);
+        }
+        if let Some(entry_phase) = entry_phase {
+            if *render_phase != Some(entry_phase) {
+                out.push(phase_separator_line(entry_phase));
+                activity_header_ids.push(None);
+                *render_phase = Some(entry_phase);
+            }
+        } else {
+            *render_phase = None;
+        }
+
+        let start = out.len();
+        self.render_entry(entry, width, out);
+        let group_header_id = entry.activity_group.as_ref().and_then(|group| {
+            (!group.is_live && !group.tool_calls.is_empty()).then(|| group.id.clone())
+        });
+        for index in start..out.len() {
+            activity_header_ids.push(if index == start {
+                group_header_id.clone()
+            } else {
+                None
+            });
+        }
     }
 
     fn render_entry(&self, entry: &Entry, width: usize, out: &mut Vec<Line<'static>>) {
@@ -998,6 +2200,36 @@ impl App {
                     Span::raw("       "),
                 );
                 out.extend(prefixed);
+            }
+            EntryRole::WorkingNarration => {
+                let text = sanitize_terminal_text(&entry.text);
+                let rendered =
+                    render_markdown_text_with_width(&text, Some(width.saturating_sub(7)));
+                let muted = rendered
+                    .lines
+                    .into_iter()
+                    .map(|line| line.patch_style(Style::default().fg(Color::Gray)))
+                    .collect::<Vec<_>>();
+                out.extend(prefix_lines(
+                    muted,
+                    Span::styled("work › ", Style::default().fg(Color::DarkGray)),
+                    Span::raw("       "),
+                ));
+            }
+            EntryRole::FinalAnswer => {
+                let text = sanitize_terminal_text(&entry.text);
+                let rendered =
+                    render_markdown_text_with_width(&text, Some(width.saturating_sub(7)));
+                out.extend(prefix_lines(
+                    rendered.lines,
+                    Span::styled(
+                        "done › ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("       "),
+                ));
             }
             EntryRole::User => {
                 let text = sanitize_terminal_text(&entry.text);
@@ -1029,6 +2261,29 @@ impl App {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
             }
+            EntryRole::ActivityGroup => {
+                if let Some(group) = &entry.activity_group {
+                    out.extend(render_activity_group_entry(
+                        group,
+                        width,
+                        self.activity_group_is_expanded(group),
+                        self.activity_group_is_focused(group),
+                        group.is_live.then(|| self.active_spinner()),
+                    ));
+                }
+            }
+            EntryRole::CompletedSummary => {
+                let text = sanitize_terminal_text(&entry.text);
+                out.extend(prefix_wrapped_lines(
+                    &text,
+                    width,
+                    "sum  › ",
+                    "       ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             EntryRole::ToolUse => {
                 out.extend(render_tool_use_entry(entry, width));
             }
@@ -1039,6 +2294,18 @@ impl App {
                 out.extend(render_tool_result_entry(entry, width, self.panel_visible()));
             }
         }
+    }
+
+    fn activity_group_is_expanded(&self, group: &TuiActivityGroup) -> bool {
+        group.is_live || !group.collapsed
+    }
+
+    fn activity_group_is_focused(&self, group: &TuiActivityGroup) -> bool {
+        !group.is_live
+            && self
+                .focused_activity_group_id
+                .as_deref()
+                .is_some_and(|focused_id| focused_id == group.id)
     }
 
     fn transcript_lines_for_area(&self, area: Rect) -> Vec<Line<'static>> {
@@ -1089,6 +2356,244 @@ fn transcript_line_has_content(line: &Line<'_>) -> bool {
     line.spans
         .iter()
         .any(|span| !span.content.trim().is_empty())
+}
+
+fn transcript_point_leq(left: TranscriptPoint, right: TranscriptPoint) -> bool {
+    left.line < right.line || (left.line == right.line && left.column <= right.column)
+}
+
+fn apply_transcript_selection(lines: &mut [Line<'static>], selection: Option<TranscriptSelection>) {
+    let Some(range) = selection.and_then(TranscriptSelection::range) else {
+        return;
+    };
+
+    for (line_index, line) in lines.iter_mut().enumerate() {
+        let Some((start, end)) = selection_columns_for_line(&range, line_index, line.width())
+        else {
+            continue;
+        };
+        *line = highlight_line_range(line, start, end);
+    }
+}
+
+fn selection_columns_for_line(
+    range: &TranscriptSelectionRange,
+    line_index: usize,
+    line_width: usize,
+) -> Option<(usize, usize)> {
+    if line_index < range.start.line || line_index > range.end.line || line_width == 0 {
+        return None;
+    }
+
+    let start = if line_index == range.start.line {
+        range.start.column.min(line_width)
+    } else {
+        0
+    };
+    let end = if line_index == range.end.line {
+        range.end.column.min(line_width)
+    } else {
+        line_width
+    };
+
+    (end > start).then_some((start, end))
+}
+
+fn highlight_line_range(line: &Line<'static>, start: usize, end: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut column = 0;
+    for span in &line.spans {
+        spans.extend(highlight_span_range(span, start, end, &mut column));
+    }
+    Line::from(spans)
+}
+
+fn highlight_span_range(
+    span: &Span<'static>,
+    start: usize,
+    end: usize,
+    column: &mut usize,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut buffer = String::new();
+    let mut buffer_selected: Option<bool> = None;
+    for ch in span.content.as_ref().chars() {
+        let width = char_display_width(ch);
+        let ch_start = *column;
+        let ch_end = ch_start.saturating_add(width);
+        let selected = ch_end > start && ch_start < end;
+        if buffer_selected != Some(selected) {
+            flush_selection_segment(&mut spans, &mut buffer, span.style, buffer_selected);
+            buffer_selected = Some(selected);
+        }
+        buffer.push(ch);
+        *column = ch_end;
+    }
+    flush_selection_segment(&mut spans, &mut buffer, span.style, buffer_selected);
+    spans
+}
+
+fn flush_selection_segment(
+    spans: &mut Vec<Span<'static>>,
+    buffer: &mut String,
+    base_style: Style,
+    selected: Option<bool>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let style = if selected.unwrap_or(false) {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        base_style
+    };
+    spans.push(Span::styled(std::mem::take(buffer), style));
+}
+
+fn selected_text_from_lines(lines: &[Line<'_>], range: TranscriptSelectionRange) -> Option<String> {
+    if lines.is_empty() || range.start.line >= lines.len() {
+        return None;
+    }
+
+    let end_line = range.end.line.min(lines.len().saturating_sub(1));
+    let mut selected = Vec::new();
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .take(end_line + 1)
+        .skip(range.start.line)
+    {
+        let text = line_text(line);
+        let line_width = text_display_width(&text);
+        let Some((start, end)) = selection_columns_for_line(&range, line_index, line_width) else {
+            selected.push(String::new());
+            continue;
+        };
+        selected.push(display_slice(&text, start, end));
+    }
+
+    let text = selected.join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn display_slice(text: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    let mut column: usize = 0;
+    for ch in text.chars() {
+        let width = char_display_width(ch);
+        let ch_start = column;
+        let ch_end = ch_start.saturating_add(width);
+        if ch_end > start && ch_start < end {
+            out.push(ch);
+        }
+        column = ch_end;
+    }
+    out
+}
+
+fn url_at_display_column(text: &str, column: usize) -> Option<String> {
+    CLICKABLE_URL_RE.find_iter(text).find_map(|match_| {
+        let url = trim_clickable_url(match_.as_str());
+        if url.is_empty() {
+            return None;
+        }
+        let start = text_display_width(&text[..match_.start()]);
+        let end = start.saturating_add(text_display_width(url));
+        (column >= start && column <= end).then(|| url.to_string())
+    })
+}
+
+fn trim_clickable_url(url: &str) -> &str {
+    url.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']'])
+}
+
+fn text_display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    ch.width().unwrap_or(0).max(1)
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        copy_text_to_macos_clipboard(text)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        copy_text_to_terminal_clipboard(text)
+    }
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+
+    let status = ProcessCommand::new(opener)
+        .arg(url)
+        .status()
+        .map_err(|error| format!("failed to launch {opener}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{opener} exited with status {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_text_to_macos_clipboard(text: &str) -> Result<(), String> {
+    let mut child = ProcessCommand::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to launch pbcopy: {error}"))?;
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "failed to open pbcopy stdin".to_string())?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write selection to pbcopy: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed waiting for pbcopy: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pbcopy exited with status {status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_text_to_terminal_clipboard(text: &str) -> Result<(), String> {
+    let sequence = osc52_sequence(text, std::env::var_os("TMUX").is_some());
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(sequence.as_bytes())
+        .map_err(|error| format!("failed to write OSC 52 clipboard sequence: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to flush OSC 52 clipboard sequence: {error}"))
+}
+
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    if tmux {
+        format!("\x1bPtmux;\x1b{sequence}\x1b\\")
+    } else {
+        sequence
+    }
 }
 
 fn should_dismiss_welcome(entries: &[Entry], input: &str) -> bool {
@@ -1203,7 +2708,7 @@ fn discover_built_skills(installed: &[LocalSkillSummary]) -> Vec<LocalSkillSumma
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| read_built_skill(&entry.path(), &installed))
         .collect::<Vec<_>>();
-    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    skills.sort_by_key(|skill| skill.name.to_lowercase());
     skills
 }
 
@@ -1222,7 +2727,7 @@ fn discover_installed_skills_from(path: &Path) -> Vec<LocalSkillSummary> {
         .filter(|entry| entry.path().is_dir())
         .map(|entry| read_skill_manifest(&entry.path()))
         .collect::<Vec<_>>();
-    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    skills.sort_by_key(|skill| skill.name.to_lowercase());
     skills
 }
 
@@ -1665,347 +3170,79 @@ fn normalize_tool_arguments(arguments: Value) -> Option<Value> {
     }
 }
 
-fn should_update_tool_use(entry: &Entry, name: &str) -> bool {
-    matches!(entry.role, EntryRole::ToolUse)
-        && entry.tool_name.as_deref() == Some(name)
-        && entry.tool_arguments.is_none()
-}
-
-fn render_tool_use_entry(entry: &Entry, width: usize) -> Vec<Line<'static>> {
-    let content_width = tool_content_width(width);
-    let lines = wrap_tool_text_lines(&tool_use_summary_lines(entry, content_width), content_width);
-    prefix_tool_lines(lines, EntryRole::ToolUse)
-}
-
-fn render_tool_result_entry(
-    entry: &Entry,
-    width: usize,
-    panel_visible: bool,
-) -> Vec<Line<'static>> {
-    let content_width = tool_content_width(width);
-    let text = sanitize_terminal_text(&entry.text);
-    let plan = tool_result_render_plan(&text, content_width);
-    let mut lines = wrap_tool_text_lines(
-        &tool_result_summary_lines(entry, &text, plan.summarize),
-        content_width,
-    );
-    let budget = TOOL_RESULT_MAX_LINES.saturating_sub(lines.len());
-    lines.extend(tool_result_preview_lines(
-        entry,
-        content_width,
-        budget,
-        panel_visible,
-        plan,
-    ));
-    prefix_tool_lines(lines, entry.role)
-}
-
-fn tool_content_width(width: usize) -> usize {
-    width.saturating_sub(TOOL_PREFIX_DISPLAY_WIDTH).max(1)
-}
-
-fn prefix_tool_lines(lines: Vec<Line<'static>>, role: EntryRole) -> Vec<Line<'static>> {
-    let (initial, style) = tool_prefix(role);
-    prefix_lines(
-        lines,
-        Span::styled(initial, style),
-        Span::raw(tool_continuation_prefix()),
-    )
-}
-
-fn tool_continuation_prefix() -> String {
-    " ".repeat(TOOL_PREFIX_DISPLAY_WIDTH)
-}
-
-fn tool_prefix(role: EntryRole) -> (&'static str, Style) {
-    match role {
-        EntryRole::ToolUse => (TOOL_USE_PREFIX, Style::default().fg(Color::Magenta)),
-        EntryRole::ToolResult => (TOOL_RESULT_PREFIX, Style::default().fg(Color::Green)),
-        EntryRole::ToolError => (
-            TOOL_ERROR_PREFIX,
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        _ => (TOOL_RESULT_PREFIX, Style::default()),
-    }
-}
-
-fn wrap_tool_text_lines(lines: &[String], width: usize) -> Vec<Line<'static>> {
-    let mut rendered = Vec::new();
-    for line in lines {
-        rendered.extend(wrap_tool_output_text(line, width));
-    }
-    if rendered.is_empty() {
-        rendered.push(Line::default());
-    }
-    rendered
-}
-
-fn tool_use_summary_lines(entry: &Entry, width: usize) -> Vec<String> {
-    let mut lines = vec![format!("▶ {}", tool_label(entry.tool_name.as_deref()))];
-    if let Some(arguments) = &entry.tool_arguments {
-        lines.extend(tool_argument_summary_lines(
-            entry.tool_name.as_deref(),
-            arguments,
-            width,
-        ));
-    }
-    truncate_tool_use_summary(lines)
-}
-
-fn truncate_tool_use_summary(lines: Vec<String>) -> Vec<String> {
-    if lines.len() <= TOOL_USE_MAX_LINES {
-        return lines;
-    }
-    let mut limited = lines[..TOOL_USE_MAX_LINES - 1].to_vec();
-    limited.push(format!(
-        "  … {} more fields",
-        lines.len() - TOOL_USE_MAX_LINES + 1
-    ));
-    limited
-}
-
-fn tool_argument_summary_lines(
-    tool_name: Option<&str>,
-    arguments: &Value,
-    width: usize,
-) -> Vec<String> {
-    match arguments {
-        Value::Object(map) => tool_object_summary_lines(tool_name, map, width),
-        other => vec![format!(
-            "  args: {}",
-            summarize_tool_value(other, width.saturating_sub(10))
-        )],
-    }
-}
-
-fn tool_object_summary_lines(
-    tool_name: Option<&str>,
-    map: &serde_json::Map<String, Value>,
-    width: usize,
-) -> Vec<String> {
-    let fields = prioritized_tool_fields(tool_name, map);
-    let mut lines = fields
-        .into_iter()
-        .take(TOOL_USE_FIELD_LIMIT)
-        .map(|(key, value)| {
-            let available = width.saturating_sub(key.len() + 7);
-            format!("  {key}: {}", summarize_tool_value(value, available))
+fn legacy_tool_call_id(name: &str, ordinal: usize) -> String {
+    let slug = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
         })
-        .collect::<Vec<_>>();
-    let remaining = map.len().saturating_sub(TOOL_USE_FIELD_LIMIT);
-    if remaining > 0 {
-        lines.push(format!("  … {remaining} more fields"));
-    }
-    lines
+        .collect::<String>();
+    format!("legacy-tool-{}-{}", ordinal.saturating_add(1), slug)
 }
 
-fn prioritized_tool_fields<'a>(
-    tool_name: Option<&str>,
-    map: &'a serde_json::Map<String, Value>,
-) -> Vec<(&'a String, &'a Value)> {
-    let mut fields = map.iter().collect::<Vec<_>>();
-    if tool_name == Some("run_experiment") {
-        fields.sort_by_key(|(key, _)| (experiment_tool_argument_priority(key), key.as_str()));
-    }
-    fields
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn experiment_tool_argument_priority(key: &str) -> usize {
-    match key {
-        "signal" => 0,
-        "hypothesis" => 1,
-        "scope" => 2,
-        "nodes" => 3,
-        "mode" => 4,
-        "timeout" => 5,
-        _ => 6,
-    }
+fn non_empty_trimmed(text: String) -> Option<String> {
+    non_empty_trimmed_str(&text)
 }
 
-fn summarize_tool_value(value: &Value, limit: usize) -> String {
-    match value {
-        Value::String(text) => {
-            format!("\"{}\"", preview_text(&sanitize_terminal_text(text), limit))
-        }
-        Value::Array(items) => format!("[{} items]", items.len()),
-        Value::Object(map) => format!("{{{} keys}}", map.len()),
-        other => other.to_string(),
-    }
+fn non_empty_trimmed_str(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn preview_text(text: &str, limit: usize) -> String {
-    let preview_limit = limit.clamp(4, TOOL_VALUE_PREVIEW_CHARS);
-    truncate_text(
-        &text.split_whitespace().collect::<Vec<_>>().join(" "),
-        preview_limit,
-    )
+fn normalized_tool_call_id(id: Option<&str>, name: Option<&str>) -> String {
+    id.and_then(non_empty_trimmed_str)
+        .or_else(|| name.and_then(non_empty_trimmed_str))
+        .unwrap_or_else(|| "tool".to_string())
 }
 
-fn tool_result_summary_lines(entry: &Entry, text: &str, summarize_experiment: bool) -> Vec<String> {
-    let status = if matches!(entry.role, EntryRole::ToolError) {
-        "failure"
+fn normalized_backend_activity_group_id(id: &str) -> String {
+    let normalized = non_empty_trimmed_str(id).unwrap_or_else(|| "activity".to_string());
+    if normalized.starts_with(SYNTHETIC_ACTIVITY_GROUP_PREFIX) {
+        // Keep the TUI's generated legacy namespace private. If a backend ever
+        // emits the same prefix, render it as a distinct real backend group
+        // rather than merging it with synthetic compatibility entries.
+        format!("backend:{normalized}")
     } else {
-        "success"
+        normalized
+    }
+}
+
+fn activity_tool_call_index(
+    group: &TuiActivityGroup,
+    id: &str,
+    name: Option<&str>,
+) -> Option<usize> {
+    if let Some(index) = group.tool_calls.iter().position(|call| call.id == id) {
+        return Some(index);
+    }
+    let Some(name) = name.and_then(non_empty_trimmed_str) else {
+        return group
+            .tool_calls
+            .iter()
+            .rposition(|call| call.success.is_none());
     };
-    let label = tool_label(entry.tool_name.as_deref());
-    let mut lines = vec![format!(
-        "{} {label} ({status})",
-        tool_status_icon(entry.role)
-    )];
-    if summarize_experiment {
-        lines.extend(experiment_result_summary_lines(text));
+    group
+        .tool_calls
+        .iter()
+        .rposition(|call| call.name == name && call.success.is_none())
+}
+
+fn append_activity_group_narration(group: &mut TuiActivityGroup, delta: &str) {
+    if group.narration.is_none() && delta.trim().is_empty() {
+        return;
     }
-    lines
-}
-
-fn tool_label(name: Option<&str>) -> String {
-    let sanitized = sanitize_terminal_text(name.unwrap_or("tool"));
-    if sanitized.trim().is_empty() {
-        "tool".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn tool_status_icon(role: EntryRole) -> &'static str {
-    if matches!(role, EntryRole::ToolError) {
-        "✗"
-    } else {
-        "✓"
-    }
-}
-
-fn experiment_result_summary_lines(text: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(decision) = find_prefixed_line(text, "Decision:") {
-        lines.push(collapse_whitespace(decision));
-    }
-    if let Some(score_line) = find_experiment_score_line(text) {
-        lines.push(collapse_whitespace(score_line));
-    }
-    if let Some(chain_entry) = find_line_containing(text, "Chain entry #") {
-        lines.push(collapse_whitespace(chain_entry));
-    }
-    lines
-}
-
-fn find_prefixed_line<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    text.lines()
-        .find(|line| line.trim_start().starts_with(prefix))
-}
-
-fn find_experiment_score_line(text: &str) -> Option<&str> {
-    text.lines()
-        .find(|line| line.contains("score:") && line.contains("WINNER"))
-        .or_else(|| text.lines().find(|line| line.contains("score:")))
-}
-
-fn find_line_containing<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
-    text.lines().find(|line| line.contains(needle))
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-struct ToolResultRenderPlan {
-    wrapped_output: Vec<Line<'static>>,
-    summarize: bool,
-}
-
-fn tool_result_preview_lines(
-    entry: &Entry,
-    width: usize,
-    limit: usize,
-    panel_visible: bool,
-    plan: ToolResultRenderPlan,
-) -> Vec<Line<'static>> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let total_lines = plan.wrapped_output.len();
-    if plan.summarize {
-        return experiment_notice_lines(entry, width, panel_visible, limit, total_lines);
-    }
-    truncate_wrapped_lines(
-        plan.wrapped_output,
-        width,
-        limit,
-        tool_result_notice(entry, panel_visible, total_lines),
-    )
-}
-
-fn has_experiment_summary(text: &str) -> bool {
-    !experiment_result_summary_lines(text).is_empty()
-}
-
-fn tool_result_render_plan(text: &str, width: usize) -> ToolResultRenderPlan {
-    let wrapped_output = wrap_tool_output_text(text, width);
-    let summarize = has_experiment_summary(text) && wrapped_output.len() > TOOL_RESULT_MAX_LINES;
-    ToolResultRenderPlan {
-        wrapped_output,
-        summarize,
-    }
-}
-
-fn experiment_notice_lines(
-    entry: &Entry,
-    width: usize,
-    panel_visible: bool,
-    limit: usize,
-    total_lines: usize,
-) -> Vec<Line<'static>> {
-    let notice = wrap_plain_text(
-        &tool_result_notice(entry, panel_visible, total_lines),
-        width,
-    );
-    notice.into_iter().take(limit).collect()
-}
-
-fn truncate_wrapped_lines(
-    wrapped: Vec<Line<'static>>,
-    width: usize,
-    limit: usize,
-    notice: String,
-) -> Vec<Line<'static>> {
-    if wrapped.len() <= limit {
-        return wrapped;
-    }
-    let notice_lines = wrap_tool_output_text(&notice, width);
-    let keep = limit.saturating_sub(notice_lines.len());
-    let mut out = wrapped.into_iter().take(keep).collect::<Vec<_>>();
-    out.extend(
-        notice_lines
-            .into_iter()
-            .take(limit.saturating_sub(out.len())),
-    );
-    out
-}
-
-fn tool_result_notice(entry: &Entry, panel_visible: bool, total_lines: usize) -> String {
-    if panel_visible && entry.tool_name.as_deref() == Some("run_experiment") {
-        return format!("[full output: {total_lines} lines — see Experiment panel →]");
-    }
-    format!("[full output: {total_lines} lines — truncated in transcript]")
-}
-
-fn wrap_tool_output_text(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let options = textwrap::Options::new(width).break_words(true);
-    for raw_line in text.lines() {
-        out.extend(
-            textwrap::wrap(raw_line, &options)
-                .into_iter()
-                .map(|line| Line::from(line.into_owned())),
-        );
-    }
-    if text.ends_with('\n') {
-        out.push(Line::default());
-    }
-    if out.is_empty() {
-        out.push(Line::default());
-    }
-    out
+    group
+        .narration
+        .get_or_insert_with(String::new)
+        .push_str(delta);
 }
 
 fn prefix_wrapped_lines(
@@ -2075,6 +3312,7 @@ fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
         EnterAlternateScreen,
         EnableAlternateScroll,
         EnableMouseCapture,
+        EnableBracketedPaste,
         SetTitle("Fawx")
     )
     .context("enter alt screen")?;
@@ -2087,6 +3325,7 @@ fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         DisableAlternateScroll,
         LeaveAlternateScreen
@@ -2164,19 +3403,22 @@ mod tests {
             rx,
         );
         app.entries.clear();
+        app.spinner_frames = &UNICODE_ACTIVE_FRAMES;
         app
     }
 
     fn live_like_test_app() -> App {
         let backend: Arc<dyn EngineBackend> = Arc::new(TestBackend::default());
         let (tx, rx) = unbounded_channel();
-        App::new(
+        let mut app = App::new(
             backend,
             crate::DEFAULT_ENGINE_URL.to_string(),
             Arc::new(Mutex::new(ExperimentPanel::new())),
             tx,
             rx,
-        )
+        );
+        app.spinner_frames = &UNICODE_ACTIVE_FRAMES;
+        app
     }
 
     #[derive(Default)]
@@ -2728,10 +3970,896 @@ mod tests {
             content: "═══ Experiment Complete ═══\nDecision:      ✅ ACCEPT\nnode-0 Conservative score: 8.73 ← WINNER\nChain entry #7 recorded".to_string(),
         });
 
+        assert_eq!(app.entries.len(), 1);
+        let group = app.entries[0]
+            .activity_group
+            .as_ref()
+            .expect("legacy tool events should normalize into an activity group");
+        assert!(group.synthetic);
+        assert_eq!(group.tool_calls.len(), 1);
+        assert_eq!(group.tool_calls[0].name, "run_experiment");
+        assert!(group.tool_calls[0].arguments.is_some());
+        assert_eq!(group.tool_calls[0].success, Some(true));
+    }
+
+    #[test]
+    fn repeated_legacy_tool_use_events_get_distinct_call_slots() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "echo first" }),
+        });
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "echo second" }),
+        });
+        app.handle_backend_event(BackendEvent::ToolResult {
+            name: None,
+            success: true,
+            content: "second".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::ToolResult {
+            name: None,
+            success: true,
+            content: "first".to_string(),
+        });
+
+        let group = app.entries[0]
+            .activity_group
+            .as_ref()
+            .expect("legacy activity group");
+        assert!(group.synthetic);
+        assert_eq!(group.tool_calls.len(), 2);
+        assert_ne!(group.tool_calls[0].id, group.tool_calls[1].id);
+        assert_eq!(group.tool_calls[0].result.as_deref(), Some("first"));
+        assert_eq!(group.tool_calls[1].result.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn backend_activity_ids_cannot_collide_with_synthetic_legacy_namespace() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "legacy" }),
+        });
+        let synthetic_id = app.entries[0]
+            .activity_group
+            .as_ref()
+            .expect("synthetic group")
+            .id
+            .clone();
+
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: synthetic_id.clone(),
+            title: Some("Backend group".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: synthetic_id.clone(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            success: true,
+            content: "backend result".to_string(),
+        });
+
+        let groups = app
+            .entries
+            .iter()
+            .filter_map(|entry| entry.activity_group.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].id, synthetic_id);
+        assert_eq!(groups[1].id, format!("backend:{synthetic_id}"));
+        assert!(!groups[1].synthetic);
+        assert_eq!(
+            groups[1].tool_calls[0].result.as_deref(),
+            Some("backend result")
+        );
+    }
+
+    #[test]
+    fn legacy_tool_events_finish_as_collapsed_activity_before_final_answer() {
+        let mut app = test_app();
+        app.entries
+            .push(Entry::plain(EntryRole::User, "inspect the TUI"));
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm locating the transcript components first.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::ToolUse {
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "tui/src/app.rs" }),
+        });
+        app.handle_backend_event(BackendEvent::ToolResult {
+            name: None,
+            success: true,
+            content: "fn rendered_transcript_lines() {}".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Summarizing,
+        ));
+        app.handle_backend_event(BackendEvent::CompletedSummary(
+            "Worked this turn: 1 file read.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Finalizing,
+        ));
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta(
+            "The TUI has a normalized activity path now.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::Done {
+            model: None,
+            iterations: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        assert!(matches!(app.entries[1].role, EntryRole::ActivityGroup));
+        let group = app.entries[1]
+            .activity_group
+            .as_ref()
+            .expect("synthetic activity group");
+        assert!(group.synthetic);
+        assert!(!group.is_live);
+        assert_eq!(
+            group.narration.as_deref(),
+            Some("I'm locating the transcript components first.")
+        );
+        let group_id = group.id.clone();
+        assert!(matches!(app.entries[2].role, EntryRole::CompletedSummary));
+        assert_eq!(app.entries[2].text, "Worked this turn: 1 file read.");
+        assert!(matches!(app.entries[3].role, EntryRole::FinalAnswer));
+
+        let text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(text.contains("work · ▸ Tool activity · 1 file read"));
+        assert!(text.contains("read_file"));
+        assert!(text.contains("tui/src/app.rs"));
+        assert!(!text.contains("I'm locating the transcript components first."));
+        assert!(!text.contains("fn rendered_transcript_lines()"));
+
+        app.toggle_activity_group_by_id(&group_id);
+        let expanded_text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(expanded_text.contains("work · ▾ Tool activity · 1 file read"));
+        assert!(expanded_text.contains("I'm locating the transcript components first."));
+        assert!(expanded_text.contains("fn rendered_transcript_lines()"));
+    }
+
+    #[test]
+    fn typed_activity_stream_renders_group_summary_then_final_answer() {
+        let mut app = test_app();
+        app.entries
+            .push(Entry::plain(EntryRole::User, "inspect the TUI"));
+
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm locating the transcript code first.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Read TUI files".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolCallStart {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            name: Some("read_file".to_string()),
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolCallComplete {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments: json!({ "path": "tui/src/app.rs" }),
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            success: true,
+            content: "fn rendered_transcript_lines() {}".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::ActivityEnd {
+            id: "act-1".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Summarizing,
+        ));
+        app.handle_backend_event(BackendEvent::CompletedSummary(
+            "Worked this turn: 1 file read.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Finalizing,
+        ));
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta(
+            "The TUI has a typed activity path now.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::Done {
+            model: None,
+            iterations: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        assert!(matches!(app.entries[1].role, EntryRole::ActivityGroup));
+        assert!(matches!(app.entries[2].role, EntryRole::CompletedSummary));
+        assert!(matches!(app.entries[3].role, EntryRole::FinalAnswer));
+
+        let lines = app.rendered_transcript_lines(96);
+        let text = rendered_text(&lines).join("\n");
+        assert!(text.contains("work · ▸ Read TUI files"));
+        assert!(text.contains("read_file"));
+        assert!(text.contains("tui/src/app.rs"));
+        assert!(!text.contains("I'm locating the transcript code first."));
+        assert!(!text.contains("fn rendered_transcript_lines()"));
+        assert!(text.contains("sum  › Worked this turn: 1 file read."));
+        assert!(text.contains("done › The TUI has a typed activity path now."));
+
+        app.toggle_activity_group_by_id("act-1");
+        let expanded_text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(expanded_text.contains("work · ▾ Read TUI files"));
+        assert!(expanded_text.contains("I'm locating the transcript code first."));
+        assert!(expanded_text.contains("✓ read_file"));
+        assert!(expanded_text.contains("fn rendered_transcript_lines()"));
+    }
+
+    #[test]
+    fn executing_tools_boundary_activates_activity_phase() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::ExecutingTools,
+        ));
+
+        assert_eq!(app.active_render_phase(), Some(TuiRenderPhase::Activity));
+
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Inspect files".to_string()),
+            kind: None,
+        });
+
+        assert!(matches!(
+            app.entries.last().and_then(|entry| entry.render_phase),
+            Some(TuiRenderPhase::Activity)
+        ));
+    }
+
+    #[test]
+    fn transcript_render_model_groups_entries_into_turn_phase_sections() {
+        let entries = vec![
+            Entry::plain(EntryRole::User, "inspect"),
+            Entry::working_narration("planning".to_string())
+                .with_render_phase(Some(TuiRenderPhase::Working)),
+            Entry::activity_group(TuiActivityGroup::new(
+                "act-1".to_string(),
+                Some("Read files".to_string()),
+                None,
+                None,
+            ))
+            .with_render_phase(Some(TuiRenderPhase::Activity)),
+            Entry::completed_summary("Worked this turn: 1 file read.".to_string())
+                .with_render_phase(Some(TuiRenderPhase::Summary)),
+            Entry::final_answer("Done.".to_string())
+                .with_render_phase(Some(TuiRenderPhase::Response)),
+        ];
+
+        let model = TuiTranscriptRenderModel::reduce(&entries);
+
+        assert_eq!(model.turns.len(), 1);
+        let phases = model.turns[0]
+            .sections
+            .iter()
+            .map(|section| section.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                None,
+                Some(TuiRenderPhase::Working),
+                Some(TuiRenderPhase::Activity),
+                Some(TuiRenderPhase::Summary),
+                Some(TuiRenderPhase::Response),
+            ]
+        );
+    }
+
+    #[test]
+    fn working_narration_after_activity_start_attaches_to_live_group() {
+        let mut app = test_app();
+        app.entries
+            .push(Entry::plain(EntryRole::User, "inspect the TUI"));
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Read TUI files".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I found the group; now I'm reading the reducer.".to_string(),
+            voiceover_suppressed: false,
+        });
+
         assert_eq!(app.entries.len(), 2);
-        assert_eq!(app.entries[0].tool_name.as_deref(), Some("run_experiment"));
-        assert!(app.entries[0].tool_arguments.is_some());
-        assert_eq!(app.entries[1].tool_name.as_deref(), Some("run_experiment"));
+        assert!(matches!(app.entries[1].role, EntryRole::ActivityGroup));
+        let group = app.entries[1]
+            .activity_group
+            .as_ref()
+            .expect("activity group");
+        assert_eq!(
+            group.narration.as_deref(),
+            Some("I found the group; now I'm reading the reducer.")
+        );
+        assert!(
+            !app.entries
+                .iter()
+                .any(|entry| matches!(entry.role, EntryRole::WorkingNarration)),
+            "late narration should not drift away from the active tool group"
+        );
+    }
+
+    #[test]
+    fn completed_activity_group_toggles_details_from_header_click() {
+        let mut app = test_app();
+        let mut group = TuiActivityGroup::new(
+            "act-1".to_string(),
+            Some("Read TUI files".to_string()),
+            None,
+            Some("I checked the transcript reducer.".to_string()),
+        );
+        group.is_live = false;
+        let mut call = TuiToolCall::new(Some("tool-1".to_string()), Some("read_file".to_string()));
+        call.success = Some(true);
+        call.result = Some("expanded evidence payload from the tool".to_string());
+        group.tool_calls.push(call);
+        app.push_entry_with_phase(Entry::activity_group(group), Some(TuiRenderPhase::Activity));
+        app.transcript_area = Rect::new(0, 0, 100, 12);
+
+        let collapsed = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(collapsed.contains("work · ▸ Read TUI files · 1 file read"));
+        assert!(!collapsed.contains("expanded evidence payload"));
+
+        let inner = transcript_inner_area(app.transcript_area);
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x.saturating_add(1),
+            row: inner.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let expanded = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(expanded.contains("work · ▾ Read TUI files · 1 file read"));
+        assert!(expanded.contains("expanded evidence payload"));
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x.saturating_add(1),
+            row: inner.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let collapsed_again = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(collapsed_again.contains("work · ▸ Read TUI files · 1 file read"));
+        assert!(!collapsed_again.contains("expanded evidence payload"));
+    }
+
+    #[test]
+    fn keyboard_focus_toggles_completed_activity_group_details() {
+        let mut app = test_app();
+        let mut group = TuiActivityGroup::new(
+            "act-1".to_string(),
+            Some("Read TUI files".to_string()),
+            None,
+            None,
+        );
+        group.is_live = false;
+        let mut call = TuiToolCall::new(Some("tool-1".to_string()), Some("read_file".to_string()));
+        call.success = Some(true);
+        call.result = Some("expanded evidence payload from the tool".to_string());
+        group.tool_calls.push(call);
+        app.push_entry_with_phase(Entry::activity_group(group), Some(TuiRenderPhase::Activity));
+
+        let collapsed = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(collapsed.contains("work · ▸ Read TUI files · 1 file read"));
+        assert!(!collapsed.contains("expanded evidence payload"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_activity_group_id.as_deref(), Some("act-1"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let expanded = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(expanded.contains("work · ▾ Read TUI files · 1 file read"));
+        assert!(expanded.contains("expanded evidence payload"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let collapsed_again = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(collapsed_again.contains("work · ▸ Read TUI files · 1 file read"));
+        assert!(!collapsed_again.contains("expanded evidence payload"));
+    }
+
+    #[test]
+    fn collapsed_activity_headers_hide_raw_run_command_json() {
+        let mut app = test_app();
+        let mut group = TuiActivityGroup::new(
+            "act-1".to_string(),
+            Some("Ran 1 tool".to_string()),
+            None,
+            None,
+        );
+        group.is_live = false;
+        let mut call =
+            TuiToolCall::new(Some("tool-1".to_string()), Some("run_command".to_string()));
+        call.arguments = Some(json!({
+            "argv": [
+                "gh",
+                "pr",
+                "comment",
+                "1858",
+                "--repo",
+                "fawxai/fawx",
+                "--body",
+                "Review posted"
+            ]
+        }));
+        call.progress = Some(TuiToolProgress {
+            category: "mutation".to_string(),
+            target: Some("run_command:{\"argv\":[\"gh\",\"pr\",\"comment\",\"1858\"]}".to_string()),
+            advances_slot: None,
+            outcome: "advanced".to_string(),
+        });
+        call.success = Some(true);
+        group.tool_calls.push(call);
+        app.push_entry_with_phase(Entry::activity_group(group), Some(TuiRenderPhase::Activity));
+
+        let collapsed = rendered_text(&app.rendered_transcript_lines(120)).join("\n");
+
+        assert!(collapsed.contains("gh pr comment 1858 --repo fawxai/fawx --body Review posted"));
+        assert!(!collapsed.contains("{\"argv\""));
+        assert!(!collapsed.contains("run_command:{"));
+    }
+
+    #[test]
+    fn live_activity_group_header_surfaces_latest_tool_progress() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ToolProgress {
+            activity_id: Some("act-1".to_string()),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            category: "file".to_string(),
+            target: Some("src/app.rs".to_string()),
+            advances_slot: None,
+            outcome: "reading".to_string(),
+        });
+
+        let text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(text.contains("work · ◐ Working · reading src/app.rs"));
+        assert!(text.contains("1 file read, 1 running"));
+    }
+
+    #[test]
+    fn active_spinner_advances_during_live_activity() {
+        let mut app = test_app();
+        app.pending_request = true;
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: None,
+            kind: None,
+        });
+
+        let first = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(first.contains("work · ◐ Working"));
+
+        for _ in 0..4 {
+            app.advance_spinner();
+        }
+
+        let second = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(second.contains("work · ◓ Working"));
+    }
+
+    #[test]
+    fn spinner_uses_ascii_fallback_for_limited_terminals() {
+        assert_eq!(
+            active_spinner_frames_for_env(None, Some("linux"), Some("en_US.UTF-8")),
+            &ASCII_ACTIVE_FRAMES
+        );
+        assert_eq!(
+            active_spinner_frames_for_env(None, Some("xterm-256color"), Some("C")),
+            &ASCII_ACTIVE_FRAMES
+        );
+        assert_eq!(
+            active_spinner_frames_for_env(Some("1"), Some("xterm-256color"), Some("en_US.UTF-8")),
+            &ASCII_ACTIVE_FRAMES
+        );
+        assert_eq!(
+            active_spinner_frames_for_env(None, Some("xterm-256color"), Some("en_US.UTF-8")),
+            &UNICODE_ACTIVE_FRAMES
+        );
+    }
+
+    #[test]
+    fn expanded_activity_group_state_survives_recreated_entries() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Read files".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            success: true,
+            content: "first payload".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::ActivityEnd {
+            id: "act-1".to_string(),
+        });
+        app.toggle_activity_group_by_id("act-1");
+
+        assert!(
+            !app.entries[0]
+                .activity_group
+                .as_ref()
+                .expect("activity group")
+                .collapsed
+        );
+
+        app.entries.clear();
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Read files".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            success: true,
+            content: "rebuilt payload".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::ActivityEnd {
+            id: "act-1".to_string(),
+        });
+
+        let group = app.entries[0]
+            .activity_group
+            .as_ref()
+            .expect("recreated activity group");
+        assert!(!group.collapsed);
+        let text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(text.contains("rebuilt payload"));
+    }
+
+    #[test]
+    fn transcript_renders_phase_separators_and_live_final_answer() {
+        let mut app = test_app();
+        app.entries.push(Entry::plain(EntryRole::User, "inspect"));
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm checking the reducer.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::ActivityStart {
+            id: "act-1".to_string(),
+            title: Some("Read TUI files".to_string()),
+            kind: None,
+        });
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: "act-1".to_string(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("read_file".to_string()),
+            success: true,
+            content: "payload".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::ActivityEnd {
+            id: "act-1".to_string(),
+        });
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Summarizing,
+        ));
+        app.handle_backend_event(BackendEvent::CompletedSummary(
+            "Worked this turn: 1 file read.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::TranscriptPhaseBoundary(
+            TranscriptPhaseBoundary::Finalizing,
+        ));
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta("Here is ".to_string()));
+
+        let streaming = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(streaming.contains("╌╌ Activity"));
+        assert!(streaming.contains("━━ Completed work"));
+        assert!(streaming.contains("══ Response"));
+        assert!(!streaming.contains("I'm checking the reducer."));
+        assert!(streaming.contains("done › Here is"));
+
+        app.toggle_activity_group_by_id("act-1");
+        let expanded_streaming = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(expanded_streaming.contains("I'm checking the reducer."));
+
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta("the answer.".to_string()));
+        let updated = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(updated.contains("done › Here is the answer."));
+    }
+
+    #[test]
+    fn working_narration_without_activity_stays_muted_and_separate() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm thinking through the request.".to_string(),
+            voiceover_suppressed: false,
+        });
+
+        assert!(matches!(app.entries[0].role, EntryRole::WorkingNarration));
+        let text = rendered_text(&app.rendered_transcript_lines(80)).join("\n");
+        assert!(text.contains("work › I'm thinking through the request."));
+    }
+
+    #[test]
+    fn suppressed_working_narration_is_not_preserved_as_voiceover() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm reading app.".to_string(),
+            voiceover_suppressed: true,
+        });
+
+        assert!(
+            app.entries.is_empty(),
+            "tool-progress narration should be represented by the tool card, not duplicated"
+        );
+    }
+
+    #[test]
+    fn text_preview_streams_as_candidate_answer_until_reset() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::TextPreviewDelta(
+            "Current Architecture Assessment".to_string(),
+        ));
+
+        let text = rendered_text(&app.rendered_transcript_lines(96)).join("\n");
+        assert!(text.contains("fawx › Current Architecture Assessment"));
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn text_reset_demotes_preview_to_working_narration() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::TextPreviewDelta(
+            "I'm locating the transcript components first.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::TextReset);
+
+        assert_eq!(app.entries.len(), 1);
+        assert!(matches!(app.entries[0].role, EntryRole::WorkingNarration));
+        assert_eq!(
+            app.entries[0].text,
+            "I'm locating the transcript components first."
+        );
+        assert_eq!(app.streaming_text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn text_reset_does_not_remove_committed_working_narration() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I'm checking the reducer.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::TextReset);
+
+        assert_eq!(app.entries.len(), 1);
+        assert!(matches!(app.entries[0].role, EntryRole::WorkingNarration));
+        assert_eq!(app.entries[0].text, "I'm checking the reducer.");
+    }
+
+    #[test]
+    fn final_answer_delta_replaces_already_rendered_preview() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::TextPreviewDelta("Done.".to_string()));
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta("Done.".to_string()));
+        app.handle_backend_event(BackendEvent::Done {
+            model: None,
+            iterations: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        assert_eq!(app.entries.len(), 1);
+        assert!(matches!(app.entries[0].role, EntryRole::FinalAnswer));
+        assert_eq!(app.entries[0].text, "Done.");
+    }
+
+    #[test]
+    fn transcript_selection_highlights_rendered_spans() {
+        let mut lines = vec![Line::from("abcdef")];
+        apply_transcript_selection(
+            &mut lines,
+            Some(TranscriptSelection {
+                anchor: TranscriptPoint { line: 0, column: 1 },
+                focus: TranscriptPoint { line: 0, column: 4 },
+                dragging: false,
+            }),
+        );
+
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["a", "bcd", "ef"]
+        );
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::White));
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn mouse_drag_selects_visible_transcript_text() {
+        let mut app = test_app();
+        app.entries
+            .push(Entry::plain(EntryRole::System, "hello world"));
+        app.transcript_area = Rect::new(0, 0, 40, 6);
+        let inner = transcript_inner_area(app.transcript_area);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 7,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: inner.x + 12,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: inner.x + 12,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected_transcript_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn esc_clears_transcript_selection_before_quitting() {
+        let mut app = test_app();
+        app.transcript_selection = Some(TranscriptSelection {
+            anchor: TranscriptPoint { line: 0, column: 0 },
+            focus: TranscriptPoint { line: 0, column: 1 },
+            dragging: false,
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.transcript_selection.is_none());
+        assert!(!app.should_quit);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn selected_text_from_lines_preserves_multiline_selection() {
+        let lines = vec![
+            Line::from("alpha"),
+            Line::from("bravo"),
+            Line::from("charlie"),
+        ];
+        let selected = selected_text_from_lines(
+            &lines,
+            TranscriptSelectionRange {
+                start: TranscriptPoint { line: 0, column: 2 },
+                end: TranscriptPoint { line: 2, column: 4 },
+            },
+        );
+
+        assert_eq!(selected.as_deref(), Some("pha\nbravo\nchar"));
+    }
+
+    #[test]
+    fn url_at_display_column_finds_visible_http_link() {
+        let line = "See docs (https://example.com/path).";
+
+        assert_eq!(
+            url_at_display_column(line, 14).as_deref(),
+            Some("https://example.com/path")
+        );
+        assert_eq!(url_at_display_column(line, 3), None);
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_selected_text_for_terminal_clipboard() {
+        assert_eq!(osc52_sequence("hello", false), "\u{1b}]52;c;aGVsbG8=\u{7}");
+        assert_eq!(
+            osc52_sequence("hello", true),
+            "\u{1b}Ptmux;\u{1b}\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}\\"
+        );
+    }
+
+    #[test]
+    fn text_reset_during_final_answer_preserves_existing_output() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I checked the relevant files.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::FinalAnswerDelta(
+            "Here is the final answer.".to_string(),
+        ));
+        app.handle_backend_event(BackendEvent::TextReset);
+        app.handle_backend_event(BackendEvent::Done {
+            model: None,
+            iterations: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+        });
+
+        assert!(matches!(app.entries[0].role, EntryRole::WorkingNarration));
+        assert_eq!(app.entries[0].text, "I checked the relevant files.");
+        assert!(matches!(app.entries[1].role, EntryRole::FinalAnswer));
+        assert_eq!(app.entries[1].text, "Here is the final answer.");
+    }
+
+    #[test]
+    fn stream_error_preserves_committed_working_narration() {
+        let mut app = test_app();
+        app.pending_request = true;
+        app.streaming_text = Some(String::new());
+        app.handle_backend_event(BackendEvent::WorkingNarrationDelta {
+            text: "I started checking the workspace.".to_string(),
+            voiceover_suppressed: false,
+        });
+        app.handle_backend_event(BackendEvent::StreamError("cancelled".to_string()));
+
+        assert!(matches!(app.entries[0].role, EntryRole::WorkingNarration));
+        assert_eq!(app.entries[0].text, "I started checking the workspace.");
+        assert!(matches!(app.entries[1].role, EntryRole::Error));
+        assert!(!app.pending_request);
+        assert!(app.final_answer_text.is_none());
+    }
+
+    #[test]
+    fn orphan_activity_end_is_ignored_without_creating_a_group() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ActivityEnd {
+            id: "missing-activity".to_string(),
+        });
+
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn orphan_activity_tool_result_creates_defensive_group() {
+        let mut app = test_app();
+        app.handle_backend_event(BackendEvent::ActivityToolResult {
+            activity_id: "late-activity".to_string(),
+            id: Some("tool-1".to_string()),
+            tool_name: Some("run_command".to_string()),
+            success: true,
+            content: "done".to_string(),
+        });
+
+        let group = app.entries[0]
+            .activity_group
+            .as_ref()
+            .expect("late tool result should create a defensive activity group");
+        assert_eq!(group.id, "late-activity");
+        assert_eq!(group.tool_calls.len(), 1);
+        assert_eq!(group.tool_calls[0].name, "run_command");
+        assert_eq!(group.tool_calls[0].success, Some(true));
+    }
+
+    #[test]
+    fn transcript_render_buffer_is_bounded() {
+        let mut app = test_app();
+        for index in 0..(MAX_TRANSCRIPT_ENTRIES + 12) {
+            app.push_system(format!("entry {index}"));
+        }
+
+        assert_eq!(app.entries.len(), MAX_TRANSCRIPT_ENTRIES);
+        assert_eq!(app.entries[0].text, "entry 12");
+        let expected_last = format!("entry {}", MAX_TRANSCRIPT_ENTRIES + 11);
+        assert_eq!(
+            app.entries.last().map(|entry| entry.text.as_str()),
+            Some(expected_last.as_str())
+        );
     }
 
     #[test]
@@ -2925,6 +5053,19 @@ mod tests {
         assert!(actual.contains(INPUT_PLACEHOLDER));
         assert!(actual.contains(SHORTCUT_HINT));
         assert!(!actual.contains("persistent memory assistant"));
+    }
+
+    #[test]
+    fn bracketed_multiline_paste_appends_to_input_without_submitting() {
+        let mut app = test_app();
+
+        app.handle_terminal_event(CEvent::Paste(
+            "first line\r\nsecond line\nthird line".to_string(),
+        ));
+
+        assert_eq!(app.input, "first line\nsecond line\nthird line");
+        assert!(app.entries.is_empty());
+        assert!(!app.pending_request);
     }
 
     #[test]

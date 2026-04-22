@@ -1,8 +1,9 @@
 use super::*;
-use crate::act::{ToolExecutor, ToolResult};
+use crate::act::{ToolExecutionDiagnostics, ToolExecutor, ToolResult};
 use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
+use crate::FailureClass;
 use async_trait::async_trait;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::types::{InputSource, ScreenState, UserInput};
@@ -11,7 +12,7 @@ use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, Message, ProviderError, ToolCall,
     ToolDefinition,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -206,6 +207,7 @@ impl ToolExecutor for StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -233,12 +235,124 @@ impl ToolExecutor for AlwaysFailingToolExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "tool crashed: segfault".to_string(),
+                failure_class: None,
             })
             .collect())
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![read_file_def()]
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ScriptedToolOutcome {
+    expected_tool: &'static str,
+    success: bool,
+    output: &'static str,
+    failure_class: Option<FailureClass>,
+    diagnostics: Option<ToolExecutionDiagnostics>,
+}
+
+impl ScriptedToolOutcome {
+    pub(super) fn success(expected_tool: &'static str, output: &'static str) -> Self {
+        Self {
+            expected_tool,
+            success: true,
+            output,
+            failure_class: None,
+            diagnostics: None,
+        }
+    }
+
+    pub(super) fn failure(
+        expected_tool: &'static str,
+        output: &'static str,
+        failure_class: FailureClass,
+    ) -> Self {
+        Self {
+            expected_tool,
+            success: false,
+            output,
+            failure_class: Some(failure_class),
+            diagnostics: None,
+        }
+    }
+
+    pub(super) fn with_diagnostics(mut self, diagnostics: ToolExecutionDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ScriptedRouteExecutor {
+    tools: Vec<ToolDefinition>,
+    outcomes: Mutex<VecDeque<ScriptedToolOutcome>>,
+    calls: Mutex<Vec<String>>,
+    diagnostics: Mutex<HashMap<String, ToolExecutionDiagnostics>>,
+}
+
+impl ScriptedRouteExecutor {
+    pub(super) fn new(tool_names: &[&str], outcomes: Vec<ScriptedToolOutcome>) -> Self {
+        Self {
+            tools: tool_names
+                .iter()
+                .map(|tool_name| ToolDefinition {
+                    name: (*tool_name).to_string(),
+                    description: format!("{tool_name} test tool"),
+                    parameters: serde_json::json!({"type":"object"}),
+                })
+                .collect(),
+            outcomes: Mutex::new(VecDeque::from(outcomes)),
+            calls: Mutex::new(Vec::new()),
+            diagnostics: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(super) fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("calls").clone()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ScriptedRouteExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        let mut outcomes = self.outcomes.lock().expect("outcomes");
+        let mut observed = self.calls.lock().expect("calls");
+        let mut diagnostics = self.diagnostics.lock().expect("diagnostics");
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let outcome = outcomes.pop_front().expect("scripted outcome");
+            assert_eq!(call.name, outcome.expected_tool);
+            observed.push(call.name.clone());
+            if let Some(diagnostic) = outcome.diagnostics {
+                diagnostics.insert(call.id.clone(), diagnostic);
+            }
+            results.push(ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: outcome.success,
+                output: outcome.output.to_string(),
+                failure_class: outcome.failure_class,
+            });
+        }
+        Ok(results)
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.clone()
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.diagnostics
+            .lock()
+            .expect("diagnostics")
+            .remove(call_id)
     }
 }
 
@@ -275,6 +389,7 @@ impl ToolExecutor for SlowToolExecutor {
                     tool_name: call.name.clone(),
                     success: false,
                     output: "cancelled mid-execution".to_string(),
+                    failure_class: None,
                 })
                 .collect());
         }
@@ -285,6 +400,7 @@ impl ToolExecutor for SlowToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "slow result".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -314,6 +430,7 @@ impl ToolExecutor for LargeOutputToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "X".repeat(self.output_size),
+                failure_class: None,
             })
             .collect())
     }
@@ -418,8 +535,8 @@ pub(super) fn build_engine_with_executor(
 }
 
 pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals: descriptions
+    DecompositionPlan::standard(
+        descriptions
             .iter()
             .map(|desc| {
                 SubGoal::with_definition_of_done(
@@ -430,7 +547,6 @@ pub(super) fn decomposition_plan(descriptions: &[&str]) -> DecompositionPlan {
                 )
             })
             .collect(),
-        strategy: AggregationStrategy::Sequential,
-        truncated_from: None,
-    }
+        AggregationStrategy::Sequential,
+    )
 }

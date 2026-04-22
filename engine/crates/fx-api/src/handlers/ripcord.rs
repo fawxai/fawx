@@ -200,6 +200,8 @@ mod tests {
             shared: Arc::new(SharedReadState::from_app(&TestApp)),
             config_manager: None,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: ServerRuntime::local(8400),
             tailscale_ip: None,

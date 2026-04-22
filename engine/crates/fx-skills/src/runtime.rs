@@ -326,6 +326,7 @@ impl SkillRuntime {
             .map_err(|e| SkillError::Execution(format!("Failed to link set_output: {}", e)))?;
 
         Self::link_http_request(linker)?;
+        Self::link_http_request_v2(linker)?;
         Self::link_exec_command(linker)?;
         Self::link_read_file(linker)?;
         Self::link_write_file(linker)?;
@@ -396,6 +397,67 @@ impl SkillRuntime {
                 },
             )
             .map_err(|e| SkillError::Execution(format!("Failed to link http_request: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Link the structured HTTP host function to the WASM linker.
+    fn link_http_request_v2(linker: &mut Linker<HostState>) -> Result<(), SkillError> {
+        linker
+            .func_wrap(
+                "host_api_v1",
+                "http_request_v2",
+                |mut caller: Caller<'_, HostState>,
+                 method_ptr: u32,
+                 method_len: u32,
+                 url_ptr: u32,
+                 url_len: u32,
+                 headers_ptr: u32,
+                 headers_len: u32,
+                 body_ptr: u32,
+                 body_len: u32|
+                 -> u32 {
+                    if !caller.data().has_capability(&Capability::Network) {
+                        tracing::warn!("http_request_v2 denied: skill lacks Network capability");
+                        return 0;
+                    }
+                    let Some(method) = Self::read_host_string(
+                        &caller,
+                        method_ptr,
+                        method_len,
+                        "http_request_v2 method",
+                    ) else {
+                        return 0;
+                    };
+                    let Some(url) =
+                        Self::read_host_string(&caller, url_ptr, url_len, "http_request_v2 url")
+                    else {
+                        return 0;
+                    };
+                    let Some(headers) = Self::read_host_string(
+                        &caller,
+                        headers_ptr,
+                        headers_len,
+                        "http_request_v2 headers",
+                    ) else {
+                        return 0;
+                    };
+                    let Some(body) =
+                        Self::read_host_string(&caller, body_ptr, body_len, "http_request_v2 body")
+                    else {
+                        return 0;
+                    };
+                    let Some(response) = caller
+                        .data()
+                        .api
+                        .http_request_v2(&method, &url, &headers, &body)
+                    else {
+                        return 0;
+                    };
+                    Self::write_host_string(&mut caller, &response, "http_request_v2")
+                },
+            )
+            .map_err(|e| SkillError::Execution(format!("Failed to link http_request_v2: {}", e)))?;
 
         Ok(())
     }
@@ -827,6 +889,8 @@ mod tests {
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         }
     }
@@ -1237,6 +1301,51 @@ mod tests {
         wat.as_bytes().to_vec()
     }
 
+    fn create_http_request_v2_wasm() -> Vec<u8> {
+        let wat = r#"
+            (module
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (import "host_api_v1" "http_request_v2"
+                    (func $http_request_v2
+                        (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "GET")
+                (data (i32.const 3) "https://mock.test/api")
+                (data (i32.const 100) "{}")
+                (data (i32.const 200) "no_response")
+
+                (func (export "run")
+                    (local $resp_ptr i32)
+                    (local $len i32)
+                    (local.set $resp_ptr
+                        (call $http_request_v2
+                            (i32.const 0)   (i32.const 3)
+                            (i32.const 3)   (i32.const 21)
+                            (i32.const 100) (i32.const 2)
+                            (i32.const 102) (i32.const 0)))
+
+                    (if (i32.eqz (local.get $resp_ptr))
+                        (then
+                            (call $set_output (i32.const 200) (i32.const 11)))
+                        (else
+                            (block $done
+                                (loop $scan
+                                    (br_if $done
+                                        (i32.eqz
+                                            (i32.load8_u
+                                                (i32.add
+                                                    (local.get $resp_ptr)
+                                                    (local.get $len)))))
+                                    (local.set $len
+                                        (i32.add (local.get $len) (i32.const 1)))
+                                    (br $scan)))
+                            (call $set_output (local.get $resp_ptr) (local.get $len))))
+                )
+            )
+        "#;
+        wat.as_bytes().to_vec()
+    }
+
     fn create_exec_command_wasm() -> Vec<u8> {
         let wat = r#"
             (module
@@ -1320,6 +1429,8 @@ mod tests {
                 vec![]
             },
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         }
     }
@@ -1382,6 +1493,45 @@ mod tests {
         // Without Network capability, http_request returns 0 → "no_response"
         let output = runtime.invoke("no_net", "input").expect("Should invoke");
         assert_eq!(output, "no_response");
+    }
+
+    #[test]
+    fn test_wasm_http_request_v2_preserves_structured_status_and_headers() {
+        let mut runtime = SkillRuntime::new().expect("Should create runtime");
+        let loader = SkillLoader::with_engine(runtime.engine().clone(), vec![]);
+
+        let manifest = create_http_manifest("http_v2", true);
+        let wasm = create_http_request_v2_wasm();
+
+        let skill = loader.load(&wasm, &manifest, None).expect("Should load");
+        runtime.register_skill(skill).expect("Should register");
+
+        let mock_api = MockHostApi::new("input");
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("retry-after".to_string(), "30".to_string());
+        mock_api.add_http_response_envelope(
+            "https://mock.test/api",
+            crate::host_api::HttpResponseEnvelope::response(
+                403,
+                headers,
+                r#"{"message":"forbidden"}"#,
+            ),
+        );
+
+        let output = runtime
+            .invoke_with_api("http_v2", Box::new(mock_api))
+            .expect("Should invoke");
+
+        let envelope: crate::host_api::HttpResponseEnvelope =
+            serde_json::from_str(&output).expect("structured envelope");
+        match envelope {
+            crate::host_api::HttpResponseEnvelope::Response(response) => {
+                assert_eq!(response.status_code, 403);
+                assert_eq!(response.headers.get("retry-after"), Some(&"30".to_string()));
+                assert_eq!(response.body, r#"{"message":"forbidden"}"#);
+            }
+            other => panic!("expected response envelope, got {other:?}"),
+        }
     }
 
     #[test]

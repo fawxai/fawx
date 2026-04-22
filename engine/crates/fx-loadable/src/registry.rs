@@ -12,12 +12,13 @@
 use async_trait::async_trait;
 use fx_kernel::act::{
     cancelled_result, is_cancelled, timed_out_result, JournalAction, ToolCacheability,
-    ToolExecutor, ToolExecutorError, ToolResult,
+    ToolExecutionDiagnostics, ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::warn;
 
 use crate::lifecycle::{builtin_activation, SkillActivation, SkillStatusSummary};
@@ -34,6 +35,7 @@ struct RegisteredSkill {
 /// `remove_skill` take `&self` — safe to call through `Arc<SkillRegistry>`.
 pub struct SkillRegistry {
     skills: RwLock<Vec<RegisteredSkill>>,
+    execution_diagnostics: Mutex<HashMap<String, ToolExecutionDiagnostics>>,
 }
 
 /// Manual `Debug` impl because `RwLock<Vec<Arc<dyn Skill>>>` doesn't derive
@@ -53,6 +55,7 @@ impl SkillRegistry {
     pub fn new() -> Self {
         Self {
             skills: RwLock::new(Vec::new()),
+            execution_diagnostics: Mutex::new(HashMap::new()),
         }
     }
 
@@ -164,6 +167,7 @@ impl SkillRegistry {
                     name: entry.skill.name().to_string(),
                     description: entry.skill.description().to_string(),
                     tool_names: tools,
+                    routing_tools: entry.skill.routing_tools(),
                     capabilities: entry.skill.capabilities(),
                     activation: entry.activation.clone(),
                     source_drift: None,
@@ -238,38 +242,37 @@ impl SkillRegistry {
         let skill = self.find_skill(tool_name);
 
         if let Some(skill) = skill {
-            return match skill.execute(tool_name, arguments, cancel).await {
-                Some(Ok(output)) => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: true,
-                    output,
-                },
-                Some(Err(err)) => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: false,
-                    output: err,
-                },
-                None => ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    success: false,
-                    output: format!(
+            let result = match skill
+                .execute_tool_result(tool_call_id, tool_name, arguments, cancel)
+                .await
+            {
+                Some(result) => result,
+                None => ToolResult::failure(
+                    tool_call_id,
+                    tool_name,
+                    format!(
                         "skill '{}' matched tool '{}' but declined to execute",
                         skill.name(),
                         tool_name
                     ),
-                },
+                    fx_kernel::FailureClass::Permanent,
+                ),
             };
+            if let Some(diagnostics) = skill.take_execution_diagnostics(tool_call_id) {
+                self.execution_diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(tool_call_id.to_string(), diagnostics);
+            }
+            return result;
         }
 
-        ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: false,
-            output: format!("no skill handles tool '{tool_name}'"),
-        }
+        ToolResult::failure(
+            tool_call_id,
+            tool_name,
+            format!("no skill handles tool '{tool_name}'"),
+            fx_kernel::FailureClass::Permanent,
+        )
     }
 
     async fn execute_single_call(
@@ -461,12 +464,21 @@ impl ToolExecutor for SkillRegistry {
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
         self.owning_skill_journal_action(call, result)
     }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.execution_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(call_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skill::Skill;
+    use fx_core::tool_routing::ToolRoutingSummary;
+    use fx_kernel::act::{RunCommandDiagnostics, ToolExecutionDiagnostics};
     use std::{path::PathBuf, sync::Arc};
 
     /// A deterministic mock skill for testing.
@@ -479,6 +491,7 @@ mod tests {
         action_category: &'static str,
         authority_surface: ToolAuthoritySurface,
         journal_action: Option<JournalAction>,
+        routing_tools: Vec<ToolRoutingSummary>,
     }
 
     impl MockSkill {
@@ -507,6 +520,7 @@ mod tests {
                 action_category: "unknown",
                 authority_surface: ToolAuthoritySurface::Other,
                 journal_action: None,
+                routing_tools: Vec::new(),
             }
         }
 
@@ -531,6 +545,16 @@ mod tests {
             skill.authority_surface = authority_surface;
             skill
         }
+
+        fn with_routing_tools(
+            name: &str,
+            tool_names: &[&str],
+            routing_tools: Vec<ToolRoutingSummary>,
+        ) -> Self {
+            let mut skill = Self::new(name, tool_names);
+            skill.routing_tools = routing_tools;
+            skill
+        }
     }
 
     #[async_trait]
@@ -549,6 +573,10 @@ mod tests {
 
         fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
             self.cacheability
+        }
+
+        fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+            self.routing_tools.clone()
         }
 
         fn action_category(&self, _tool_name: &str) -> &'static str {
@@ -613,6 +641,59 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct DiagnosticsSkill {
+        diagnostics: Mutex<Option<ToolExecutionDiagnostics>>,
+    }
+
+    #[async_trait]
+    impl Skill for DiagnosticsSkill {
+        fn name(&self) -> &str {
+            "diagnostics"
+        }
+
+        fn description(&self) -> &str {
+            "diagnostics skill"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "inspect".to_string(),
+                description: "returns diagnostics".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            tool_name: &str,
+            _arguments: &str,
+            _cancel: Option<&CancellationToken>,
+        ) -> Option<Result<String, String>> {
+            if tool_name != "inspect" {
+                return None;
+            }
+            *self.diagnostics.lock().expect("diagnostics lock") = Some(
+                ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+                    exit_code: Some(17),
+                    stderr_snippet: Some("permission denied".to_string()),
+                    duration_ms: 12,
+                    shell: true,
+                    timed_out: false,
+                    external_actions: Vec::new(),
+                }),
+            );
+            Some(Err("inspect failed".to_string()))
+        }
+
+        fn take_execution_diagnostics(
+            &self,
+            _tool_call_id: &str,
+        ) -> Option<ToolExecutionDiagnostics> {
+            self.diagnostics.lock().expect("diagnostics lock").take()
+        }
+    }
+
     fn make_tool_call(name: &str) -> ToolCall {
         ToolCall {
             id: "call_1".to_string(),
@@ -666,6 +747,35 @@ mod tests {
     }
 
     #[test]
+    fn skill_statuses_include_routing_summaries() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(MockSkill::with_routing_tools(
+            "browser",
+            &["web_fetch"],
+            vec![ToolRoutingSummary {
+                tool_name: "web_fetch".to_string(),
+                metadata: fx_core::tool_routing::ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: fx_core::tool_routing::RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                },
+                readiness: fx_core::tool_routing::ToolReadinessSummary {
+                    available: true,
+                    ready: true,
+                    readiness_reason: None,
+                },
+            }],
+        )));
+
+        let statuses = reg.skill_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].routing_tools.len(), 1);
+        assert_eq!(statuses[0].routing_tools[0].tool_name, "web_fetch");
+    }
+
+    #[test]
     fn authority_surface_comes_from_owning_skill_metadata() {
         let reg = SkillRegistry::new();
         reg.register(Arc::new(MockSkill::with_authority_surface(
@@ -697,6 +807,35 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
         assert_eq!(results[0].output, "net:http_get");
+    }
+
+    #[tokio::test]
+    async fn registry_preserves_skill_execution_diagnostics() {
+        let reg = SkillRegistry::new();
+        reg.register(Arc::new(DiagnosticsSkill::default()));
+
+        let calls = vec![make_tool_call("inspect")];
+        let results = reg.execute_tools(&calls, None).await.expect("execute");
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+
+        let diagnostics = reg
+            .take_execution_diagnostics(&results[0].tool_call_id)
+            .expect("diagnostics should be preserved");
+        assert_eq!(
+            diagnostics,
+            ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+                exit_code: Some(17),
+                stderr_snippet: Some("permission denied".to_string()),
+                duration_ms: 12,
+                shell: true,
+                timed_out: false,
+                external_actions: Vec::new(),
+            })
+        );
+        assert!(reg
+            .take_execution_diagnostics(&results[0].tool_call_id)
+            .is_none());
     }
 
     #[tokio::test]
@@ -911,6 +1050,7 @@ mod tests {
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         assert_eq!(reg.journal_action(&call, &result), Some(expected));

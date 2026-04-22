@@ -98,7 +98,7 @@ async fn direct_inspection_successful_read_file_completes_terminally() {
 }
 
 #[tokio::test]
-async fn direct_inspection_with_mixed_text_terminates_terminally() {
+async fn direct_inspection_with_mixed_text_treats_text_as_transient_narration() {
     let prompt = "Read ~/.zshrc and explain what each line does.";
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     let llm = RecordingLlm::ok(vec![
@@ -129,10 +129,7 @@ async fn direct_inspection_with_mixed_text_terminates_terminally() {
             ..
         } => {
             assert_eq!(iterations, 1);
-            assert_eq!(
-                response,
-                "Here is what I found so far.\n\nLine 1 configures the shell environment."
-            );
+            assert_eq!(response, "Line 1 configures the shell environment.");
         }
         other => panic!("expected terminal completion, got {other:?}"),
     }
@@ -166,14 +163,24 @@ async fn direct_inspection_empty_post_tool_response_gets_one_synthesis_pass_then
         name: "read_file".to_string(),
         arguments: serde_json::json!({"path":"~/.zshrc"}),
     }]);
-    let llm = EmptySummaryInspectionLlm::new(vec![CompletionResponse {
-        content: vec![ContentBlock::Text {
-            text: String::new(),
-        }],
-        tool_calls: Vec::new(),
-        usage: None,
-        stop_reason: None,
-    }]);
+    let llm = EmptySummaryInspectionLlm::new(vec![
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: String::new(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        },
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: String::new(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: None,
+        },
+    ]);
 
     let action = engine
         .act(
@@ -191,8 +198,8 @@ async fn direct_inspection_empty_post_tool_response_gets_one_synthesis_pass_then
         }
         other => panic!("expected terminal completion after one synthesis pass, got {other:?}"),
     }
-    assert_eq!(llm.complete_calls(), 1);
-    assert_eq!(llm.generate_calls(), 1);
+    assert_eq!(llm.complete_calls(), 2);
+    assert_eq!(llm.generate_calls(), 0);
 }
 
 #[tokio::test]
@@ -203,6 +210,7 @@ async fn standard_turns_still_continue_normally_after_observation_only_tool_roun
         .perceive(&test_snapshot(prompt))
         .await
         .expect("perceive");
+    engine.requested_artifact_target = Some("src/lib.rs".to_string());
     let decision = Decision::UseTools(vec![ToolCall {
         id: "call-1".to_string(),
         name: "read_file".to_string(),

@@ -102,6 +102,8 @@ mod tests {
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         }
     }

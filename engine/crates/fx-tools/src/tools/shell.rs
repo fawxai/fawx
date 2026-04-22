@@ -1,20 +1,27 @@
 use super::{
-    canonicalize_existing_or_parent, parse_args, to_tool_result, validate_path, ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, tool_failure_from_io, validate_path, ToolFailure,
+    ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
-use fx_kernel::act::{JournalAction, ToolCacheability, ToolCallClassification, ToolResult};
+use fx_core::command_text::{
+    tokenize_non_shell_command as shared_tokenize_non_shell_command, CommandTokenizationError,
+};
+use fx_kernel::act::{
+    FailureClass, JournalAction, RunCommandDiagnostics, ToolCacheability, ToolCallClassification,
+    ToolExecutionDiagnostics, ToolResult,
+};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets};
+use fx_ripcord::git_guard::{check_push_allowed, extract_push_targets_from_tokens};
 use serde::Deserialize;
-use std::iter::Peekable;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::str::CharIndices;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{iter::Peekable, str::CharIndices};
 use tokio::process::Command;
 
 pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolContext>) {
@@ -23,12 +30,30 @@ pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolCont
 
 struct RunCommandTool {
     context: Arc<ToolContext>,
+    diagnostics: Arc<Mutex<HashMap<String, ToolExecutionDiagnostics>>>,
 }
 
 impl RunCommandTool {
     fn new(context: &Arc<ToolContext>) -> Self {
         Self {
             context: Arc::clone(context),
+            diagnostics: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn store_execution_diagnostics(
+        &self,
+        call_id: &str,
+        diagnostics: Option<ToolExecutionDiagnostics>,
+    ) {
+        let mut guard = self
+            .diagnostics
+            .lock()
+            .expect("run_command diagnostics lock");
+        if let Some(diagnostics) = diagnostics {
+            guard.insert(call_id.to_string(), diagnostics);
+        } else {
+            guard.remove(call_id);
         }
     }
 }
@@ -42,25 +67,44 @@ impl Tool for RunCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Run a command and capture exit code, stdout, and stderr".to_string(),
+            description: "Run a local command and capture exit code, stdout, and stderr. Use argv for an exact non-shell program/argument invocation. Use command with shell=true to execute a shell string via /bin/sh -c. If shell=false and only command is supplied, the tool tokenizes the string with strict quote-aware parsing and rejects malformed quoting. The tool succeeds only when the command exits with code 0; any non-zero exit returns a failed tool result with the captured output.".to_string(),
+            // Anthropic rejects top-level allOf/oneOf/anyOf in tool schemas, so the
+            // exact either-or contract is enforced by parse_run_command_invocation_from_args.
             parameters: serde_json::json!({
                 "type": "object",
+                "description": "Provide either command or argv. When shell=true, command is required and argv must be omitted. Runtime validation enforces the exact shape.",
                 "properties": {
-                    "command": { "type": "string" },
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command text when shell=true, or a backward-compatible non-shell command string parsed with strict quote-aware tokenization when shell=false."
+                    },
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Exact program and arguments for non-shell execution. argv[0] is the program name and argument boundaries are preserved exactly."
+                    },
                     "working_dir": { "type": "string" },
-                    "shell": { "type": "boolean" }
-                },
-                "required": ["command"]
+                    "shell": {
+                        "type": "boolean",
+                        "description": "When true, require command and execute it via /bin/sh -c. When false or omitted, run argv exactly or parse command without a shell."
+                    }
+                }
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
-        to_tool_result(
-            &call.id,
-            self.name(),
-            self.context.handle_run_command(&call.arguments).await,
-        )
+        match self.context.execute_run_command(&call.arguments).await {
+            Ok(execution) => {
+                self.store_execution_diagnostics(&call.id, Some(execution.diagnostics));
+                ToolResult::success(&call.id, self.name(), execution.output)
+            }
+            Err(error) => {
+                self.store_execution_diagnostics(&call.id, error.diagnostics().cloned());
+                ToolResult::failure(&call.id, self.name(), error.message, error.class)
+            }
+        }
     }
 
     fn cacheability(&self) -> ToolCacheability {
@@ -72,7 +116,10 @@ impl Tool for RunCommandTool {
     }
 
     fn journal_action(&self, call: &ToolCall, result: &ToolResult) -> Option<JournalAction> {
-        let command = call.arguments.get("command")?.as_str()?.to_string();
+        let command = parse_run_command_invocation(&call.arguments)
+            .ok()?
+            .display_command()
+            .to_string();
         Some(JournalAction::ShellCommand {
             command,
             exit_code: shell_exit_code(&result.output, result.success),
@@ -85,6 +132,13 @@ impl Tool for RunCommandTool {
 
     fn authority_surface(&self, _call: &ToolCall) -> ToolAuthoritySurface {
         ToolAuthoritySurface::Command
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.diagnostics
+            .lock()
+            .expect("run_command diagnostics lock")
+            .remove(call_id)
     }
 }
 
@@ -106,89 +160,299 @@ fn shell_exit_code(output: &str, success: bool) -> i32 {
 
 #[derive(Deserialize)]
 struct RunCommandArgs {
-    command: String,
+    command: Option<String>,
+    argv: Option<Vec<String>>,
     working_dir: Option<String>,
     shell: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunCommandInvocation {
+    Shell {
+        command: String,
+    },
+    NonShell {
+        display_command: String,
+        argv: Vec<String>,
+    },
+}
+
+impl RunCommandInvocation {
+    fn shell(&self) -> bool {
+        matches!(self, Self::Shell { .. })
+    }
+
+    fn display_command(&self) -> &str {
+        match self {
+            Self::Shell { command } => command,
+            Self::NonShell {
+                display_command, ..
+            } => display_command,
+        }
+    }
+}
+
+struct RunCommandExecution {
+    output: String,
+    diagnostics: ToolExecutionDiagnostics,
+}
+
 impl ToolContext {
-    pub(crate) async fn handle_run_command(
+    async fn execute_run_command(
         &self,
         args: &serde_json::Value,
-    ) -> Result<String, String> {
-        let parsed: RunCommandArgs = parse_args(args)?;
-        let command = parsed.command.trim();
-        if command.is_empty() {
-            return Err("command cannot be empty".to_string());
-        }
-        let working_dir = self.resolve_command_dir(parsed.working_dir.as_deref())?;
-        self.guard_push_command(command)?;
-        let child = build_command(command, parsed.shell.unwrap_or(false), &working_dir)?
+    ) -> Result<RunCommandExecution, ToolFailure> {
+        let started_at = Instant::now();
+        let parsed: RunCommandArgs = parse_args(args).map_err(|error| {
+            attach_run_command_diagnostics(
+                ToolFailure::permanent(error),
+                started_at,
+                false,
+                None,
+                false,
+            )
+        })?;
+        let shell = parsed.shell.unwrap_or(false);
+        let requested_working_dir = parsed.working_dir.clone();
+        let invocation = parse_run_command_invocation_from_args(parsed).map_err(|error| {
+            attach_run_command_diagnostics(error, started_at, shell, None, false)
+        })?;
+        let working_dir = self
+            .resolve_command_dir(requested_working_dir.as_deref())
+            .map_err(|error| {
+                attach_run_command_diagnostics(error, started_at, invocation.shell(), None, false)
+            })?;
+        self.guard_push_invocation(&invocation).map_err(|error| {
+            attach_run_command_diagnostics(error, started_at, invocation.shell(), None, false)
+        })?;
+        let child = build_command(&invocation, &working_dir)
+            .map_err(|error| {
+                attach_run_command_diagnostics(error, started_at, invocation.shell(), None, false)
+            })?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| error.to_string())?;
-        let output = wait_with_timeout(child, self.config.command_timeout).await?;
-        Ok(format_command_output(output, parsed.shell.unwrap_or(false)))
+            .map_err(|error| {
+                attach_run_command_diagnostics(
+                    tool_failure_from_io(error),
+                    started_at,
+                    invocation.shell(),
+                    None,
+                    false,
+                )
+            })?;
+        let output = wait_with_timeout(child, self.config.command_timeout)
+            .await
+            .map_err(|error| {
+                attach_run_command_diagnostics(error, started_at, invocation.shell(), None, true)
+            })?;
+        let formatted = format_command_output(&output, invocation.shell());
+        if output.status.success() {
+            Ok(RunCommandExecution {
+                diagnostics: run_command_success_diagnostics(
+                    started_at,
+                    invocation.shell(),
+                    invocation.display_command(),
+                    &formatted,
+                    &output,
+                ),
+                output: formatted,
+            })
+        } else {
+            Err(
+                ToolFailure::new(formatted, classify_command_exit(&output)).with_diagnostics(
+                    run_command_failure_diagnostics(
+                        started_at,
+                        invocation.shell(),
+                        Some(&output),
+                        false,
+                        None,
+                    ),
+                ),
+            )
+        }
     }
 
-    pub(crate) fn guard_push_command(&self, command: &str) -> Result<(), String> {
-        let targets = extract_push_targets(command);
+    pub(crate) fn guard_push_command(&self, command: &str) -> Result<(), ToolFailure> {
+        let targets = extract_push_targets_from_shell_command(command);
         if targets.is_empty() {
             return Ok(());
         }
-        check_push_allowed(&targets, &self.protected_branches)
+        check_push_allowed(&targets, &self.protected_branches).map_err(ToolFailure::permanent)
     }
 
-    pub(crate) fn resolve_command_dir(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let desired = requested.unwrap_or_else(|| self.working_dir.to_str().unwrap_or("."));
+    fn guard_push_invocation(&self, invocation: &RunCommandInvocation) -> Result<(), ToolFailure> {
+        let targets = match invocation {
+            RunCommandInvocation::Shell { command } => {
+                extract_push_targets_from_shell_command(command)
+            }
+            RunCommandInvocation::NonShell { argv, .. } => extract_push_targets_from_tokens(argv),
+        };
+        if targets.is_empty() {
+            return Ok(());
+        }
+        check_push_allowed(&targets, &self.protected_branches).map_err(ToolFailure::permanent)
+    }
+
+    pub(crate) fn resolve_command_dir(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<PathBuf, ToolFailure> {
+        let working_dir = self.working_dir();
+        let desired = requested.unwrap_or_else(|| working_dir.to_str().unwrap_or("."));
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(desired));
         }
-        validate_path(&self.working_dir, desired)
+        validate_path(&working_dir, desired)
     }
 }
 
 pub(super) fn classify_run_command_call(args: &serde_json::Value) -> ToolCallClassification {
-    let Ok(parsed): Result<RunCommandArgs, _> = parse_args(args) else {
+    let Ok(invocation) = parse_run_command_invocation(args) else {
         return ToolCallClassification::Mutation;
     };
-    if is_observational_command(parsed.command.trim(), parsed.shell.unwrap_or(false)) {
-        ToolCallClassification::Observation
-    } else {
-        ToolCallClassification::Mutation
+    match invocation {
+        RunCommandInvocation::Shell { command } => {
+            if is_observational_command(&command, true) {
+                ToolCallClassification::Observation
+            } else {
+                ToolCallClassification::Mutation
+            }
+        }
+        RunCommandInvocation::NonShell { argv, .. } => {
+            if is_observational_program_and_args(&argv) {
+                ToolCallClassification::Observation
+            } else {
+                ToolCallClassification::Mutation
+            }
+        }
     }
 }
 
-fn build_command(command: &str, shell: bool, working_dir: &Path) -> Result<Command, String> {
-    if shell {
-        let mut built = Command::new("/bin/sh");
-        built.kill_on_drop(true);
-        built.arg("-c").arg(command).current_dir(working_dir);
-        return Ok(built);
+fn build_command(
+    invocation: &RunCommandInvocation,
+    working_dir: &Path,
+) -> Result<Command, ToolFailure> {
+    match invocation {
+        RunCommandInvocation::Shell { command } => {
+            let mut built = Command::new("/bin/sh");
+            built.kill_on_drop(true);
+            built.arg("-c").arg(command).current_dir(working_dir);
+            Ok(built)
+        }
+        RunCommandInvocation::NonShell { argv, .. } => {
+            let (program, args) = argv
+                .split_first()
+                .expect("non-shell argv validated during invocation parsing");
+            let mut built = Command::new(program);
+            built.kill_on_drop(true);
+            built.args(args).current_dir(working_dir);
+            Ok(built)
+        }
     }
-    let mut parts = command.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| "command cannot be empty".to_string())?;
-    let mut built = Command::new(program);
-    built.kill_on_drop(true);
-    built.args(parts).current_dir(working_dir);
-    Ok(built)
 }
 
 async fn wait_with_timeout(
     child: tokio::process::Child,
     timeout: Duration,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::Output, ToolFailure> {
     let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
     match waited {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("command timed out".to_string()),
+        Ok(result) => result.map_err(tool_failure_from_io),
+        Err(_) => Err(ToolFailure::transient("command timed out")),
     }
 }
 
-fn format_command_output(output: std::process::Output, shell: bool) -> String {
+fn run_command_failure_diagnostics(
+    started_at: Instant,
+    shell: bool,
+    output: Option<&std::process::Output>,
+    timed_out: bool,
+    fallback_stderr: Option<&str>,
+) -> ToolExecutionDiagnostics {
+    ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+        exit_code: output.and_then(|process_output| process_output.status.code()),
+        stderr_snippet: output
+            .and_then(|process_output| stderr_snippet(&process_output.stderr))
+            .or_else(|| fallback_stderr.and_then(stderr_snippet_from_text)),
+        duration_ms: elapsed_ms(started_at),
+        shell,
+        timed_out,
+        external_actions: Vec::new(),
+    })
+}
+
+fn run_command_success_diagnostics(
+    started_at: Instant,
+    shell: bool,
+    command: &str,
+    formatted_output: &str,
+    output: &std::process::Output,
+) -> ToolExecutionDiagnostics {
+    ToolExecutionDiagnostics::RunCommand(RunCommandDiagnostics {
+        exit_code: output.status.code(),
+        stderr_snippet: stderr_snippet(&output.stderr),
+        duration_ms: elapsed_ms(started_at),
+        shell,
+        timed_out: false,
+        external_actions: fx_kernel::act::external_actions_from_run_command(
+            command,
+            formatted_output,
+        ),
+    })
+}
+
+fn attach_run_command_diagnostics(
+    error: ToolFailure,
+    started_at: Instant,
+    shell: bool,
+    output: Option<&std::process::Output>,
+    timed_out: bool,
+) -> ToolFailure {
+    let fallback_stderr = if output.is_none() {
+        Some(error.message.clone())
+    } else {
+        None
+    };
+    error.with_diagnostics(run_command_failure_diagnostics(
+        started_at,
+        shell,
+        output,
+        timed_out,
+        fallback_stderr.as_deref(),
+    ))
+}
+
+fn stderr_snippet(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    stderr_snippet_from_text(text.as_ref())
+}
+
+fn stderr_snippet_from_text(text: &str) -> Option<String> {
+    let snippet = text.trim();
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(truncate_snippet(snippet, 240))
+    }
+}
+
+fn truncate_snippet(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let prefix = text.chars().take(max_chars).collect::<String>();
+    format!("{prefix}...")
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    let millis = started_at.elapsed().as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn format_command_output(output: &std::process::Output, shell: bool) -> String {
     let mut lines = vec![format!("exit_code: {}", output.status.code().unwrap_or(-1))];
     if shell {
         lines.push("warning: command executed via shell=true".to_string());
@@ -204,24 +468,30 @@ fn format_command_output(output: std::process::Output, shell: bool) -> String {
     lines.join("\n")
 }
 
+fn classify_command_exit(output: &std::process::Output) -> FailureClass {
+    match output.status.code() {
+        Some(126 | 127) => FailureClass::Permanent,
+        Some(_) => FailureClass::Unknown,
+        None => FailureClass::Transient,
+    }
+}
+
 fn is_observational_command(command: &str, shell: bool) -> bool {
     if command.is_empty() {
         return false;
     }
-    if contains_mutating_shell_syntax(command) {
-        return false;
-    }
     if shell {
+        if contains_mutating_shell_syntax(command) {
+            return false;
+        }
         return shell_segments(command)
             .into_iter()
             .all(is_observational_shell_segment);
     }
-    is_observational_program_and_args(
-        &command
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-    )
+    match tokenize_non_shell_command(command) {
+        Ok(tokens) => is_observational_program_and_args(&tokens),
+        Err(_) => false,
+    }
 }
 
 fn contains_mutating_shell_syntax(command: &str) -> bool {
@@ -352,7 +622,12 @@ fn is_observational_shell_segment(segment: &str) -> bool {
     if segment.is_empty() {
         return true;
     }
-    let tokens: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+    // Shell segments may contain expansions or subshell syntax. For classification
+    // we intentionally ignore expansion semantics and only recover the literal
+    // program/argument shape well enough to decide whether the command is read-only.
+    let Ok(tokens) = tokenize_non_shell_command(segment) else {
+        return false;
+    };
     if tokens.is_empty() {
         return true;
     }
@@ -383,6 +658,7 @@ fn is_observational_program_and_args(tokens: &[String]) -> bool {
         "echo" => true,
         "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
         "git" => is_observational_git_command(args),
+        "gh" => is_observational_gh_command(args),
         "cargo" => is_observational_cargo_command(args),
         _ => false,
     }
@@ -414,6 +690,23 @@ fn is_observational_git_command(args: &[String]) -> bool {
     }
 }
 
+fn is_observational_gh_command(args: &[String]) -> bool {
+    let Some(resource) = args.first().map(String::as_str) else {
+        return false;
+    };
+    let Some(subcommand) = args.get(1).map(String::as_str) else {
+        return false;
+    };
+    match resource {
+        "pr" => matches!(subcommand, "view" | "diff" | "list" | "status" | "checks"),
+        "issue" => matches!(subcommand, "view" | "list" | "status"),
+        "repo" => matches!(subcommand, "view" | "list"),
+        "search" => matches!(subcommand, "prs" | "issues" | "repos" | "commits" | "code"),
+        "auth" => subcommand == "status",
+        _ => false,
+    }
+}
+
 fn is_observational_cargo_command(args: &[String]) -> bool {
     let Some(subcommand) = args.first().map(String::as_str) else {
         return false;
@@ -422,4 +715,218 @@ fn is_observational_cargo_command(args: &[String]) -> bool {
         subcommand,
         "metadata" | "tree" | "locate-project" | "help" | "search" | "version"
     )
+}
+
+fn parse_run_command_invocation(
+    args: &serde_json::Value,
+) -> Result<RunCommandInvocation, ToolFailure> {
+    let parsed: RunCommandArgs = parse_args(args).map_err(ToolFailure::permanent)?;
+    parse_run_command_invocation_from_args(parsed)
+}
+
+fn parse_run_command_invocation_from_args(
+    parsed: RunCommandArgs,
+) -> Result<RunCommandInvocation, ToolFailure> {
+    let shell = parsed.shell.unwrap_or(false);
+    match (shell, parsed.command, parsed.argv) {
+        (true, Some(_), Some(_)) | (true, None, Some(_)) => Err(ToolFailure::permanent(
+            "argv cannot be used when shell=true",
+        )),
+        (true, Some(command), None) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(ToolFailure::permanent("command cannot be empty"));
+            }
+            Ok(RunCommandInvocation::Shell {
+                command: command.to_string(),
+            })
+        }
+        (true, None, None) => Err(ToolFailure::permanent(
+            "command is required when shell=true",
+        )),
+        (false, Some(_), Some(_)) => Err(ToolFailure::permanent(
+            "specify either command or argv, not both",
+        )),
+        (false, Some(command), None) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(ToolFailure::permanent("command cannot be empty"));
+            }
+            let argv = tokenize_non_shell_command(command)?;
+            validate_argv(&argv)?;
+            Ok(RunCommandInvocation::NonShell {
+                display_command: command.to_string(),
+                argv,
+            })
+        }
+        (false, None, Some(argv)) => {
+            validate_argv(&argv)?;
+            Ok(RunCommandInvocation::NonShell {
+                display_command: format_argv_for_display(&argv),
+                argv,
+            })
+        }
+        (false, None, None) => Err(ToolFailure::permanent("command or argv is required")),
+    }
+}
+
+fn validate_argv(argv: &[String]) -> Result<(), ToolFailure> {
+    if argv.is_empty() {
+        return Err(ToolFailure::permanent("argv cannot be empty"));
+    }
+    if argv[0].trim().is_empty() {
+        return Err(ToolFailure::permanent("argv[0] cannot be empty"));
+    }
+    Ok(())
+}
+
+fn extract_push_targets_from_shell_command(command: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for segment in shell_segments(command) {
+        let Ok(tokens) = tokenize_non_shell_command(segment) else {
+            continue;
+        };
+        for target in extract_push_targets_from_tokens(&tokens) {
+            if !targets.iter().any(|existing| existing == &target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+fn format_argv_for_display(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| format_display_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Format argv for journaling/display only.
+/// This uses JSON-style escaping for readability and must not be treated as a
+/// shell-escaped command line for re-execution or copy-paste.
+fn format_display_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+    {
+        arg.to_string()
+    } else {
+        serde_json::to_string(arg).unwrap_or_else(|_| "\"<invalid utf8>\"".to_string())
+    }
+}
+
+fn tokenize_non_shell_command(command: &str) -> Result<Vec<String>, ToolFailure> {
+    shared_tokenize_non_shell_command(command).map_err(command_tokenization_failure)
+}
+
+fn command_tokenization_failure(error: CommandTokenizationError) -> ToolFailure {
+    ToolFailure::permanent(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_non_shell_command_preserves_quoted_arguments() {
+        let tokens = tokenize_non_shell_command(r#"open -a "Google Chrome" --new"#)
+            .expect("quoted command should parse");
+
+        assert_eq!(
+            tokens,
+            vec![
+                "open".to_string(),
+                "-a".to_string(),
+                "Google Chrome".to_string(),
+                "--new".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_non_shell_command_rejects_unmatched_quotes() {
+        let error = tokenize_non_shell_command(r#"open -a "Google Chrome"#)
+            .expect_err("unterminated quote should fail");
+
+        assert_eq!(error.class, FailureClass::Permanent);
+        assert!(error.message.contains("unmatched double quote"));
+    }
+
+    #[test]
+    fn tokenize_non_shell_command_preserves_single_quoted_arguments() {
+        let tokens = tokenize_non_shell_command("open -a 'Google Chrome' --new")
+            .expect("single-quoted command should parse");
+
+        assert_eq!(
+            tokens,
+            vec![
+                "open".to_string(),
+                "-a".to_string(),
+                "Google Chrome".to_string(),
+                "--new".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_non_shell_command_allows_single_quotes_inside_double_quotes() {
+        let tokens = tokenize_non_shell_command(r#"open -a "it's here" --new"#)
+            .expect("mixed quotes should parse");
+
+        assert_eq!(
+            tokens,
+            vec![
+                "open".to_string(),
+                "-a".to_string(),
+                "it's here".to_string(),
+                "--new".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_non_shell_command_handles_posix_single_quote_splicing() {
+        let tokens = tokenize_non_shell_command(r#"open -a 'it'\''s here' --new"#)
+            .expect("single-quote splice should parse");
+
+        assert_eq!(
+            tokens,
+            vec![
+                "open".to_string(),
+                "-a".to_string(),
+                "it's here".to_string(),
+                "--new".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_non_shell_command_ignores_shell_redirect_literals() {
+        let classification =
+            classify_run_command_call(&serde_json::json!({"command": "echo '>' notes.txt"}));
+
+        assert_eq!(classification, ToolCallClassification::Observation);
+    }
+
+    #[test]
+    fn parse_run_command_invocation_rejects_ambiguous_non_shell_shape() {
+        let error = parse_run_command_invocation(&serde_json::json!({
+            "command": "echo hi",
+            "argv": ["echo", "hi"]
+        }))
+        .expect_err("ambiguous non-shell shape should fail");
+
+        assert_eq!(error.class, FailureClass::Permanent);
+        assert!(error.message.contains("either command or argv"));
+    }
+
+    #[test]
+    fn extract_push_targets_from_shell_command_preserves_quoted_repo_arguments() {
+        let targets =
+            extract_push_targets_from_shell_command(r#"git push --repo "/tmp/remote path" main"#);
+
+        assert_eq!(targets, vec!["main".to_string()]);
+    }
 }

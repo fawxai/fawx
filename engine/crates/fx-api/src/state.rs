@@ -7,11 +7,16 @@ use fx_channel_telegram::TelegramChannel;
 use fx_channel_webhook::WebhookChannel;
 use fx_core::channel::Channel;
 use fx_fleet::FleetManager;
-use fx_kernel::{ChannelRegistry, HttpChannel, ResponseRouter};
+use fx_kernel::{
+    loop_input_channel, CancellationToken, ChannelRegistry, HttpChannel, LoopCommand,
+    LoopInputChannel, LoopInputSender, ResponseRouter, TokenUsage,
+};
+use fx_session::SessionKey;
 use fx_session::SessionRegistry;
 use fx_telemetry::{SignalCollector, TelemetryConsent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock as TokioRwLock};
@@ -24,7 +29,8 @@ pub struct ReadSnapshot {
     pub active_model: String,
     pub thinking_level: ThinkingLevelDto,
     pub available_models: Vec<ModelInfoDto>,
-    pub token_usage: (u64, u64),
+    pub token_usage: TokenUsage,
+    pub max_history: usize,
 }
 
 /// Read-only state cache, updated after mutations. Handlers that only need
@@ -35,13 +41,19 @@ pub struct SharedReadState {
 }
 
 impl SharedReadState {
-    pub fn new(model: String, thinking: ThinkingLevelDto, models: Vec<ModelInfoDto>) -> Self {
+    pub fn new(
+        model: String,
+        thinking: ThinkingLevelDto,
+        models: Vec<ModelInfoDto>,
+        max_history: usize,
+    ) -> Self {
         Self {
             snapshot: TokioRwLock::new(ReadSnapshot {
                 active_model: model,
                 thinking_level: thinking,
                 available_models: models,
-                token_usage: (0, 0),
+                token_usage: TokenUsage::default(),
+                max_history,
             }),
         }
     }
@@ -51,6 +63,7 @@ impl SharedReadState {
             app.active_model().to_owned(),
             app.thinking_level(),
             app.available_models(),
+            app.max_history(),
         )
     }
 
@@ -64,7 +77,7 @@ impl SharedReadState {
         &self,
         model: &str,
         thinking: &ThinkingLevelDto,
-        tokens: (u64, u64),
+        tokens: TokenUsage,
     ) {
         let mut snap = self.snapshot.write().await;
         snap.active_model = model.to_owned();
@@ -78,11 +91,13 @@ impl SharedReadState {
         model: &str,
         thinking: &ThinkingLevelDto,
         models: Vec<ModelInfoDto>,
+        max_history: usize,
     ) {
         let mut snap = self.snapshot.write().await;
         snap.active_model = model.to_owned();
         snap.thinking_level = thinking.clone();
         snap.available_models = models;
+        snap.max_history = max_history;
     }
 
     /// Update just thinking level.
@@ -92,12 +107,257 @@ impl SharedReadState {
     }
 }
 
+#[derive(Debug)]
+pub struct SessionRunPermit {
+    key: SessionKey,
+    run_id: u64,
+    token: CancellationToken,
+    cancel_state: Arc<SessionRunCancelState>,
+    input_channel: Option<LoopInputChannel>,
+}
+
+impl SessionRunPermit {
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub fn cancel_reason(&self) -> Option<SessionRunCancelReason> {
+        self.cancel_state.reason()
+    }
+
+    pub fn cancellation_message(&self) -> Option<&'static str> {
+        self.cancel_reason().map(SessionRunCancelReason::message)
+    }
+
+    pub fn take_input_channel(&mut self) -> Option<LoopInputChannel> {
+        self.input_channel.take()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRunCancelReason {
+    StoppedByUser,
+    SupersededByNewerRequest,
+}
+
+impl SessionRunCancelReason {
+    fn code(self) -> u8 {
+        match self {
+            Self::StoppedByUser => 1,
+            Self::SupersededByNewerRequest => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::StoppedByUser),
+            2 => Some(Self::SupersededByNewerRequest),
+            _ => None,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::StoppedByUser => "Cancelled by user",
+            Self::SupersededByNewerRequest => "Superseded by a newer request",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionRunCancelState {
+    reason: AtomicU8,
+}
+
+impl SessionRunCancelState {
+    fn new() -> Self {
+        Self {
+            reason: AtomicU8::new(0),
+        }
+    }
+
+    fn cancel(&self, reason: SessionRunCancelReason) -> bool {
+        self.reason
+            .compare_exchange(0, reason.code(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn reason(&self) -> Option<SessionRunCancelReason> {
+        SessionRunCancelReason::from_code(self.reason.load(Ordering::Acquire))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSessionRunOutcome {
+    Stopped,
+    NoActiveRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerSessionRunOutcome {
+    Steered,
+    NoActiveRun,
+}
+
+pub type SessionEngineHandle = Arc<Mutex<Box<dyn AppEngine>>>;
+
+#[derive(Clone, Default)]
+pub struct SessionEnginePool {
+    engines: Arc<TokioRwLock<HashMap<SessionKey, SessionEngineHandle>>>,
+}
+
+impl SessionEnginePool {
+    pub async fn get_or_spawn(
+        &self,
+        app: &Arc<Mutex<dyn AppEngine>>,
+        key: &SessionKey,
+        execution_root: PathBuf,
+    ) -> Result<Option<SessionEngineHandle>, anyhow::Error> {
+        if let Some(engine) = self.engines.read().await.get(key).cloned() {
+            return Ok(Some(engine));
+        }
+
+        let spawned = {
+            let app = app.lock().await;
+            app.spawn_session_engine(key, execution_root)?
+        };
+        let Some(engine) = spawned else {
+            return Ok(None);
+        };
+
+        let handle = Arc::new(Mutex::new(engine));
+        let mut engines = self.engines.write().await;
+        let handle = engines
+            .entry(key.clone())
+            .or_insert_with(|| Arc::clone(&handle))
+            .clone();
+        Ok(Some(handle))
+    }
+
+    pub async fn remove(&self, key: &SessionKey) {
+        self.engines.write().await.remove(key);
+    }
+
+    pub async fn clear(&self) {
+        self.engines.write().await.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionRunEntry {
+    run_id: u64,
+    token: CancellationToken,
+    cancel_state: Arc<SessionRunCancelState>,
+    input_sender: LoopInputSender,
+}
+
+impl SessionRunEntry {
+    fn cancel(&self, reason: SessionRunCancelReason) -> bool {
+        let did_cancel = self.cancel_state.cancel(reason);
+        self.token.cancel();
+        did_cancel
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRunRegistry {
+    next_run_id: Arc<AtomicU64>,
+    active_runs: Arc<Mutex<HashMap<SessionKey, SessionRunEntry>>>,
+}
+
+impl Default for SessionRunRegistry {
+    fn default() -> Self {
+        Self {
+            next_run_id: Arc::new(AtomicU64::new(1)),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl SessionRunRegistry {
+    pub async fn begin(&self, key: &SessionKey) -> SessionRunPermit {
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let token = CancellationToken::new();
+        let cancel_state = Arc::new(SessionRunCancelState::new());
+        let (input_sender, input_channel) = loop_input_channel();
+        let previous = self.active_runs.lock().await.insert(
+            key.clone(),
+            SessionRunEntry {
+                run_id,
+                token: token.clone(),
+                cancel_state: Arc::clone(&cancel_state),
+                input_sender,
+            },
+        );
+        if let Some(previous) = previous {
+            previous.cancel(SessionRunCancelReason::SupersededByNewerRequest);
+            tracing::warn!(
+                session_id = %key.as_str(),
+                previous_run_id = previous.run_id,
+                run_id,
+                "cancelled previous session run before starting replacement"
+            );
+        }
+        SessionRunPermit {
+            key: key.clone(),
+            run_id,
+            token,
+            cancel_state,
+            input_channel: Some(input_channel),
+        }
+    }
+
+    pub async fn stop(&self, key: &SessionKey) -> StopSessionRunOutcome {
+        let entry = self.active_runs.lock().await.get(key).cloned();
+        match entry {
+            Some(entry) if entry.cancel(SessionRunCancelReason::StoppedByUser) => {
+                StopSessionRunOutcome::Stopped
+            }
+            Some(_) => StopSessionRunOutcome::NoActiveRun,
+            None => StopSessionRunOutcome::NoActiveRun,
+        }
+    }
+
+    pub async fn steer(&self, key: &SessionKey, text: String) -> SteerSessionRunOutcome {
+        let entry = self.active_runs.lock().await.get(key).cloned();
+        match entry {
+            Some(entry) if !entry.token.is_cancelled() => {
+                if entry.input_sender.send(LoopCommand::Steer(text)).is_ok() {
+                    SteerSessionRunOutcome::Steered
+                } else {
+                    SteerSessionRunOutcome::NoActiveRun
+                }
+            }
+            _ => SteerSessionRunOutcome::NoActiveRun,
+        }
+    }
+
+    pub async fn finish(&self, permit: &SessionRunPermit) {
+        let mut active_runs = self.active_runs.lock().await;
+        if active_runs
+            .get(&permit.key)
+            .is_some_and(|entry| entry.run_id == permit.run_id)
+        {
+            // A cancelled permit may already have been replaced by `begin()`.
+            // Only the current owner for this session is allowed to clear the
+            // active slot, so a superseded run cannot remove its replacement.
+            active_runs.remove(&permit.key);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpState {
     pub app: Arc<Mutex<dyn AppEngine>>,
     pub shared: Arc<SharedReadState>,
     pub config_manager: Option<ConfigManagerHandle>,
     pub session_registry: Option<SessionRegistry>,
+    pub session_runs: SessionRunRegistry,
+    pub session_engines: SessionEnginePool,
     pub start_time: Instant,
     pub server_runtime: ServerRuntime,
     pub tailscale_ip: Option<String>,

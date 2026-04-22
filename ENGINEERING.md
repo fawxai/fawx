@@ -210,6 +210,35 @@ All three long-lived branches are protected: no force push, no deletion.
 
 ---
 
+## 7. Agent Execution Model
+
+### Roles
+- **Clawdio main session** is the lead. Orchestrates, designs, reviews results, makes architectural calls. Does NOT write code, regardless of size. All code is delegated to subagents.
+- **Subagents** do all implementation, review, and fix work.
+
+### Model policy
+- **Implementers + Fixers** (code generation): `model: "openai-codex/gpt-5.4"`, `thinking: "xhigh"`.
+- **Reviewers** (code analysis): `model: "anthropic/claude-opus-4-6"`, `thinking: "adaptive"`.
+- GPT-5.4 xhigh for writing code, Opus adaptive for judging code. No Sonnet unless Joe explicitly requests it.
+- Always use full model paths — never aliases (can silently fall back to wrong provider).
+
+### Orchestration model
+- **Main session owns the state machine.** Clawdio directly manages implement → review → fix → re-review loops. Do not delegate lifecycle management to N+1 orchestrator subagents.
+- **Subagents get single-responsibility prompts.** One job each: "implement this spec," "review this diff," "fix these findings."
+- **Spec-driven implementation.** Implementers receive a written spec file, not prose descriptions.
+
+### Concurrency
+- **Simple** (< 50 lines): Direct Codex worker + Opus review. Parallel OK.
+- **Standard** (single-PR features): Main session spawns workers directly. Parallel PRs OK (max 2-3) if no file overlap.
+- **Complex** (multi-crate, architectural): **Sequential only — one PR at a time.** Main session manages full context.
+
+### Rules
+1. Main session NEVER writes code. All code work delegated to subagents, no exceptions.
+2. Implementers + Fixers use `openai-codex/gpt-5.4` with `thinking: "xhigh"`. Reviewers use `anthropic/claude-opus-4-6` with `thinking: "adaptive"`.
+3. Main session chains stages (implement → review → fix → re-review) directly — no N+1 orchestrator layer.
+4. All review findings (blocking, non-blocking, nice-to-have) must be fixed. Fresh reviewer for R2.
+5. Every subagent prompt includes ENGINEERING.md rules and the spec file path.
+
 ---
 
 *This file is immutable doctrine. Cite it in PR reviews. Changes require explicit user approval. For evolving preferences and style, see `TASTE.md`.*

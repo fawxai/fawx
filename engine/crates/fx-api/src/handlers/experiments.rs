@@ -376,7 +376,7 @@ async fn run_experiment(
     provider: &dyn fx_llm::CompletionProvider,
     data_dir: &std::path::Path,
 ) -> Result<fx_improve::ImprovementRunResult, fx_improve::ImprovementError> {
-    let signal_store = fx_memory::SignalStore::new(data_dir, "experiment")
+    let signal_store = fx_memory::SignalStore::open(data_dir, "experiment")
         .map_err(|e| fx_improve::ImprovementError::Analysis(e.to_string()))?;
     let config = fx_improve::ImprovementConfig::default();
     let paths = fx_improve::CyclePaths {
@@ -667,6 +667,8 @@ mod tests {
             shared: Arc::new(SharedReadState::from_app(&TestApp)),
             config_manager: None,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: ServerRuntime::local(8400),
             tailscale_ip: None,

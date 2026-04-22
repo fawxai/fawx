@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
+use fx_kernel::{ExecutionRoot, SharedExecutionRoot};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_loadable::{Skill, SkillError};
 use fx_ripcord::git_guard::check_push_allowed;
@@ -30,7 +31,7 @@ pub type GitHubTokenProvider = Arc<dyn Fn() -> Option<Zeroizing<String>> + Send 
 
 #[derive(Clone)]
 pub struct GitSkill {
-    working_dir: PathBuf,
+    execution_root: SharedExecutionRoot,
     self_modify: Option<SelfModifyConfig>,
     github_token: Option<GitHubTokenProvider>,
     protected_branches: Vec<String>,
@@ -39,7 +40,7 @@ pub struct GitSkill {
 impl std::fmt::Debug for GitSkill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitSkill")
-            .field("working_dir", &self.working_dir)
+            .field("working_dir", &self.working_dir())
             .field("self_modify", &self.self_modify)
             .field("github_token", &self.github_token.is_some())
             .field("protected_branches", &self.protected_branches)
@@ -107,8 +108,20 @@ impl GitSkill {
         self_modify: Option<SelfModifyConfig>,
         github_token: Option<GitHubTokenProvider>,
     ) -> Self {
+        Self::with_execution_root(
+            Arc::new(ExecutionRoot::new(working_dir)),
+            self_modify,
+            github_token,
+        )
+    }
+
+    pub fn with_execution_root(
+        execution_root: SharedExecutionRoot,
+        self_modify: Option<SelfModifyConfig>,
+        github_token: Option<GitHubTokenProvider>,
+    ) -> Self {
         Self {
-            working_dir,
+            execution_root,
             self_modify,
             github_token,
             protected_branches: Vec::new(),
@@ -121,6 +134,10 @@ impl GitSkill {
         self
     }
 
+    fn working_dir(&self) -> PathBuf {
+        self.execution_root.current()
+    }
+
     async fn run_git(&self, args: &[&str]) -> Result<String, String> {
         self.run_git_with_timeout(args, STATUS_TIMEOUT).await
     }
@@ -130,10 +147,11 @@ impl GitSkill {
         args: &[&str],
         timeout_duration: Duration,
     ) -> Result<String, String> {
+        let working_dir = self.working_dir();
         let mut command = Command::new("git");
         command
             .arg("-C")
-            .arg(&self.working_dir)
+            .arg(&working_dir)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -142,7 +160,7 @@ impl GitSkill {
             .spawn()
             .map_err(|error| format!("failed to spawn git: {error}"))?;
         let output = wait_for_git_output(child, timeout_duration).await?;
-        parse_git_output(output, &self.working_dir, args)
+        parse_git_output(output, &working_dir, args)
     }
 
     async fn execute_status(&self) -> Result<String, String> {
@@ -318,6 +336,7 @@ impl GitSkill {
         token: &str,
         timeout_duration: Duration,
     ) -> Result<String, String> {
+        let working_dir = self.working_dir();
         let config_value = Zeroizing::new(format!(
             "url.https://x-access-token:{}@github.com/.insteadOf=https://github.com/",
             token
@@ -325,7 +344,7 @@ impl GitSkill {
         let mut command = Command::new("git");
         command
             .arg("-C")
-            .arg(&self.working_dir)
+            .arg(&working_dir)
             .arg("-c")
             .arg(config_value.as_str())
             .args(args)
@@ -337,7 +356,7 @@ impl GitSkill {
             .spawn()
             .map_err(|error| format!("failed to spawn git: {error}"))?;
         let output = wait_for_git_output(child, timeout_duration).await?;
-        parse_git_output(output, &self.working_dir, args)
+        parse_git_output(output, &working_dir, args)
     }
 }
 
@@ -345,6 +364,10 @@ impl GitSkill {
 impl Skill for GitSkill {
     fn name(&self) -> &str {
         "git"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect and manage git repos, branches, merges, pushes, and pull requests."
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {

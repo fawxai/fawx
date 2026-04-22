@@ -286,7 +286,8 @@ impl AuthorityCoordinator {
         surface: ToolAuthoritySurface,
     ) -> AuthorityRequest {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        classify_call(call, fallback_capability, state.working_dir(), surface)
+        let working_dir = state.working_dir();
+        classify_call(call, fallback_capability, &working_dir, surface)
     }
 
     #[must_use]
@@ -350,7 +351,6 @@ impl AuthorityCoordinator {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .working_dir()
-            .to_path_buf()
     }
 
     #[must_use]
@@ -753,7 +753,8 @@ fn resolve_path_policy(
     if request.paths.is_empty() {
         return None;
     }
-    match strongest_path_tier(&request.paths, state.working_dir(), state.config()) {
+    let working_dir = state.working_dir();
+    match strongest_path_tier(&request.paths, &working_dir, state.config()) {
         PathTier::Allow => None,
         PathTier::Propose => Some(decision(
             request.clone(),

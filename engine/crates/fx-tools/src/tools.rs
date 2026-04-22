@@ -10,14 +10,16 @@ use fx_core::kernel_manifest::BudgetSummary;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
+use fx_core::signals::Signal;
 use fx_kernel::act::{
-    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, JournalAction,
-    ToolCacheability, ToolCallClassification, ToolExecutor, ToolExecutorError, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ConcurrencyPolicy, FailureClass,
+    JournalAction, ToolCacheability, ToolCallClassification, ToolExecutionDiagnostics,
+    ToolExecutor, ToolExecutorError, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::ToolAuthoritySurface;
-use fx_kernel::{ProcessConfig, ProcessRegistry};
+use fx_kernel::{ExecutionRoot, ProcessConfig, ProcessRegistry, SharedExecutionRoot};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_subagent::SubagentControl;
@@ -29,11 +31,98 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolFailure {
+    pub(crate) message: String,
+    pub(crate) class: FailureClass,
+    pub(crate) diagnostics: Option<ToolExecutionDiagnostics>,
+}
+
+impl ToolFailure {
+    pub(crate) fn new(message: impl Into<String>, class: FailureClass) -> Self {
+        Self {
+            message: message.into(),
+            class,
+            diagnostics: None,
+        }
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: ToolExecutionDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    pub(crate) fn permanent(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Permanent)
+    }
+
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Transient)
+    }
+
+    pub(crate) fn unknown(message: impl Into<String>) -> Self {
+        Self::new(message, FailureClass::Unknown)
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<&ToolExecutionDiagnostics> {
+        self.diagnostics.as_ref()
+    }
+}
+
+impl std::fmt::Display for ToolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolFailure {}
+
+impl From<String> for ToolFailure {
+    fn from(message: String) -> Self {
+        Self::unknown(message)
+    }
+}
+
+impl From<&str> for ToolFailure {
+    fn from(message: &str) -> Self {
+        Self::unknown(message)
+    }
+}
+
+pub(crate) fn classify_io_failure(error: &std::io::Error) -> FailureClass {
+    match error.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::InvalidInput
+        // A blind retry will not clear an occupied path. Tools that support
+        // overwrite/create-or-replace semantics should avoid surfacing this
+        // error by choosing the correct filesystem primitive up front.
+        | std::io::ErrorKind::AlreadyExists => FailureClass::Permanent,
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::AddrInUse
+        | std::io::ErrorKind::AddrNotAvailable
+        | std::io::ErrorKind::BrokenPipe => FailureClass::Transient,
+        _ => FailureClass::Unknown,
+    }
+}
+
+pub(crate) fn tool_failure_from_io(error: std::io::Error) -> ToolFailure {
+    let class = classify_io_failure(&error);
+    ToolFailure::new(error.to_string(), class)
+}
+
 mod config;
 mod experiment;
 mod filesystem;
 #[cfg(feature = "improvement")]
 mod improvement;
+mod local_actions;
 mod memory;
 mod node;
 mod process;
@@ -46,11 +135,11 @@ use self::filesystem::{is_builtin_ignored_directory, MAX_SEARCH_MATCHES};
 #[cfg(test)]
 use self::runtime::{day_of_week_from_epoch, iso8601_utc_from_epoch};
 
-fn default_process_registry(working_dir: &Path) -> Arc<ProcessRegistry> {
-    Arc::new(ProcessRegistry::new(ProcessConfig {
-        allowed_dirs: vec![working_dir.to_path_buf()],
-        ..ProcessConfig::default()
-    }))
+fn default_process_registry(execution_root: &SharedExecutionRoot) -> Arc<ProcessRegistry> {
+    Arc::new(ProcessRegistry::new_with_execution_root(
+        ProcessConfig::default(),
+        Some(Arc::clone(execution_root)),
+    ))
 }
 
 fn build_budget_summary(config: &KernelBudgetConfig) -> BudgetSummary {
@@ -110,6 +199,19 @@ impl ToolRegistry {
             .map(|tool| tool.definition())
             .collect()
     }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.ordered
+            .iter()
+            .find_map(|tool| tool.take_execution_diagnostics(call_id))
+    }
+
+    #[must_use = "drained tool signals are cleared and will be lost if ignored"]
+    fn take_emitted_signals(&self, call_id: &str) -> Option<Vec<Signal>> {
+        self.ordered
+            .iter()
+            .find_map(|tool| tool.take_emitted_signals(call_id))
+    }
 }
 
 #[derive(Clone)]
@@ -121,9 +223,10 @@ pub struct FawxToolExecutor {
 
 impl FawxToolExecutor {
     pub fn new(working_dir: PathBuf, config: ToolConfig) -> Self {
+        let execution_root = Arc::new(ExecutionRoot::new(working_dir));
         let context = Arc::new(ToolContext {
-            process_registry: default_process_registry(&working_dir),
-            working_dir,
+            process_registry: default_process_registry(&execution_root),
+            execution_root,
             config,
             memory: None,
             embedding_index: None,
@@ -180,6 +283,12 @@ impl FawxToolExecutor {
     /// Attach runtime self-introspection state.
     pub fn with_runtime_info(mut self, info: Arc<RwLock<RuntimeInfo>>) -> Self {
         self.update_context(|context| context.runtime_info = Some(info));
+        self
+    }
+
+    /// Attach a shared execution root for session-scoped tool execution.
+    pub fn with_execution_root(mut self, execution_root: SharedExecutionRoot) -> Self {
+        self.update_context(|context| context.execution_root = execution_root);
         self
     }
 
@@ -277,7 +386,10 @@ impl FawxToolExecutor {
             None => to_tool_result(
                 &call.id,
                 &call.name,
-                Err(format!("unknown tool: {}", call.name)),
+                Err(ToolFailure::permanent(format!(
+                    "unknown tool: {}",
+                    call.name
+                ))),
             ),
         }
     }
@@ -286,23 +398,45 @@ impl FawxToolExecutor {
 #[cfg(test)]
 impl FawxToolExecutor {
     fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_read_file(args)
+        self.context
+            .handle_read_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_write_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_write_file(args)
+        self.context
+            .handle_write_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_edit_file(args)
+        self.context
+            .handle_edit_file(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_list_directory(args)
+        self.context
+            .handle_list_directory(args)
+            .map_err(|error| error.message)
     }
 
     async fn handle_run_command(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_run_command(args).await
+        let result = self
+            .execute_call(
+                &ToolCall {
+                    id: "test-run-command".to_string(),
+                    name: "run_command".to_string(),
+                    arguments: args.clone(),
+                },
+                None,
+            )
+            .await;
+        if result.success {
+            Ok(result.output)
+        } else {
+            Err(result.output)
+        }
     }
 
     fn handle_exec_background(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -318,7 +452,9 @@ impl FawxToolExecutor {
     }
 
     fn handle_search_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        self.context.handle_search_text(args)
+        self.context
+            .handle_search_text(args)
+            .map_err(|error| error.message)
     }
 
     fn handle_current_time(&self) -> Result<String, String> {
@@ -361,6 +497,7 @@ impl FawxToolExecutor {
         self.context.handle_memory_list()
     }
 
+    #[cfg(test)]
     fn handle_memory_search(&self, args: &serde_json::Value) -> Result<String, String> {
         self.context.handle_memory_search(args)
     }
@@ -371,10 +508,15 @@ impl FawxToolExecutor {
 }
 
 impl ToolContext {
+    pub(crate) fn working_dir(&self) -> PathBuf {
+        self.execution_root.current()
+    }
+
     pub(crate) async fn handle_run_experiment(
         &self,
         args: &serde_json::Value,
     ) -> Result<String, String> {
+        let working_dir = self.working_dir();
         let state = self
             .experiment
             .as_ref()
@@ -383,7 +525,7 @@ impl ToolContext {
             spawn_background_experiment(
                 state,
                 self.subagent_control.clone(),
-                &self.working_dir,
+                &working_dir,
                 args,
                 self.experiment_progress.clone(),
                 None,
@@ -393,7 +535,7 @@ impl ToolContext {
             handle_run_experiment(
                 state,
                 self.subagent_control.as_ref(),
-                &self.working_dir,
+                &working_dir,
                 args,
                 self.experiment_progress.clone(),
             )
@@ -508,6 +650,14 @@ impl ToolExecutor for FawxToolExecutor {
             .and_then(|tool| tool.journal_action(call, result))
     }
 
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.tools.take_execution_diagnostics(call_id)
+    }
+
+    fn take_emitted_signals(&self, call_id: &str) -> Option<Vec<Signal>> {
+        self.tools.take_emitted_signals(call_id)
+    }
+
     fn route_sub_goal_call(
         &self,
         request: &fx_kernel::act::SubGoalToolRoutingRequest,
@@ -525,8 +675,9 @@ impl ToolExecutor for FawxToolExecutor {
 impl std::fmt::Debug for FawxToolExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("FawxToolExecutor");
+        let working_dir = self.context.working_dir();
         debug
-            .field("working_dir", &self.context.working_dir)
+            .field("working_dir", &working_dir)
             .field("config", &self.context.config)
             .field("registered_tools", &self.tools.ordered.len())
             .field("process_registry", &true)
@@ -639,6 +790,7 @@ fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
     let mut registry = ToolRegistry::default();
     experiment::register_tools(&mut registry, context);
     filesystem::register_tools(&mut registry, context);
+    local_actions::register_tools(&mut registry, context);
     shell::register_tools(&mut registry, context);
     process::register_tools(&mut registry, context);
     runtime::register_tools(&mut registry, context);
@@ -651,17 +803,17 @@ fn build_registry(context: &Arc<ToolContext>) -> ToolRegistry {
     registry
 }
 
-pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, String> {
+pub fn validate_path(base: &Path, requested: &str) -> Result<PathBuf, ToolFailure> {
     // NOTE: There is an unavoidable TOCTOU window between this validation and later
     // open/read/write calls that operate by path. Tightening this fully requires
     // fd-based operations end-to-end, which is not currently practical across all tools.
-    let base_canon = fs::canonicalize(base).map_err(|error| error.to_string())?;
+    let base_canon = fs::canonicalize(base).map_err(tool_failure_from_io)?;
     let candidate = resolve_candidate(&base_canon, requested);
     let requested_canon = canonicalize_existing_or_parent(&candidate)?;
     if requested_canon.starts_with(&base_canon) {
         return Ok(requested_canon);
     }
-    Err("path escapes working directory".to_string())
+    Err(ToolFailure::permanent("path escapes working directory"))
 }
 
 fn resolve_candidate(base: &Path, requested: &str) -> PathBuf {
@@ -673,9 +825,9 @@ fn resolve_candidate(base: &Path, requested: &str) -> PathBuf {
     }
 }
 
-fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
+fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, ToolFailure> {
     if path.exists() {
-        return fs::canonicalize(path).map_err(|error| error.to_string());
+        return fs::canonicalize(path).map_err(tool_failure_from_io);
     }
 
     let mut missing_parts = Vec::new();
@@ -683,38 +835,30 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
     while !cursor.exists() {
         let name = cursor
             .file_name()
-            .ok_or_else(|| "invalid target path".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("invalid target path"))?;
         missing_parts.push(name.to_os_string());
         cursor = cursor
             .parent()
-            .ok_or_else(|| "invalid target path".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("invalid target path"))?;
     }
 
-    let mut resolved = fs::canonicalize(cursor).map_err(|error| error.to_string())?;
+    let mut resolved = fs::canonicalize(cursor).map_err(tool_failure_from_io)?;
     while let Some(part) = missing_parts.pop() {
         resolved.push(part);
     }
     Ok(resolved)
 }
 
-fn to_tool_result(
-    tool_call_id: &str,
-    tool_name: &str,
-    output: Result<String, String>,
-) -> ToolResult {
+fn to_tool_result<E>(tool_call_id: &str, tool_name: &str, output: Result<String, E>) -> ToolResult
+where
+    E: Into<ToolFailure>,
+{
     match output {
-        Ok(content) => ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: true,
-            output: content,
-        },
-        Err(error) => ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            success: false,
-            output: error,
-        },
+        Ok(content) => ToolResult::success(tool_call_id, tool_name, content),
+        Err(error) => {
+            let error = error.into();
+            ToolResult::failure(tool_call_id, tool_name, error.message, error.class)
+        }
     }
 }
 
@@ -787,8 +931,12 @@ mod tests {
     use fx_config::FawxConfig;
     use fx_consensus::ProgressEvent;
     use fx_core::memory::MemoryProvider;
+    use fx_core::signals::SignalKind;
     use fx_embeddings::{test_support::create_test_model_dir, EmbeddingModel};
-    use fx_llm::ModelRouter;
+    use fx_kernel::act::{
+        ExternalActionEvidence, RunCommandDiagnostics, ToolCallClassification, ToolExecutor,
+    };
+    use fx_llm::{ModelRouter, ToolCall};
     use fx_memory::embedding_index::EmbeddingIndex;
     use fx_subagent::{test_support::StubSubagentControl, SubagentStatus};
     use tempfile::TempDir;
@@ -871,6 +1019,7 @@ mod tests {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             }
         }
 
@@ -913,19 +1062,50 @@ mod tests {
         Arc::new(RwLock::new(RuntimeInfo {
             active_model: model.to_string(),
             provider: "openai".to_string(),
-            skills: vec![fx_core::runtime_info::SkillInfo {
-                name: "fawx-builtin".to_string(),
-                description: Some("Built-in runtime tools".to_string()),
-                tool_names: vec!["read_file".to_string(), "self_info".to_string()],
-                capabilities: Vec::new(),
-                version: None,
-                source: None,
-                revision_hash: None,
-                manifest_hash: None,
-                activated_at_ms: None,
-                signature_status: None,
-                stale_source: None,
-            }],
+            skills: vec![
+                fx_core::runtime_info::SkillInfo {
+                    name: "fawx-builtin".to_string(),
+                    description: Some("Built-in runtime tools".to_string()),
+                    tool_names: vec!["read_file".to_string(), "self_info".to_string()],
+                    routing_tools: Vec::new(),
+                    capabilities: Vec::new(),
+                    version: None,
+                    source: None,
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
+                },
+                fx_core::runtime_info::SkillInfo {
+                    name: "browser".to_string(),
+                    description: Some("Browser skill".to_string()),
+                    tool_names: vec!["web_fetch".to_string()],
+                    routing_tools: vec![fx_core::tool_routing::ToolRoutingSummary {
+                        tool_name: "web_fetch".to_string(),
+                        metadata: fx_core::tool_routing::ToolRoutingMetadata {
+                            resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                            operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                            auth_mode: fx_core::tool_routing::RouteAuthMode::None,
+                            artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                            fallback_rank: 100,
+                        },
+                        readiness: fx_core::tool_routing::ToolReadinessSummary {
+                            available: true,
+                            ready: true,
+                            readiness_reason: None,
+                        },
+                    }],
+                    capabilities: vec!["network".to_string()],
+                    version: Some("1.0.0".to_string()),
+                    source: Some("installed".to_string()),
+                    revision_hash: None,
+                    manifest_hash: None,
+                    activated_at_ms: None,
+                    signature_status: None,
+                    stale_source: None,
+                },
+            ],
             config_summary: fx_core::runtime_info::ConfigSummary {
                 max_iterations: 6,
                 max_history: 128,
@@ -966,6 +1146,34 @@ mod tests {
         serde_json::from_str(output).expect("valid json output")
     }
 
+    async fn execute_tool_result(
+        executor: &FawxToolExecutor,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> ToolResult {
+        executor
+            .execute_call(
+                &ToolCall {
+                    id: "call-1".to_string(),
+                    name: tool_name.to_string(),
+                    arguments,
+                },
+                None,
+            )
+            .await
+    }
+
+    fn expect_run_command_diagnostics(
+        diagnostics: ToolExecutionDiagnostics,
+    ) -> RunCommandDiagnostics {
+        match diagnostics {
+            ToolExecutionDiagnostics::RunCommand(diagnostics) => diagnostics,
+            ToolExecutionDiagnostics::Http(diagnostics) => {
+                panic!("expected run_command diagnostics, got http: {diagnostics:?}")
+            }
+        }
+    }
+
     fn executor_with_protected_branches(root: &Path, branches: &[&str]) -> FawxToolExecutor {
         test_executor(root).with_protected_branches(
             branches
@@ -1003,6 +1211,20 @@ mod tests {
         run_git_ok(repo.path(), &["commit", "-m", "initial"]);
         run_git_ok(repo.path(), &["checkout", "-b", "dev"]);
         (repo, remote)
+    }
+
+    #[cfg(unix)]
+    fn create_arg_capture_script(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = root.join("capture-args.sh");
+        fs::write(&script_path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("write script");
+        let mut perms = fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        script_path
     }
 
     fn test_executor_with_subagents(root: &Path) -> FawxToolExecutor {
@@ -1845,6 +2067,46 @@ three
         assert!(output.contains("hello"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_non_shell_command_string_preserves_quoted_arguments() {
+        let temp = TempDir::new().expect("temp");
+        let script_path = create_arg_capture_script(temp.path());
+        let executor = test_executor(temp.path());
+        let command = format!("{} open -a \"Google Chrome\" --new", script_path.display());
+
+        let output = executor
+            .handle_run_command(&serde_json::json!({"command": command}))
+            .await
+            .expect("quoted command should run");
+
+        assert!(output.contains("stdout:\nopen\n-a\nGoogle Chrome\n--new\n"));
+        assert!(!output.contains("Chrome\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_explicit_argv_preserves_arguments_with_spaces() {
+        let temp = TempDir::new().expect("temp");
+        let script_path = create_arg_capture_script(temp.path());
+        let executor = test_executor(temp.path());
+
+        let output = executor
+            .handle_run_command(&serde_json::json!({
+                "argv": [
+                    script_path.to_string_lossy().to_string(),
+                    "open",
+                    "-a",
+                    "Google Chrome",
+                    "--new"
+                ]
+            }))
+            .await
+            .expect("argv execution should run");
+
+        assert!(output.contains("stdout:\nopen\n-a\nGoogle Chrome\n--new\n"));
+    }
+
     #[tokio::test]
     async fn run_command_captures_nonzero_exit_code() {
         let temp = TempDir::new().expect("temp");
@@ -1852,7 +2114,7 @@ three
         let output = executor
             .handle_run_command(&serde_json::json!({"command": "false"}))
             .await
-            .expect("command");
+            .expect_err("command should fail");
         assert!(output.contains("exit_code: 1"));
     }
 
@@ -1873,6 +2135,292 @@ three
     }
 
     #[tokio::test]
+    async fn run_command_failure_result_marks_nonzero_exit_as_unknown_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "false"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(result.failure_classification(), Some(FailureClass::Unknown));
+        assert!(result.output.contains("exit_code: 1"));
+    }
+
+    #[tokio::test]
+    async fn run_command_failure_produces_structured_diagnostics() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "printf 'stderr burst\\n' >&2; exit 23",
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("run_command diagnostics"),
+        );
+        assert_eq!(diagnostics.exit_code, Some(23));
+        assert!(diagnostics.shell);
+        assert!(!diagnostics.timed_out);
+        assert!(diagnostics
+            .stderr_snippet
+            .as_deref()
+            .is_some_and(|snippet| snippet.contains("stderr burst")));
+        assert!(
+            executor.take_execution_diagnostics("call-1").is_none(),
+            "diagnostics should be drained after the first read"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_success_preserves_external_action_evidence() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let comment_url = "https://github.com/fawxai/fawx/pull/1842#issuecomment-1";
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": format!("gh() {{ printf '{comment_url}\\n'; }}; gh pr comment 1842 --body 'review'"),
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(result.success);
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("run_command diagnostics"),
+        );
+        assert_eq!(
+            diagnostics.external_actions,
+            vec![ExternalActionEvidence::github_pr_comment(Some(
+                comment_url.to_string()
+            ))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_classifies_signal_terminated_process_as_transient() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let script_path = temp.path().join("kill-self.sh");
+        fs::write(&script_path, "#!/bin/sh\nkill -9 $$\n").expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": script_path.to_string_lossy()}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Transient)
+        );
+        assert!(result.output.contains("exit_code: -1"));
+    }
+
+    #[tokio::test]
+    async fn run_command_classifies_missing_binary_as_permanent() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "definitely_missing_fawx_binary"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_classifies_shell_exit_127_as_permanent() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "definitely_missing_fawx_shell_binary",
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result.output.contains("exit_code: 127"));
+    }
+
+    #[tokio::test]
+    async fn run_command_timeout_result_is_transient() {
+        let temp = TempDir::new().expect("temp");
+        let executor = FawxToolExecutor::new(
+            temp.path().to_path_buf(),
+            ToolConfig {
+                command_timeout: Duration::from_millis(1),
+                ..ToolConfig::default()
+            },
+        );
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "sleep 1"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Transient)
+        );
+        assert!(result.output.contains("timed out"));
+
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("timeout diagnostics"),
+        );
+        assert_eq!(diagnostics.exit_code, None);
+        assert!(!diagnostics.shell);
+        assert!(diagnostics.timed_out);
+        assert!(diagnostics.duration_ms >= 1);
+    }
+
+    #[tokio::test]
+    async fn run_command_empty_command_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": "   "}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_malformed_non_shell_quoting() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"command": r#"open -a "Google Chrome"#}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result.output.contains("unmatched double quote"));
+
+        let diagnostics = expect_run_command_diagnostics(
+            executor
+                .take_execution_diagnostics("call-1")
+                .expect("malformed quoting diagnostics"),
+        );
+        assert_eq!(diagnostics.exit_code, None);
+        assert!(!diagnostics.shell);
+        assert!(!diagnostics.timed_out);
+    }
+
+    #[tokio::test]
+    async fn run_command_empty_argv_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result =
+            execute_tool_result(&executor, "run_command", serde_json::json!({"argv": []})).await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result.output.contains("argv cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn run_command_empty_argv_program_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({"argv": ["", "hello"]}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result.output.contains("argv[0] cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_argv_when_shell_is_true() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "echo hi",
+                "argv": ["echo", "hi"],
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+        assert!(result
+            .output
+            .contains("argv cannot be used when shell=true"));
+    }
+
+    #[tokio::test]
     async fn run_command_validates_working_directory_override() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -1883,12 +2431,83 @@ three
     }
 
     #[tokio::test]
+    async fn run_command_validates_working_directory_override_for_argv() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let output = executor
+            .handle_run_command(&serde_json::json!({
+                "argv": ["echo", "hi"],
+                "working_dir": "../"
+            }))
+            .await;
+        assert!(output.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_path_is_permanent_failure() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "read_file",
+            serde_json::json!({"path": "missing.txt"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_permission_denied_is_permanent_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp");
+        let path = temp.path().join("secret.txt");
+        fs::write(&path, "secret").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::Permanent)
+        );
+    }
+
+    #[tokio::test]
     async fn run_command_blocks_push_to_protected_branch() {
         let temp = TempDir::new().expect("temp");
         let executor = executor_with_protected_branches(temp.path(), &["main"]);
 
         let error = executor
             .handle_run_command(&serde_json::json!({"command": "git push origin main"}))
+            .await
+            .expect_err("protected push should be blocked");
+
+        assert!(error.contains("protected branch(es) 'main'"));
+    }
+
+    #[tokio::test]
+    async fn run_command_blocks_push_to_protected_branch_via_argv() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_protected_branches(temp.path(), &["main"]);
+
+        let error = executor
+            .handle_run_command(&serde_json::json!({
+                "argv": ["git", "push", "origin", "main"]
+            }))
             .await
             .expect_err("protected push should be blocked");
 
@@ -2025,6 +2644,20 @@ three
     }
 
     #[test]
+    fn exec_background_blocks_push_with_quoted_repo_argument() {
+        let temp = TempDir::new().expect("temp");
+        let executor = executor_with_protected_branches(temp.path(), &["main"]);
+
+        let error = executor
+            .handle_exec_background(
+                &serde_json::json!({"command": r#"git push --repo "/tmp/remote path" main"#}),
+            )
+            .expect_err("protected push should be blocked");
+
+        assert!(error.contains("protected branch(es) 'main'"));
+    }
+
+    #[test]
     fn search_text_finds_pattern_with_file_and_line() {
         let temp = TempDir::new().expect("temp");
         fs::write(temp.path().join("a.txt"), "first\nneedle\nthird").expect("write");
@@ -2033,6 +2666,24 @@ three
             .handle_search_text(&serde_json::json!({"pattern": "needle"}))
             .expect("search");
         assert!(output.contains("a.txt:2:needle"));
+    }
+
+    #[test]
+    fn search_text_can_include_focused_context_lines() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("a.txt"), "first\nneedle\nthird").expect("write");
+        let executor = test_executor(temp.path());
+        let output = executor
+            .handle_search_text(&serde_json::json!({
+                "pattern": "needle",
+                "context_lines": 1
+            }))
+            .expect("search");
+
+        assert!(output.contains("a.txt:2:needle"));
+        assert!(output.contains("  1 | first"));
+        assert!(output.contains("> 2 | needle"));
+        assert!(output.contains("  3 | third"));
     }
 
     #[test]
@@ -2386,6 +3037,17 @@ three
     }
 
     #[test]
+    fn deterministic_local_browser_tools_appear_in_definitions() {
+        let definitions = tool_definitions(false, false);
+        assert!(definitions
+            .iter()
+            .any(|tool| tool.name == "open_browser_application"));
+        assert!(definitions
+            .iter()
+            .any(|tool| tool.name == "open_browser_url"));
+    }
+
+    #[test]
     fn edit_file_appears_in_definitions() {
         let definitions = tool_definitions(false, false);
         assert!(definitions.iter().any(|tool| tool.name == "edit_file"));
@@ -2521,6 +3183,7 @@ three
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         let action = executor
@@ -2555,6 +3218,7 @@ three
             tool_name: call.name.clone(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         };
 
         let action = executor
@@ -2588,6 +3252,32 @@ three
     }
 
     #[test]
+    fn classify_call_treats_read_only_gh_pr_commands_as_observation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        for command in [
+            "gh pr view 1834 --json title,headRefName,baseRefName",
+            "gh pr diff 1834 --patch",
+            "cd /Users/joseph/fawx && gh pr diff 1834 --patch",
+        ] {
+            let call = ToolCall {
+                id: "1".to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({
+                    "command": command,
+                    "shell": true,
+                }),
+            };
+
+            assert_eq!(
+                executor.classify_call(&call),
+                ToolCallClassification::Observation,
+                "expected `{command}` to be observational"
+            );
+        }
+    }
+
+    #[test]
     fn classify_call_treats_mutating_run_command_as_mutation() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
@@ -2596,6 +3286,25 @@ three
             name: "run_command".to_string(),
             arguments: serde_json::json!({
                 "command": "cd ~/fawx && cargo run -- skill create x-post",
+                "shell": true,
+            }),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_call_treats_mutating_gh_pr_command_as_mutation() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({
+                "command": "gh pr comment 1834 --body 'Ship it'",
                 "shell": true,
             }),
         };
@@ -2794,6 +3503,22 @@ three
         assert_eq!(output["status"]["state"], "running");
     }
 
+    #[test]
+    fn spawn_agent_classifies_as_orchestration() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor_with_subagents(temp.path());
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: serde_json::json!({"task": "Review this"}),
+        };
+
+        assert_eq!(
+            executor.classify_call(&call),
+            ToolCallClassification::Orchestration
+        );
+    }
+
     #[tokio::test]
     async fn subagent_status_dispatches_send_action() {
         let temp = TempDir::new().expect("temp");
@@ -2812,6 +3537,33 @@ three
         let output = parse_json_output(&result.output);
         assert!(result.success);
         assert_eq!(output["response"], "reply");
+    }
+
+    #[tokio::test]
+    async fn subagent_status_wait_returns_terminal_state() {
+        let temp = TempDir::new().expect("temp");
+        let control = Arc::new(
+            StubSubagentControl::new().with_status(SubagentStatus::Completed {
+                result: "done".to_string(),
+                tokens_used: 42,
+            }),
+        );
+        let executor = test_executor_with_control(temp.path(), control);
+        let call = ToolCall {
+            id: "1".to_string(),
+            name: "subagent_status".to_string(),
+            arguments: serde_json::json!({
+                "action": "wait",
+                "id": "agent-1",
+                "timeout_seconds": 1
+            }),
+        };
+
+        let result = executor.execute_call(&call, None).await;
+        let output = parse_json_output(&result.output);
+        assert!(result.success);
+        assert_eq!(output["status"]["state"], "completed");
+        assert_eq!(output["status"]["result"], "done");
     }
 
     #[tokio::test]
@@ -2932,6 +3684,28 @@ three
     }
 
     #[test]
+    fn run_command_definition_describes_nonzero_exit_failure_contract() {
+        let definition = tool_definitions(false, false)
+            .into_iter()
+            .find(|tool| tool.name == "run_command")
+            .expect("run_command definition");
+
+        assert!(definition.description.contains("exits with code 0"));
+        assert!(definition.description.contains("non-zero exit"));
+        assert!(definition.description.contains("failed tool result"));
+        assert!(definition
+            .description
+            .contains("Use argv for an exact non-shell"));
+        assert!(definition.description.contains("shell=true"));
+        assert!(definition.description.contains("quote-aware"));
+        assert!(definition.parameters["properties"]["argv"].is_object());
+        assert!(definition.parameters["allOf"].is_null());
+        assert!(definition.parameters["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("either command or argv")));
+    }
+
+    #[test]
     fn self_info_returns_all_sections() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path()).with_runtime_info(sample_runtime_info("model-a"));
@@ -2976,6 +3750,15 @@ three
 
         assert_eq!(object.len(), 1);
         assert_eq!(parsed["skills"][0]["name"], "fawx-builtin");
+        assert_eq!(
+            parsed["skills"][1]["routing_tools"][0]["metadata"]["resource_kinds"][0],
+            "generic_url"
+        );
+        assert!(
+            parsed["skills"][1]["routing_tools"][0]["readiness"]["ready"]
+                .as_bool()
+                .expect("ready bool")
+        );
     }
 
     #[test]
@@ -3301,6 +4084,70 @@ three
             .expect("memory search");
 
         assert_eq!(result, "No relevant memories found for: oauth");
+    }
+
+    #[tokio::test]
+    async fn memory_search_tool_emits_memory_hit_signal_with_structured_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, memory) = memory_executor(temp.path());
+        {
+            let mut guard = memory.lock().expect("lock");
+            guard
+                .write("project_notes", "shipping auth flow soon")
+                .expect("write notes");
+        }
+
+        let results = executor
+            .execute_tools(
+                &[ToolCall {
+                    id: "call-1".to_string(),
+                    name: "memory_search".to_string(),
+                    arguments: serde_json::json!({"query": "project auth"}),
+                }],
+                None,
+            )
+            .await
+            .expect("execute memory search");
+        assert!(results[0].success, "memory search should succeed");
+
+        let signals = executor
+            .take_emitted_signals("call-1")
+            .expect("memory search signals");
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.kind, SignalKind::MemoryHit);
+        assert_eq!(signal.metadata["query"], "project auth");
+        assert_eq!(signal.metadata["result_count"], serde_json::json!(1));
+        assert!(signal.metadata.get("top_score").is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_search_tool_emits_memory_miss_signal_with_query_metadata() {
+        let temp = TempDir::new().expect("temp");
+        let (executor, _memory, _index) = embedding_executor(temp.path());
+
+        let results = executor
+            .execute_tools(
+                &[ToolCall {
+                    id: "call-1".to_string(),
+                    name: "memory_search".to_string(),
+                    arguments: serde_json::json!({"query": "oauth"}),
+                }],
+                None,
+            )
+            .await
+            .expect("execute memory search");
+        assert!(results[0].success, "memory search should succeed");
+
+        let signals = executor
+            .take_emitted_signals("call-1")
+            .expect("memory miss signal");
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.kind, SignalKind::MemoryMiss);
+        assert_eq!(signal.metadata["query"], "oauth");
+        assert_eq!(signal.metadata["result_count"], serde_json::json!(0));
+        assert!(signal.metadata.get("top_score").is_none());
     }
 
     #[test]
@@ -4015,8 +4862,7 @@ three
         let exec = test_executor(temp.path()).with_runtime_info(sample_runtime_info("m"));
         let result = exec.handle_fawx_status().expect("status");
         let json: serde_json::Value = serde_json::from_str(&result).expect("parse json");
-        // sample_runtime_info has 1 skill
-        assert_eq!(json["skills_loaded"], 1);
+        assert_eq!(json["skills_loaded"], 2);
     }
 
     #[test]
@@ -4055,6 +4901,14 @@ three
         assert_eq!(json["model"]["active_model"], "gpt-5.4");
         assert!(json["permissions"]["mode"].is_string());
         assert!(json["budget"]["max_llm_calls"].is_number());
+        assert_eq!(
+            json["tools"][1]["routing_tools"][0]["tool_name"],
+            "web_fetch"
+        );
+        assert_eq!(
+            json["tools"][1]["routing_tools"][0]["metadata"]["resource_kinds"][0],
+            "generic_url"
+        );
         assert!(json.get("tripwire").is_none(), "must not expose tripwires");
         assert!(json.get("ripcord").is_none(), "must not expose ripcord");
     }

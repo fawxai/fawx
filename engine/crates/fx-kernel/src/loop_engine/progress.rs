@@ -65,8 +65,15 @@ impl LoopEngine {
         if self.last_activity_progress.as_ref() == Some(&next) {
             return;
         }
+        let narration = activity_narration_from_progress(&next.1);
         self.last_activity_progress = Some(next.clone());
         self.emit_public_progress(next.0, next.1, stream);
+        if let Some(narration) = narration {
+            stream.emit(StreamEvent::WorkingNarrationDelta {
+                text: narration,
+                voiceover_suppressed: true,
+            });
+        }
     }
 
     pub(super) fn expire_activity_progress(&mut self, stream: CycleStream<'_>) {
@@ -119,6 +126,32 @@ impl LoopEngine {
     }
 }
 
+fn activity_narration_from_progress(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("I ") || trimmed.starts_with("I'm ") {
+        return Some(ensure_sentence_punctuation(trimmed));
+    }
+
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    let mut narration = String::from("I'm ");
+    narration.extend(first.to_lowercase());
+    narration.push_str(chars.as_str());
+    Some(ensure_sentence_punctuation(&narration))
+}
+
+fn ensure_sentence_punctuation(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.ends_with(['.', '!', '?']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
 pub(super) fn progress_for_turn_state_with_profile(
     commitment: Option<&TurnCommitment>,
     pending_tool_scope: Option<&ContinuationToolScope>,
@@ -137,6 +170,12 @@ pub(super) fn progress_for_turn_state_with_profile(
     if let TurnExecutionProfile::DirectUtility(profile) = turn_execution_profile {
         if commitment.is_none() {
             return direct_utility_progress(profile);
+        }
+    }
+
+    if let TurnExecutionProfile::DeterministicLocal(plan) = turn_execution_profile {
+        if commitment.is_none() {
+            return plan.progress();
         }
     }
 
@@ -173,6 +212,10 @@ pub(super) fn progress_for_turn_state_with_profile(
                 "Preparing one blocking question about {}",
                 compact_progress_subject(&commitment.blocking_choice)
             ),
+        ),
+        Some(TurnCommitment::FinalizeResponse(_)) => (
+            ProgressKind::Researching,
+            "Drafting the final response.".to_string(),
         ),
         Some(TurnCommitment::ProceedUnderConstraints(commitment)) => {
             if commitment_focuses_on_implementation(commitment, pending_tool_scope, tool_executor) {
@@ -253,7 +296,7 @@ fn commitment_focuses_on_implementation(
         Some(ContinuationToolScope::Only(names)) => names.iter().any(|name| {
             tool_executor.cacheability(name) == ToolCacheability::SideEffect || name == "write_file"
         }),
-        Some(ContinuationToolScope::Full) | None => false,
+        Some(ContinuationToolScope::Full | ContinuationToolScope::NoTools) | None => false,
     }
 }
 
@@ -432,6 +475,7 @@ fn round_activity_descriptor(
                     },
                     countable: true,
                 }),
+                ToolCallClassification::Orchestration => None,
                 ToolCallClassification::Mutation => Some(RoundActivityDescriptor {
                     priority: 85,
                     kind: ProgressKind::Implementing,
@@ -465,6 +509,18 @@ fn round_activity_descriptor(
             kind: ProgressKind::Researching,
             message: "Breaking the task into smaller execution steps".to_string(),
             countable: false,
+        }),
+        "spawn_agent" => Some(RoundActivityDescriptor {
+            priority: 50,
+            kind: ProgressKind::Researching,
+            message: "Delegating focused work to a subagent".to_string(),
+            countable: true,
+        }),
+        "subagent_status" => Some(RoundActivityDescriptor {
+            priority: 50,
+            kind: ProgressKind::Researching,
+            message: "Collecting delegated subagent results".to_string(),
+            countable: true,
         }),
         "current_time" => Some(RoundActivityDescriptor {
             priority: 90,

@@ -1,6 +1,7 @@
 use crate::experiment_panel::ExperimentPanel;
 use crate::fawx_backend::{
     friendly_error_message, try_send, BackendEvent, EngineBackend, EngineStatus,
+    TranscriptPhaseBoundary,
 };
 use async_trait::async_trait;
 use fx_consensus::{format_progress_event, ProgressCallback};
@@ -132,10 +133,58 @@ fn handle_stream_event(
     event: StreamEvent,
 ) {
     match event {
+        StreamEvent::TextPreviewDelta { text } => {
+            try_send(tx, BackendEvent::TextPreviewDelta(text));
+        }
+        StreamEvent::WorkingNarrationDelta {
+            text,
+            voiceover_suppressed,
+        } => {
+            try_send(
+                tx,
+                BackendEvent::WorkingNarrationDelta {
+                    text,
+                    voiceover_suppressed,
+                },
+            );
+        }
+        StreamEvent::TextReset => {
+            try_send(tx, BackendEvent::TextReset);
+        }
         StreamEvent::TextDelta { text } => send_text_delta(tx, saw_text_delta, text),
+        StreamEvent::FinalAnswerDelta { text } => {
+            send_final_answer_delta(tx, saw_text_delta, text);
+        }
         StreamEvent::ToolCallStart { id, name } => {
             track_experiment_tool(active_experiments, experiment_panel, &id, &name);
             send_tool_call_start(tx, name);
+        }
+        StreamEvent::ActivityStart { id, title, kind } => {
+            try_send(
+                tx,
+                BackendEvent::ActivityStart {
+                    id,
+                    title,
+                    kind: Some(kind),
+                },
+            );
+        }
+        StreamEvent::ActivityEnd { id } => {
+            try_send(tx, BackendEvent::ActivityEnd { id });
+        }
+        StreamEvent::ActivityToolCallStart {
+            activity_id,
+            id,
+            name,
+        } => {
+            try_send(
+                tx,
+                BackendEvent::ActivityToolCallStart {
+                    activity_id,
+                    id: Some(id),
+                    name: Some(name),
+                },
+            );
         }
         StreamEvent::ToolCallComplete {
             id,
@@ -144,6 +193,22 @@ fn handle_stream_event(
         } => {
             track_experiment_tool(active_experiments, experiment_panel, &id, &name);
             send_tool_call_complete(tx, name, &arguments);
+        }
+        StreamEvent::ActivityToolCallComplete {
+            activity_id,
+            id,
+            name,
+            arguments,
+        } => {
+            try_send(
+                tx,
+                BackendEvent::ActivityToolCallComplete {
+                    activity_id,
+                    id: Some(id),
+                    name: Some(name),
+                    arguments: parse_tool_arguments(&arguments),
+                },
+            );
         }
         StreamEvent::ToolResult {
             id,
@@ -155,6 +220,50 @@ fn handle_stream_event(
             if !is_error {
                 send_tool_result(tx, Some(tool_name), output, true);
             }
+        }
+        StreamEvent::ActivityToolResult {
+            activity_id,
+            id,
+            tool_name,
+            output,
+            is_error,
+        } => {
+            complete_experiment_tool(active_experiments, experiment_panel, &id);
+            try_send(
+                tx,
+                BackendEvent::ActivityToolResult {
+                    activity_id,
+                    id: Some(id),
+                    tool_name: Some(tool_name),
+                    success: !is_error,
+                    content: output,
+                },
+            );
+        }
+        StreamEvent::ToolProgress {
+            activity_id,
+            id,
+            tool_name,
+            class,
+            target,
+            advances_slot,
+            outcome,
+        } => {
+            try_send(
+                tx,
+                BackendEvent::ToolProgress {
+                    activity_id,
+                    id: Some(id),
+                    tool_name: Some(tool_name),
+                    category: stream_progress_class_label(class).to_string(),
+                    target,
+                    advances_slot,
+                    outcome: stream_progress_outcome_label(outcome).to_string(),
+                },
+            );
+        }
+        StreamEvent::CompletedSummary { text } => {
+            try_send(tx, BackendEvent::CompletedSummary(text));
         }
         StreamEvent::ToolError { tool_name, error } => {
             tracing::warn!(tool = %tool_name, "tool error in embedded mode: {error}");
@@ -169,6 +278,40 @@ fn handle_stream_event(
         | StreamEvent::ContextCompacted { .. }
         | StreamEvent::PhaseChange { .. }
         | StreamEvent::PermissionPrompt(_) => {}
+        StreamEvent::TranscriptPhaseBoundary { phase } => {
+            try_send(tx, BackendEvent::TranscriptPhaseBoundary(phase.into()));
+        }
+    }
+}
+
+fn stream_progress_class_label(
+    class: fx_kernel::streaming::StreamToolProgressClass,
+) -> &'static str {
+    match class {
+        fx_kernel::streaming::StreamToolProgressClass::Observation => "observation",
+        fx_kernel::streaming::StreamToolProgressClass::Mutation => "mutation",
+    }
+}
+
+fn stream_progress_outcome_label(
+    outcome: fx_kernel::streaming::StreamToolProgressOutcome,
+) -> &'static str {
+    match outcome {
+        fx_kernel::streaming::StreamToolProgressOutcome::Advanced => "advanced",
+        fx_kernel::streaming::StreamToolProgressOutcome::Duplicate => "duplicate",
+        fx_kernel::streaming::StreamToolProgressOutcome::RetryableFailure => "retryable_failure",
+    }
+}
+
+impl From<fx_kernel::streaming::TranscriptTurnPhase> for TranscriptPhaseBoundary {
+    fn from(phase: fx_kernel::streaming::TranscriptTurnPhase) -> Self {
+        match phase {
+            fx_kernel::streaming::TranscriptTurnPhase::CollectingWork => Self::CollectingWork,
+            fx_kernel::streaming::TranscriptTurnPhase::ExecutingTools => Self::ExecutingTools,
+            fx_kernel::streaming::TranscriptTurnPhase::Summarizing => Self::Summarizing,
+            fx_kernel::streaming::TranscriptTurnPhase::Finalizing => Self::Finalizing,
+            fx_kernel::streaming::TranscriptTurnPhase::Completed => Self::Completed,
+        }
     }
 }
 
@@ -226,6 +369,15 @@ fn mark_experiment_complete(experiment_panel: &SharedExperimentPanel) {
 fn send_text_delta(tx: &UnboundedSender<BackendEvent>, saw_text_delta: &AtomicBool, text: String) {
     saw_text_delta.store(true, Ordering::Relaxed);
     try_send(tx, BackendEvent::TextDelta(text));
+}
+
+fn send_final_answer_delta(
+    tx: &UnboundedSender<BackendEvent>,
+    saw_text_delta: &AtomicBool,
+    text: String,
+) {
+    saw_text_delta.store(true, Ordering::Relaxed);
+    try_send(tx, BackendEvent::FinalAnswerDelta(text));
 }
 
 fn send_tool_call_start(tx: &UnboundedSender<BackendEvent>, name: String) {
@@ -301,6 +453,7 @@ mod tests {
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::cancellation::CancellationToken;
     use fx_kernel::context_manager::ContextCompactor;
+    use fx_kernel::execution_root::ExecutionRoot;
     use fx_kernel::loop_engine::LoopEngine;
     use fx_kernel::{budget::BudgetConfig, budget::BudgetTracker};
     use fx_llm::{
@@ -368,6 +521,7 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                ..ProviderCapabilities::default()
             }
         }
     }
@@ -403,6 +557,7 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                ..ProviderCapabilities::default()
             }
         }
     }
@@ -429,10 +584,7 @@ mod tests {
     }
 
     fn test_usage() -> Usage {
-        Usage {
-            input_tokens: 7,
-            output_tokens: 11,
-        }
+        Usage::new(7, 11)
     }
 
     fn test_engine() -> LoopEngine {
@@ -499,9 +651,11 @@ mod tests {
                     max_history: 20,
                     memory_enabled: false,
                 },
+                authority: None,
                 version: "test".to_string(),
             })),
             config,
+            execution_root: Arc::new(ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             system_prompt_path: None,
@@ -514,9 +668,13 @@ mod tests {
             cron_store: None,
             startup_warnings: Vec::new(),
             stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+            permission_prompt_state: None,
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             experiment_registry: None,
         })
         .expect("headless app")
@@ -613,7 +771,13 @@ mod tests {
 
         let config = fx_cli::prepare_embedded_config(FawxConfig::default());
 
-        assert_eq!(config.tools.working_dir, Some(temp_dir));
+        assert_eq!(
+            config
+                .tools
+                .working_dir
+                .map(|path| path.canonicalize().expect("canonical working dir")),
+            Some(temp_dir.canonicalize().expect("canonical temp dir"))
+        );
     }
 
     #[tokio::test]
@@ -737,6 +901,105 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn final_answer_delta_marks_response_as_streamed() {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            StreamEvent::FinalAnswerDelta {
+                text: "streamed final".to_string(),
+            },
+        );
+        emit_unstreamed_response(&tx, &saw_text_delta, "fallback final");
+
+        match recv_event(&mut rx).await {
+            BackendEvent::FinalAnswerDelta(text) => assert_eq!(text, "streamed final"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "streamed final answer should suppress done.response fallback dump"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_stream_event_maps_transcript_phase_boundary() {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            StreamEvent::TranscriptPhaseBoundary {
+                phase: fx_kernel::streaming::TranscriptTurnPhase::Finalizing,
+            },
+        );
+
+        match recv_event(&mut rx).await {
+            BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::Finalizing) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_stream_event_maps_executing_tools_phase_boundary() {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            StreamEvent::TranscriptPhaseBoundary {
+                phase: fx_kernel::streaming::TranscriptTurnPhase::ExecutingTools,
+            },
+        );
+
+        match recv_event(&mut rx).await {
+            BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::ExecutingTools) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_stream_event_maps_completed_summary() {
+        let (tx, mut rx) = unbounded_channel();
+        let saw_text_delta = AtomicBool::new(false);
+        let experiment_panel = test_experiment_panel();
+        let active_experiments = test_active_experiments();
+
+        handle_stream_event(
+            &tx,
+            &saw_text_delta,
+            &experiment_panel,
+            &active_experiments,
+            StreamEvent::CompletedSummary {
+                text: "Worked this turn: 1 file read.".to_string(),
+            },
+        );
+
+        match recv_event(&mut rx).await {
+            BackendEvent::CompletedSummary(text) => {
+                assert_eq!(text, "Worked this turn: 1 file read.");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     #[test]
     fn handle_stream_event_ignores_metadata_only_stream_events() {
         assert_stream_event_ignored(StreamEvent::Notification {
@@ -816,10 +1079,14 @@ mod tests {
 
         backend.stream_message("hello".to_string(), tx).await;
 
-        match recv_event(&mut rx).await {
-            BackendEvent::StreamError(message) => assert!(message.contains("stream failed")),
-            other => panic!("unexpected event: {other:?}"),
-        }
+        let error = loop {
+            match recv_event(&mut rx).await {
+                BackendEvent::TranscriptPhaseBoundary(_) => continue,
+                BackendEvent::StreamError(message) => break message,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        assert!(error.contains("stream failed"));
         assert!(rx.try_recv().is_err());
     }
 
@@ -895,26 +1162,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_messages_stream_text_delta_events() {
+    async fn regular_messages_stream_final_answer_delta_events() {
         let backend = EmbeddedBackend::new(test_headless_app());
         let (tx, mut rx) = unbounded_channel();
 
         backend.stream_message("hello".to_string(), tx).await;
 
         let events = recv_events_until_done(&mut rx).await;
-        let text_deltas = events
+        let final_answer_deltas = events
             .iter()
             .filter_map(|event| match event {
-                BackendEvent::TextDelta(text) => Some(text.as_str()),
+                BackendEvent::FinalAnswerDelta(text) => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let combined = text_deltas.concat();
-        // At least one text delta must arrive (streaming or fallback).
-        // With real providers, multiple deltas arrive per-token.
+        let combined = final_answer_deltas.concat();
+        // At least one final-answer delta must arrive before Done; otherwise
+        // the TUI would dump the whole response from the done fallback.
         assert!(
-            !text_deltas.is_empty(),
-            "expected at least one text delta event"
+            !final_answer_deltas.is_empty(),
+            "expected at least one final answer delta event"
         );
         assert!(combined.contains("\"ok\""));
 

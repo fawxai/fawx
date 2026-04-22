@@ -168,6 +168,10 @@ impl Skill for ScratchpadSkill {
         "scratchpad"
     }
 
+    fn description(&self) -> &str {
+        "Keep working notes, hypotheses, observations, and conclusions during a task."
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {

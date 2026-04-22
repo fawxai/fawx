@@ -6,6 +6,7 @@ fn make_tool_result(index: usize, output_size: usize) -> ToolResult {
         tool_name: format!("tool_{index}"),
         success: true,
         output: "x".repeat(output_size),
+        failure_class: None,
     }
 }
 

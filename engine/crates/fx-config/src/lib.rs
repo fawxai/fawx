@@ -1,4 +1,5 @@
 pub mod manager;
+mod provider_model_cache;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -11,6 +12,10 @@ mod types;
 mod validation;
 
 pub use defaults::{DEFAULT_CONFIG_TEMPLATE, DEFAULT_DENY_PATHS};
+pub use provider_model_cache::{
+    clear_provider_model_cache, load_provider_model_cache, save_provider_model_cache,
+    update_provider_model_cache, ProviderModelCache, ProviderModelCacheEntry,
+};
 pub use toml_io::{save_default_model, save_thinking_budget};
 pub use types::{
     AgentBehaviorConfig, AgentConfig, BorrowScope, BudgetConfig, CapabilityMode, FawxConfig,
@@ -21,7 +26,9 @@ pub use types::{
     ToolsConfig, WebhookChannelConfig, WebhookConfig, WorkspaceConfig,
 };
 pub use validation::{
-    parse_log_level, validate_synthesis_instruction, MAX_SYNTHESIS_INSTRUCTION_LENGTH,
+    parse_log_level, validate_agent_personality, validate_custom_instructions,
+    validate_synthesis_instruction, MAX_CUSTOM_INSTRUCTION_LENGTH,
+    MAX_SYNTHESIS_INSTRUCTION_LENGTH,
 };
 
 pub(crate) use toml_io::{parse_config_document, set_typed_field, write_config_file};
@@ -631,11 +638,13 @@ default_model = "old-model"
     #[test]
     fn load_rejects_oversized_synthesis_instruction() {
         let temp = TempDir::new().expect("tempdir");
-        let long_value = "x".repeat(501);
+        let long_value = "x".repeat(MAX_SYNTHESIS_INSTRUCTION_LENGTH + 1);
         let content = format!("[model]\nsynthesis_instruction = \"{}\"\n", long_value);
         write_config(&temp, &content);
         let error = FawxConfig::load(temp.path()).expect_err("should reject long instruction");
-        assert!(error.contains("synthesis_instruction exceeds 500 characters"));
+        assert!(error.contains(&format!(
+            "synthesis_instruction exceeds {MAX_SYNTHESIS_INSTRUCTION_LENGTH} characters"
+        )));
     }
 
     #[test]
@@ -649,11 +658,75 @@ default_model = "old-model"
     #[test]
     fn load_accepts_max_length_synthesis_instruction() {
         let temp = TempDir::new().expect("tempdir");
-        let value = "x".repeat(500);
+        let value = "x".repeat(MAX_SYNTHESIS_INSTRUCTION_LENGTH);
         let content = format!("[model]\nsynthesis_instruction = \"{}\"\n", value);
         write_config(&temp, &content);
-        let config = FawxConfig::load(temp.path()).expect("should accept 500 chars");
-        assert_eq!(config.model.synthesis_instruction.unwrap().len(), 500);
+        let config = FawxConfig::load(temp.path()).expect("should accept max length");
+        assert_eq!(
+            config.model.synthesis_instruction.unwrap().len(),
+            MAX_SYNTHESIS_INSTRUCTION_LENGTH
+        );
+    }
+
+    #[test]
+    fn load_accepts_max_length_custom_instructions() {
+        let temp = TempDir::new().expect("tempdir");
+        let value = "x".repeat(MAX_CUSTOM_INSTRUCTION_LENGTH);
+        let content = format!("[agent.behavior]\ncustom_instructions = \"{}\"\n", value);
+        write_config(&temp, &content);
+        let config = FawxConfig::load(temp.path()).expect("should accept max length");
+        assert_eq!(
+            config.agent.behavior.custom_instructions.unwrap().len(),
+            MAX_CUSTOM_INSTRUCTION_LENGTH
+        );
+    }
+
+    #[test]
+    fn load_rejects_oversized_custom_instructions() {
+        let temp = TempDir::new().expect("tempdir");
+        let value = "x".repeat(MAX_CUSTOM_INSTRUCTION_LENGTH + 1);
+        let content = format!("[agent.behavior]\ncustom_instructions = \"{}\"\n", value);
+        write_config(&temp, &content);
+        let error = FawxConfig::load(temp.path()).expect_err("should reject long instructions");
+        assert!(error.contains(&format!(
+            "agent.behavior.custom_instructions exceeds {MAX_CUSTOM_INSTRUCTION_LENGTH} characters"
+        )));
+    }
+
+    #[test]
+    fn load_accepts_supported_agent_personality_values() {
+        for personality in [
+            "casual",
+            "direct",
+            "professional",
+            "technical",
+            "caveman",
+            "custom",
+            "minimal",
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let content = format!("[agent]\npersonality = \"{personality}\"\n");
+            write_config(&temp, &content);
+            let config = FawxConfig::load(temp.path()).expect("should accept personality");
+            assert_eq!(config.agent.personality, personality);
+        }
+    }
+
+    #[test]
+    fn load_accepts_case_insensitive_agent_personality_values() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[agent]\npersonality = \"DIRECT\"\n");
+        let config = FawxConfig::load(temp.path()).expect("should accept personality");
+        assert_eq!(config.agent.personality, "DIRECT");
+    }
+
+    #[test]
+    fn load_rejects_unknown_agent_personality() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(&temp, "[agent]\npersonality = \"wizard\"\n");
+        let error = FawxConfig::load(temp.path()).expect_err("should reject personality");
+        assert!(error.contains("agent.personality must be one of"));
+        assert!(error.contains("caveman"));
     }
 
     #[test]

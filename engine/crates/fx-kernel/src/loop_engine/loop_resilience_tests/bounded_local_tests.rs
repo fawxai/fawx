@@ -113,9 +113,10 @@ async fn direct_inspection_blocks_hallucinated_mutation_tool_calls() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -332,7 +333,7 @@ async fn standard_turns_keep_their_normal_tool_surface() {
 fn bounded_local_profile_ignores_generic_observation_round_stripping() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
-    engine.consecutive_observation_only_rounds = 1;
+    engine.observation_round_tracker.repetitive_rounds = 1;
 
     let tools = engine.apply_tool_round_progress_policy(1, &mut Vec::new());
     let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -410,6 +411,7 @@ fn bounded_local_phase_advances_discovery_to_mutation_then_terminal() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     };
     engine.advance_bounded_local_phase_after_tool_round(
         std::slice::from_ref(&discovery_call),
@@ -427,6 +429,7 @@ fn bounded_local_phase_advances_discovery_to_mutation_then_terminal() {
         tool_name: "write_file".to_string(),
         success: true,
         output: "wrote 12 bytes to src/lib.rs".to_string(),
+        failure_class: None,
     };
     engine.advance_bounded_local_phase_after_tool_round(
         std::slice::from_ref(&mutation_call),
@@ -444,6 +447,7 @@ fn bounded_local_phase_advances_discovery_to_mutation_then_terminal() {
         tool_name: "run_command".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     };
     engine.advance_bounded_local_phase_after_tool_round(
         std::slice::from_ref(&verify_call),
@@ -471,6 +475,7 @@ fn bounded_local_discovery_does_not_advance_on_search_only_round() {
         tool_name: "search_text".to_string(),
         success: true,
         output: "found matches in loop_engine.rs".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -502,6 +507,7 @@ fn bounded_local_artifact_target_can_advance_after_non_read_discovery() {
         tool_name: "search_text".to_string(),
         success: true,
         output: "found matches in ChatViewModel.swift".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -532,6 +538,7 @@ async fn bounded_local_failed_mutation_gets_one_recovery_round_then_terminal() {
         tool_name: "edit_file".to_string(),
         success: false,
         output: "old_text not found in file".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -554,12 +561,13 @@ async fn bounded_local_failed_mutation_gets_one_recovery_round_then_terminal() {
         }),
     };
     let recovery_results = engine
-        .execute_tool_calls_with_stream(
+        .execute_tool_calls_batch_with_stream(
             std::slice::from_ref(&recovery_call),
             CycleStream::disabled(),
         )
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(recovery_results.len(), 1);
     assert!(recovery_results[0].success);
@@ -578,6 +586,7 @@ async fn bounded_local_failed_mutation_gets_one_recovery_round_then_terminal() {
         tool_name: "edit_file".to_string(),
         success: false,
         output: "old_text still not found in file".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -670,6 +679,7 @@ fn bounded_local_semantically_blocked_mutation_still_enters_recovery() {
             "Tool 'write_file' blocked: {}. Try a different approach.",
             BOUNDED_LOCAL_MUTATION_NOOP_BLOCK_REASON
         ),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -686,7 +696,7 @@ async fn bounded_local_recovery_bypasses_generic_observation_only_restriction() 
     let mut engine = engine_with_budget(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
     engine.bounded_local_phase = BoundedLocalPhase::Recovery;
-    engine.consecutive_observation_only_rounds = 9;
+    engine.observation_round_tracker.repetitive_rounds = 9;
     engine.pending_tool_scope = Some(ContinuationToolScope::MutationOnly);
 
     let call = ToolCall {
@@ -698,9 +708,10 @@ async fn bounded_local_recovery_bypasses_generic_observation_only_restriction() 
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -720,7 +731,7 @@ async fn bounded_local_discovery_bypasses_generic_observation_only_restriction()
     let mut engine = engine_with_budget(BudgetConfig::default());
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
     engine.bounded_local_phase = BoundedLocalPhase::Discovery;
-    engine.consecutive_observation_only_rounds = 9;
+    engine.observation_round_tracker.repetitive_rounds = 9;
 
     let call = ToolCall {
         id: "d1".to_string(),
@@ -732,9 +743,10 @@ async fn bounded_local_discovery_bypasses_generic_observation_only_restriction()
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(std::slice::from_ref(&call), CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -761,9 +773,10 @@ async fn bounded_local_discovery_blocks_run_command_before_editing() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -785,9 +798,10 @@ async fn bounded_local_mutation_blocks_noop_scratch_write() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -810,9 +824,10 @@ async fn bounded_local_mutation_blocks_tmp_scratch_edit() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -835,9 +850,10 @@ async fn bounded_local_mutation_blocks_edit_without_old_text() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -862,6 +878,7 @@ fn bounded_local_mutation_phase_does_not_advance_on_noop_write() {
         tool_name: "write_file".to_string(),
         success: true,
         output: "wrote 0 bytes to /Users/joseph/fawx/.fawx_noop".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -893,6 +910,7 @@ fn bounded_local_mutation_phase_does_not_advance_on_proposal_only_result() {
         output:
             "PROPOSAL CREATED: write to '/Users/joseph/fawx/app/Fawx/ViewModels/ChatViewModel.swift' requires approval. Proposal saved to: /tmp/proposal.md"
                 .to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -918,9 +936,10 @@ async fn bounded_local_verification_blocks_shell_repo_search() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(!results[0].success);
@@ -942,9 +961,10 @@ async fn bounded_local_verification_allows_focused_test_command() {
     };
 
     let results = engine
-        .execute_tool_calls_with_stream(&[call], CycleStream::disabled())
+        .execute_tool_calls_batch_with_stream(&[call], CycleStream::disabled())
         .await
-        .expect("execute");
+        .expect("execute")
+        .results;
 
     assert_eq!(results.len(), 1);
     assert!(results[0].success);

@@ -1,5 +1,6 @@
 use crate::engine::ResultKind;
 use fx_kernel::ErrorCategory;
+use fx_session::SessionThreadBinding;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,6 +11,8 @@ pub struct MessageRequest {
     pub images: Vec<ImagePayload>,
     #[serde(default)]
     pub documents: Vec<DocumentPayload>,
+    #[serde(default)]
+    pub steering: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -55,10 +58,225 @@ pub struct StatusResponse {
     pub config: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    General,
+    Repository,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositorySummary {
+    pub root: String,
+    pub vcs: String,
+    pub current_branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub clean: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub kind: WorkspaceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepositorySummary>,
+    pub last_opened_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspacesResponse {
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenWorkspaceRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct WorkspaceScope(Option<String>);
+
+impl WorkspaceScope {
+    #[cfg(test)]
+    pub(crate) fn explicit(path: impl Into<String>) -> Self {
+        Self(Some(path.into()))
+    }
+
+    pub fn requested_path(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct WorkspaceRouteQuery {
+    #[serde(rename = "workspace_path", default)]
+    pub workspace_scope: WorkspaceScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeStatus {
+    Active,
+    Available,
+    Detached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub label: String,
+    pub path: String,
+    pub branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    pub status: WorktreeStatus,
+    pub clean: bool,
+    pub ahead_count: u64,
+    pub behind_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreesResponse {
+    pub worktrees: Vec<WorktreeSummary>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    General,
+    Coding,
+    Automation,
+    Subagent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatus {
+    Active,
+    Idle,
+    Completed,
+    Failed,
+    Paused,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub title: String,
+    pub kind: ThreadKind,
+    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+    pub active_session_id: String,
+    pub status: ThreadStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadsResponse {
+    pub threads: Vec<ThreadSummary>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateThreadRequest {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(
+        rename = "workspace_path",
+        default,
+        skip_serializing_if = "WorkspaceScope::is_default"
+    )]
+    pub workspace_scope: WorkspaceScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateWorktreeRequest {
+    pub workspace_id: String,
+    pub branch: String,
+    #[serde(
+        rename = "workspace_path",
+        default,
+        skip_serializing_if = "WorkspaceScope::is_default"
+    )]
+    pub workspace_scope: WorkspaceScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachWorktreeThreadRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachWorktreeThreadResponse {
+    pub worktree_id: String,
+    pub thread_id: String,
+    pub active_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveWorktreeResponse {
+    pub worktree_id: String,
+    pub archived_thread_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteWorktreeResponse {
+    pub deleted: bool,
+    pub worktree_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SetupAuthStatus {
     pub bearer_token_present: bool,
     pub providers_configured: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionThreadBindingDto {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+}
+
+impl From<SessionThreadBinding> for SessionThreadBindingDto {
+    fn from(value: SessionThreadBinding) -> Self {
+        Self {
+            workspace_id: value.workspace_id,
+            execution_root: value.execution_root,
+            worktree_path: value.worktree_path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -252,6 +470,10 @@ pub struct ModelInfoDto {
     pub model_id: String,
     pub provider: String,
     pub auth_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub recommended: bool,
+    pub thinking_levels: Vec<String>,
 }
 
 impl From<fx_llm::ModelInfo> for ModelInfoDto {
@@ -260,6 +482,9 @@ impl From<fx_llm::ModelInfo> for ModelInfoDto {
             model_id: m.model_id,
             provider: m.provider_name,
             auth_method: m.auth_method,
+            display_name: m.display_name,
+            recommended: m.recommended,
+            thinking_levels: m.thinking_levels,
         }
     }
 }

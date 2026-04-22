@@ -3,9 +3,15 @@
 use crate::{FawxConfig, SelfModifyCliConfig};
 use tracing_subscriber::filter::LevelFilter;
 
-pub const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
+// The preferences UI and the legacy synthesis-instruction path share the same
+// cap so moving users between the old and new config surfaces never truncates
+// valid saved instructions. Older builds capped synthesis_instruction at 500.
+pub const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 4000;
+pub const MAX_CUSTOM_INSTRUCTION_LENGTH: usize = 4000;
 const MIN_MAX_READ_SIZE: u64 = 1024;
 pub(crate) const VALID_LOG_LEVELS: &str = "error, warn, info, debug, trace";
+pub(crate) const VALID_AGENT_PERSONALITIES: &str =
+    "casual, direct, professional, technical, caveman, custom";
 
 pub fn validate_synthesis_instruction(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
@@ -18,6 +24,39 @@ pub fn validate_synthesis_instruction(value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub fn validate_custom_instructions(value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    if length > MAX_CUSTOM_INSTRUCTION_LENGTH {
+        return Err(format!(
+            "agent.behavior.custom_instructions exceeds {MAX_CUSTOM_INSTRUCTION_LENGTH} characters"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_agent_personality(value: &str) -> Result<(), String> {
+    // Be forgiving for hand-edited TOML while keeping app-authored writes on
+    // canonical lowercase ids.
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "casual" | "direct" | "professional" | "technical" | "caveman" | "custom"
+        )
+    {
+        return Ok(());
+    }
+
+    // Keep old configs working, but do not surface the old label as a new choice.
+    if normalized == "minimal" {
+        return Ok(());
+    }
+
+    Err(format!(
+        "agent.personality must be one of: {VALID_AGENT_PERSONALITIES}"
+    ))
 }
 
 pub fn parse_log_level(value: &str) -> Option<LevelFilter> {
@@ -76,6 +115,10 @@ impl FawxConfig {
         if let Some(instruction) = &self.model.synthesis_instruction {
             validate_synthesis_instruction(instruction)?;
         }
+        if let Some(instructions) = &self.agent.behavior.custom_instructions {
+            validate_custom_instructions(instructions)?;
+        }
+        validate_agent_personality(&self.agent.personality)?;
         if let Some(max_files) = self.logging.max_files {
             if max_files == 0 {
                 return Err("logging.max_files must be >= 1".to_string());

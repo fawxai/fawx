@@ -1,6 +1,9 @@
 use super::*;
 use async_trait::async_trait;
-use fx_llm::{CompletionResponse, CompletionStream, ContentBlock, ProviderError, StreamChunk};
+use fx_llm::{
+    malformed_tool_arguments, CompletionResponse, CompletionStream, ContentBlock, ProviderError,
+    StreamChunk, ToolDefinition,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +24,7 @@ impl ToolExecutor for NoopToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -66,10 +70,21 @@ fn base_engine() -> LoopEngine {
         .expect("test engine build")
 }
 
-// -- Finding NB1: stream_tool_call_from_state drops malformed JSON --
+fn allowed_tool_names(names: &[&str]) -> Vec<ToolDefinition> {
+    names
+        .iter()
+        .map(|name| ToolDefinition {
+            name: (*name).to_string(),
+            description: "Test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        })
+        .collect()
+}
+
+// -- Regression: streaming preserves tool identities even when args are malformed --
 
 #[test]
-fn stream_tool_call_from_state_drops_malformed_json_arguments() {
+fn stream_tool_call_from_state_preserves_malformed_json_arguments_for_rejection() {
     let state = StreamToolCallState {
         id: Some("call-1".to_string()),
         provider_id: None,
@@ -77,10 +92,16 @@ fn stream_tool_call_from_state_drops_malformed_json_arguments() {
         arguments: "not valid json {{{".to_string(),
         arguments_done: true,
     };
-    let result = stream_tool_call_from_state(state);
+    let call = stream_tool_call_from_state(state).expect("tool call should be preserved");
+    let malformed = malformed_tool_arguments(&call.arguments)
+        .expect("malformed arguments should be marked for actionable rejection");
+    assert_eq!(call.id, "call-1");
+    assert_eq!(call.name, "read_file");
+    assert_eq!(malformed.raw, "not valid json {{{");
     assert!(
-        result.is_none(),
-        "malformed JSON arguments should cause the tool call to be dropped"
+        malformed.error.contains("expected ident"),
+        "parse error should be surfaced: {}",
+        malformed.error
     );
 }
 
@@ -99,6 +120,28 @@ fn stream_tool_call_from_state_accepts_valid_json_arguments() {
     assert_eq!(call.id, "call-1");
     assert_eq!(call.name, "read_file");
     assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+}
+
+#[test]
+fn stream_tool_call_from_state_repairs_common_string_escaping_errors() {
+    let state = StreamToolCallState {
+        id: Some("call-1".to_string()),
+        provider_id: None,
+        name: Some("write_file".to_string()),
+        arguments: "{\n  \"path\": \"README.md\",\n  \"content\": \"let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n\"\n}".to_string(),
+        arguments_done: true,
+    };
+
+    let call = stream_tool_call_from_state(state).expect("tool call");
+    assert!(
+        malformed_tool_arguments(&call.arguments).is_none(),
+        "repairable arguments should parse cleanly"
+    );
+    assert_eq!(call.arguments["path"], "README.md");
+    assert_eq!(
+        call.arguments["content"],
+        "let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n"
+    );
 }
 
 // -- Regression tests for #1118: empty args for zero-param tools --
@@ -177,7 +220,7 @@ fn finalize_stream_tool_calls_preserves_zero_param_tool_calls() {
 }
 
 #[test]
-fn finalize_stream_tool_calls_filters_out_malformed_arguments() {
+fn finalize_stream_tool_calls_preserves_malformed_arguments_for_actionable_rejection() {
     let mut by_index = HashMap::new();
     by_index.insert(
         0,
@@ -200,8 +243,16 @@ fn finalize_stream_tool_calls_filters_out_malformed_arguments() {
         },
     );
     let calls = finalize_stream_tool_calls(by_index);
-    assert_eq!(calls.len(), 1, "only the valid tool call should survive");
+    assert_eq!(
+        calls.len(),
+        2,
+        "streaming should preserve malformed calls so the kernel can reject them explicitly"
+    );
     assert_eq!(calls[0].id, "call-good");
+    assert_eq!(calls[1].id, "call-bad");
+    let malformed = malformed_tool_arguments(&calls[1].arguments)
+        .expect("malformed streamed arguments should carry parse metadata");
+    assert_eq!(malformed.raw, "truncated json {");
 }
 
 // -- Finding NB2: StreamingFinished exactly once for all paths --
@@ -235,6 +286,8 @@ async fn consume_stream_publishes_exactly_one_finished_on_success() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -288,6 +341,8 @@ async fn consume_stream_publishes_exactly_one_finished_on_cancel() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -325,6 +380,8 @@ async fn consume_stream_publishes_exactly_one_finished_on_error() {
     let error = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -445,6 +502,8 @@ async fn consume_stream_with_zero_chunks_produces_empty_response() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )

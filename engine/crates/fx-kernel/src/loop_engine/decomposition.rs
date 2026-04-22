@@ -1,12 +1,13 @@
 use super::{
     action_partial_response, append_continuation_context, build_user_message, current_time_ms,
     extract_user_message, loop_error, meaningful_response_text, truncate_prompt_text,
-    CompactionScope, CycleStream, DecomposeToolArguments, DirectInspectionOwnership,
-    ExecutionVisibility, LlmProvider, LoopEngine, LoopEngineBuilder, LoopResult,
-    DECOMPOSITION_DEPTH_LIMIT_RESPONSE, DECOMPOSITION_RESULTS_PREFIX, MAX_SUB_GOALS,
+    CompactionScope, CycleStream, DecomposeReasoningMode, DecomposeToolArguments,
+    DirectInspectionOwnership, ExecutionVisibility, LlmProvider, LoopEngine, LoopEngineBuilder,
+    LoopResult, DECOMPOSITION_DEPTH_LIMIT_RESPONSE, DECOMPOSITION_RESULTS_PREFIX, MAX_SUB_GOALS,
 };
 use crate::act::{
-    ActionContinuation, ActionNextStep, ActionResult, TokenUsage, ToolCacheability, ToolExecutor,
+    ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, TokenUsage, ToolCacheability,
+    ToolExecutor,
 };
 use crate::budget::{
     build_skip_mask, effective_max_depth, estimate_complexity, ActionCost, AllocationMode,
@@ -17,15 +18,21 @@ use crate::decide::Decision;
 use crate::scoped_tool_executor::scope_tool_executor;
 use crate::signals::{LoopStep, SignalKind};
 use crate::types::{LoopError, PerceptionSnapshot};
+use async_trait::async_trait;
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{
-    AggregationStrategy, ComplexityHint, DecompositionPlan, ExecutionContract, SubGoal,
-    SubGoalOutcome, SubGoalResult,
+    AggregationStrategy, ComplexityHint, DecompositionPlan, ExecutionContract, GeneratedThoughts,
+    GoTPreset, GraphDispatcher, GraphOfOperationsSpec, MergedThought, ReasoningMode, SubGoal,
+    SubGoalOutcome, SubGoalResult, ThoughtGenerator, ThoughtMerger, ThoughtMetadata, ThoughtScore,
+    ThoughtScorer, ThoughtState,
 };
-use fx_llm::{CompletionResponse, Message, ToolDefinition};
+use fx_llm::{
+    completion_text, CompletionRequest, CompletionResponse, ContentBlock, Message, ToolDefinition,
+    Usage,
+};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(super) struct SubGoalExecution {
@@ -97,8 +104,210 @@ const SUB_GOAL_MUTATION_RETRY_INCOMPLETE_REASON: &str =
     "sub-goal required a bounded mutation retry but still did not execute the required work";
 const SUB_GOAL_MUTATION_RETRY_FOLLOW_UP_REASON: &str =
     "sub-goal follow-up still required another reasoning pass after the bounded mutation retry";
+const GOT_SCORE_RESPONSE_TOKEN_LIMIT: u32 = 64;
+const GOT_GENERATION_TOKEN_LIMIT: u32 = 512;
+const GOT_MERGE_TOKEN_LIMIT: u32 = 1024;
+
+#[derive(Clone)]
+struct GoTBudgetHandle {
+    tracker: Arc<Mutex<BudgetTracker>>,
+}
+
+impl GoTBudgetHandle {
+    fn new(tracker: BudgetTracker) -> Self {
+        Self {
+            tracker: Arc::new(Mutex::new(tracker)),
+        }
+    }
+
+    fn reserve_llm_call(&self) -> Result<(), fx_decompose::DecomposeError> {
+        let mut tracker = self.tracker.lock().expect("got budget lock");
+        let cost = ActionCost {
+            llm_calls: 1,
+            tool_invocations: 0,
+            tokens: 0,
+            cost_cents: DEFAULT_LLM_CALL_COST_CENTS,
+        };
+        tracker
+            .check_at(current_time_ms(), &cost)
+            .map_err(|error| {
+                fx_decompose::DecomposeError::BudgetExceeded(format!(
+                    "{:?} budget exceeded (limit={}, current={}, requested={})",
+                    error.resource, error.limit, error.current, error.requested
+                ))
+            })?;
+        tracker.record(&cost);
+        Ok(())
+    }
+
+    fn record_usage(&self, usage: Option<Usage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        self.tracker
+            .lock()
+            .expect("got budget lock")
+            .record(&ActionCost {
+                llm_calls: 0,
+                tool_invocations: 0,
+                tokens: u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                cost_cents: 0,
+            });
+    }
+
+    fn snapshot(&self) -> BudgetTracker {
+        self.tracker.lock().expect("got budget lock").clone()
+    }
+}
+
+#[derive(Clone)]
+struct GoTCompletionBridge<'a> {
+    llm: &'a dyn LlmProvider,
+    budget: GoTBudgetHandle,
+}
+
+impl<'a> GoTCompletionBridge<'a> {
+    fn new(llm: &'a dyn LlmProvider, budget: GoTBudgetHandle) -> Self {
+        Self { llm, budget }
+    }
+
+    async fn complete_text(
+        &self,
+        prompt: String,
+        max_tokens: u32,
+    ) -> Result<String, fx_decompose::DecomposeError> {
+        self.budget.reserve_llm_call()?;
+        let request = CompletionRequest {
+            model: self.llm.model_name().to_string(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(max_tokens),
+            system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
+            thinking: None,
+        };
+        let response = self.llm.complete(request).await.map_err(|error| {
+            fx_decompose::DecomposeError::DecompositionFailed(format!(
+                "thought-model request failed: {error}"
+            ))
+        })?;
+        self.budget.record_usage(response.usage);
+        Ok(completion_text(&response))
+    }
+}
+
+struct KernelThoughtGenerator<'a> {
+    bridge: GoTCompletionBridge<'a>,
+}
+
+#[async_trait]
+impl<'a> ThoughtGenerator for KernelThoughtGenerator<'a> {
+    async fn generate(
+        &self,
+        parent: &ThoughtState,
+        num_branches: usize,
+        prompt_override: Option<&str>,
+    ) -> Result<GeneratedThoughts, fx_decompose::DecomposeError> {
+        let mut branches = Vec::with_capacity(num_branches);
+        let base_prompt = prompt_override
+            .unwrap_or("Generate an alternative reasoning branch for the following thought.");
+
+        for branch_index in 0..num_branches {
+            let prompt = format!(
+                "{base_prompt}\n\nParent reasoning:\n{}\n\nProduce alternative {}/{} as plain text only.",
+                parent.content,
+                branch_index + 1,
+                num_branches
+            );
+            branches.push(
+                self.bridge
+                    .complete_text(prompt, GOT_GENERATION_TOKEN_LIMIT)
+                    .await?,
+            );
+        }
+
+        Ok(GeneratedThoughts::new(branches, num_branches))
+    }
+}
+
+struct KernelThoughtScorer<'a> {
+    bridge: GoTCompletionBridge<'a>,
+}
+
+#[async_trait]
+impl<'a> ThoughtScorer for KernelThoughtScorer<'a> {
+    async fn score(
+        &self,
+        thought: &ThoughtState,
+        criteria: &str,
+    ) -> Result<ThoughtScore, fx_decompose::DecomposeError> {
+        let prompt = format!(
+            "Rate the following reasoning on a scale of 0.0 to 1.0 based on this criteria:\n\
+             {criteria}\n\nReasoning:\n{}\n\nRespond with only a number between 0.0 and 1.0.",
+            thought.content
+        );
+        let response = self
+            .bridge
+            .complete_text(prompt, GOT_SCORE_RESPONSE_TOKEN_LIMIT)
+            .await?;
+
+        Ok(ThoughtScore::new(parse_got_score(&response), 1))
+    }
+}
+
+struct KernelThoughtMerger<'a> {
+    bridge: GoTCompletionBridge<'a>,
+}
+
+#[async_trait]
+impl<'a> ThoughtMerger for KernelThoughtMerger<'a> {
+    async fn merge(
+        &self,
+        thoughts: &[&ThoughtState],
+        instruction: Option<&str>,
+    ) -> Result<MergedThought, fx_decompose::DecomposeError> {
+        let numbered = thoughts
+            .iter()
+            .enumerate()
+            .map(|(index, thought)| format!("Thought {}:\n{}", index + 1, thought.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let merge_instruction =
+            instruction.unwrap_or("Synthesize the strongest ideas into one concise thought.");
+        let prompt = format!(
+            "{merge_instruction}\n\nMerge the following reasoning paths into one improved thought:\n\n{numbered}"
+        );
+        let content = self
+            .bridge
+            .complete_text(prompt, GOT_MERGE_TOKEN_LIMIT)
+            .await?;
+
+        Ok(MergedThought::new(content, 1))
+    }
+}
 
 impl LoopEngine {
+    fn graph_of_thoughts_disabled_action_result(&mut self, decision: &Decision) -> ActionResult {
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            "graph_of_thoughts_disabled",
+            serde_json::json!({"reason": "Graph-of-Thoughts decomposition is dormant"}),
+        );
+        ActionResult {
+            decision: decision.clone(),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+            next_step: ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response: None,
+                reason: "Graph-of-Thoughts decomposition is dormant".to_string(),
+            }),
+        }
+    }
+
     pub(super) async fn execute_decomposition(
         &mut self,
         decision: &Decision,
@@ -114,6 +323,14 @@ impl LoopEngine {
             self.effective_decomposition_depth_cap(&self.budget.remaining(timestamp_ms));
         if self.decomposition_depth_limited(effective_cap) {
             return Ok(self.depth_limited_decomposition_result(decision));
+        }
+        if let ReasoningMode::GraphOfThoughts { graph } = &plan.reasoning_mode {
+            if !self.graph_of_thoughts_enabled {
+                return Ok(self.graph_of_thoughts_disabled_action_result(decision));
+            }
+            return self
+                .execute_graph_of_thoughts(decision, graph, llm, context_messages)
+                .await;
         }
         self.emit_decomposition_truncation(plan);
         let allocation = self.prepare_allocation_plan(plan, timestamp_ms, effective_cap);
@@ -132,6 +349,43 @@ impl LoopEngine {
         }
     }
 
+    async fn execute_graph_of_thoughts(
+        &mut self,
+        decision: &Decision,
+        graph: &GraphOfOperationsSpec,
+        llm: &dyn LlmProvider,
+        context_messages: &[Message],
+    ) -> Result<ActionResult, LoopError> {
+        let graph = graph.build().map_err(|error| {
+            loop_error(
+                "act",
+                &format!("invalid graph of thoughts specification: {error}"),
+                false,
+            )
+        })?;
+        let budget = GoTBudgetHandle::new(self.budget.clone());
+        let bridge = GoTCompletionBridge::new(llm, budget.clone());
+        let dispatcher = GraphDispatcher::new(
+            Arc::new(KernelThoughtGenerator {
+                bridge: bridge.clone(),
+            }),
+            Arc::new(KernelThoughtScorer {
+                bridge: bridge.clone(),
+            }),
+            Arc::new(KernelThoughtMerger { bridge }),
+        );
+        let initial_content = got_initial_content(context_messages);
+        let result = dispatcher
+            .execute(&graph, initial_content, ThoughtMetadata::Empty)
+            .await
+            .map_err(|error| loop_error("act", &format!("GoT reasoning failed: {error}"), false))?;
+        self.budget = budget.snapshot();
+        Ok(build_decomposition_action(
+            decision,
+            best_got_response(&result),
+        ))
+    }
+
     fn prepare_allocation_plan(
         &self,
         plan: &DecompositionPlan,
@@ -143,6 +397,25 @@ impl LoopEngine {
             BudgetAllocator::new().allocate(&self.budget, &plan.sub_goals, mode, timestamp_ms);
         self.apply_effective_depth_cap(&mut allocation.sub_goal_budgets, effective_cap);
         allocation
+    }
+
+    pub(super) fn all_sub_goals_below_decomposition_budget_floor(
+        &self,
+        plan: &DecompositionPlan,
+    ) -> bool {
+        if plan.sub_goals.is_empty() {
+            return false;
+        }
+
+        let timestamp_ms = current_time_ms();
+        let effective_cap =
+            self.effective_decomposition_depth_cap(&self.budget.remaining(timestamp_ms));
+        if self.decomposition_depth_limited(effective_cap) {
+            return false;
+        }
+
+        let allocation = self.prepare_allocation_plan(plan, timestamp_ms, effective_cap);
+        allocation.skipped_indices.len() == plan.sub_goals.len()
     }
 
     pub(super) fn decomposition_depth_limited(&self, effective_cap: u32) -> bool {
@@ -188,6 +461,7 @@ impl LoopEngine {
             max_cycle_failures: template.max_cycle_failures,
             max_no_progress: template.max_no_progress,
             max_tool_retries: template.max_tool_retries,
+            signal_feedback: template.signal_feedback.clone(),
             termination: template.termination.clone(),
         }
     }
@@ -765,10 +1039,7 @@ impl LoopEngine {
         sub_goal: &SubGoal,
         continuation: &ActionContinuation,
     ) -> Option<SubGoalResult> {
-        let response = continuation
-            .partial_response
-            .as_deref()
-            .and_then(meaningful_response_text)?;
+        let response = follow_up_completion_candidate(continuation)?;
         let signals = child.signals.signals().to_vec();
         Some(
             match self.check_sub_goal_completion(sub_goal, &signals, &response) {
@@ -797,13 +1068,13 @@ impl LoopEngine {
         let action = self
             .follow_up_round_action(child, llm, continuation_messages, continuation_tools)
             .await?;
-        let action_partial = action_partial_response(&action);
+        let action_completion = follow_up_action_completion_candidate(&action);
         Ok(match action.next_step {
             ActionNextStep::Finish(terminal) => FollowUpRoundResult::Terminal(
                 child.loop_result_from_action_terminal(terminal, action.tokens_used),
             ),
             ActionNextStep::Continue(continuation) => FollowUpRoundResult::Continue(
-                continuation_with_action_partial(continuation, action_partial),
+                continuation_with_action_partial(continuation, action_completion),
             ),
         })
     }
@@ -1005,6 +1276,9 @@ impl LoopEngine {
         if let Some(scratchpad_context) = &self.scratchpad_context {
             builder = builder.scratchpad_context(scratchpad_context.clone());
         }
+        if let Some(agent_preferences) = &self.agent_preferences {
+            builder = builder.agent_preferences(agent_preferences.clone());
+        }
         if let Some(provider) = &self.scratchpad_provider {
             builder = builder.scratchpad_provider(Arc::clone(provider));
         }
@@ -1113,6 +1387,61 @@ fn build_decomposition_action(decision: &Decision, aggregate: String) -> ActionR
     }
 }
 
+fn best_got_response(result: &fx_decompose::GraphExecutionResult) -> String {
+    result
+        .best
+        .as_ref()
+        .or_else(|| result.thoughts.first())
+        .map(|thought| thought.content.clone())
+        .unwrap_or_else(|| "Graph of Thoughts reasoning produced no usable result.".to_string())
+}
+
+fn got_initial_content(context_messages: &[Message]) -> String {
+    context_messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, fx_llm::MessageRole::User))
+        .and_then(message_text)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "Solve the task.".to_string())
+}
+
+fn message_text(message: &Message) -> Option<String> {
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn parse_got_score(response: &str) -> f64 {
+    if let Some(score) = response
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .filter(|token| !token.is_empty())
+        .find_map(|token| {
+            token
+                .parse::<f64>()
+                .ok()
+                .filter(|score| (0.0..=1.0).contains(score))
+        })
+    {
+        return score;
+    }
+
+    tracing::warn!(
+        response_excerpt = %truncate_prompt_text(response, 120),
+        fallback_score = 0.5,
+        "failed to parse GoT score response; using neutral fallback"
+    );
+    0.5
+}
+
 pub(super) fn aggregate_sub_goal_results(results: &[SubGoalResult]) -> String {
     if results.is_empty() {
         return "Task decomposition contained no sub-goals.".to_string();
@@ -1176,16 +1505,40 @@ fn allocation_mode_for_strategy(strategy: &AggregationStrategy) -> AllocationMod
 
 pub(super) fn parse_decomposition_plan(
     arguments: &serde_json::Value,
+    allow_graph_of_thoughts: bool,
 ) -> Result<DecompositionPlan, LoopError> {
     let parsed = parse_decompose_arguments(arguments)?;
     reject_custom_strategy(parsed.strategy.as_ref())?;
-    ensure_sub_goals_present(&parsed)?;
-    let (sub_goals, truncated_from) = parsed_sub_goals(parsed.sub_goals);
-    Ok(DecompositionPlan {
-        sub_goals,
-        strategy: parsed.strategy.unwrap_or(AggregationStrategy::Sequential),
-        truncated_from,
-    })
+
+    // The public decompose tool is standard-mode only. Older transcripts and
+    // non-strict providers may still send hidden GoT fields. If an explicit
+    // sub-goal list is present, it is the executable contract and therefore
+    // wins over any stale reasoning_mode metadata.
+    if parsed.reasoning_mode.is_none()
+        || parsed.reasoning_mode == Some(DecomposeReasoningMode::Standard)
+        || !parsed.sub_goals.is_empty()
+    {
+        ensure_sub_goals_present(&parsed)?;
+        let (sub_goals, truncated_from) = parsed_sub_goals(parsed.sub_goals);
+        let strategy = parsed.strategy.unwrap_or(AggregationStrategy::Sequential);
+        return Ok(DecompositionPlan {
+            truncated_from,
+            ..DecompositionPlan::standard(sub_goals, strategy)
+        });
+    }
+
+    if !allow_graph_of_thoughts {
+        return Err(loop_error(
+            "decide",
+            "Graph-of-Thoughts decomposition is dormant; decompose requires explicit sub_goals.",
+            true,
+        ));
+    }
+
+    match parse_reasoning_mode(&parsed)? {
+        ReasoningMode::Standard => unreachable!("standard mode handled before GoT parsing"),
+        ReasoningMode::GraphOfThoughts { graph } => Ok(DecompositionPlan::graph_of_thoughts(graph)),
+    }
 }
 
 fn reject_custom_strategy(strategy: Option<&AggregationStrategy>) -> Result<(), LoopError> {
@@ -1236,7 +1589,82 @@ fn parse_decompose_arguments(
     })
 }
 
+fn parse_reasoning_mode(parsed: &DecomposeToolArguments) -> Result<ReasoningMode, LoopError> {
+    let Some(mode) = parsed.reasoning_mode else {
+        return Ok(ReasoningMode::Standard);
+    };
+    match mode {
+        DecomposeReasoningMode::Standard => Ok(ReasoningMode::Standard),
+        DecomposeReasoningMode::GotChain => {
+            build_got_reasoning_mode(parsed, GoTPreset::ChainOfThought)
+        }
+        DecomposeReasoningMode::GotTree => {
+            build_got_reasoning_mode(parsed, GoTPreset::TreeOfThought)
+        }
+        DecomposeReasoningMode::GotGraph => {
+            build_got_reasoning_mode(parsed, GoTPreset::GraphOfThought)
+        }
+        DecomposeReasoningMode::GotConsensus => {
+            build_got_reasoning_mode(parsed, GoTPreset::Consensus)
+        }
+    }
+}
+
+fn build_got_reasoning_mode(
+    parsed: &DecomposeToolArguments,
+    preset: GoTPreset,
+) -> Result<ReasoningMode, LoopError> {
+    let branches = match preset {
+        GoTPreset::ChainOfThought => None,
+        _ => parsed.got_branches,
+    };
+    let criteria = parsed
+        .got_criteria
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            loop_error(
+                "decide",
+                "GoT reasoning modes require `got_criteria`.",
+                false,
+            )
+        })?
+        .to_string();
+    if parsed.got_branches == Some(0) {
+        return Err(loop_error(
+            "decide",
+            "`got_branches` must be at least 1.",
+            false,
+        ));
+    }
+
+    Ok(ReasoningMode::GraphOfThoughts {
+        graph: GraphOfOperationsSpec::Preset {
+            name: preset,
+            branches,
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria,
+        },
+    })
+}
+
 pub(super) fn estimate_plan_cost(plan: &DecompositionPlan) -> ActionCost {
+    if !plan.reasoning_mode.is_standard() {
+        // GoT execution can perform more model calls than this lower bound during
+        // refinement or custom graph traversal. The budget gate uses the lower
+        // bound to reject obviously impossible plans while runtime enforcement
+        // remains the source of truth for exact usage.
+        let llm_calls = plan.reasoning_mode.estimated_llm_calls_lower_bound();
+        return ActionCost {
+            llm_calls,
+            tool_invocations: 0,
+            tokens: 0,
+            cost_cents: u64::from(llm_calls) * DEFAULT_LLM_CALL_COST_CENTS,
+        };
+    }
     plan.sub_goals
         .iter()
         .fold(ActionCost::default(), |mut acc, sub_goal| {
@@ -1315,6 +1743,29 @@ fn continuation_with_action_partial(
         turn_commitment: continuation.turn_commitment,
         artifact_write_target: continuation.artifact_write_target,
     }
+}
+
+fn follow_up_completion_candidate(continuation: &ActionContinuation) -> Option<String> {
+    continuation
+        .partial_response
+        .as_deref()
+        .and_then(meaningful_response_text)
+        .or_else(|| {
+            // Sub-goal orchestration may validate model-facing continuation
+            // context, but root turns must not expose that context as partial
+            // assistant output.
+            continuation
+                .context_message
+                .as_deref()
+                .and_then(meaningful_response_text)
+        })
+}
+
+fn follow_up_action_completion_candidate(action: &ActionResult) -> Option<String> {
+    action_partial_response(action).or_else(|| match action.next_step {
+        ActionNextStep::Continue(_) => meaningful_response_text(&action.response_text),
+        ActionNextStep::Finish(_) => None,
+    })
 }
 
 fn incomplete_follow_up_result(
@@ -1600,7 +2051,7 @@ mod tests {
             .collect::<Vec<_>>();
         let arguments = serde_json::json!({"sub_goals": sub_goals});
 
-        let plan = parse_decomposition_plan(&arguments).expect("plan should parse");
+        let plan = parse_decomposition_plan(&arguments, false).expect("plan should parse");
 
         assert_eq!(plan.sub_goals.len(), MAX_SUB_GOALS);
         assert_eq!(plan.sub_goals[0].description, "goal-0");
@@ -1689,9 +2140,8 @@ mod tests {
         let result = engine.depth_limited_decomposition_result(&decision);
 
         assert!(result.tool_results.is_empty());
-        let blocked = engine
-            .signals
-            .signals()
+        let signals = engine.signals.signals();
+        let blocked = signals
             .iter()
             .filter(|signal| signal.kind == SignalKind::Blocked)
             .collect::<Vec<_>>();
@@ -1741,6 +2191,7 @@ mod tests {
         DecompositionPlan {
             sub_goals,
             strategy: AggregationStrategy::Parallel,
+            reasoning_mode: ReasoningMode::Standard,
             truncated_from: None,
         }
     }

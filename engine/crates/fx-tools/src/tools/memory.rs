@@ -1,11 +1,13 @@
 use super::{parse_args, to_tool_result, ToolRegistry};
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
+use fx_core::signals::{LoopStep, Signal, SignalKind};
 use fx_kernel::act::{ToolCacheability, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_MEMORY_SEARCH_RESULTS: usize = 5;
 
@@ -35,6 +37,7 @@ struct MemoryDeleteTool {
 
 struct MemorySearchTool {
     context: Arc<ToolContext>,
+    emitted_signals: Mutex<HashMap<String, Vec<Signal>>>,
 }
 
 impl MemoryWriteTool {
@@ -73,7 +76,16 @@ impl MemorySearchTool {
     fn new(context: &Arc<ToolContext>) -> Self {
         Self {
             context: Arc::clone(context),
+            emitted_signals: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn store_emitted_signal(&self, call_id: &str, signal: Signal) {
+        let mut guard = self
+            .emitted_signals
+            .lock()
+            .expect("memory_search emitted_signals lock");
+        guard.insert(call_id.to_string(), vec![signal]);
     }
 }
 
@@ -266,11 +278,18 @@ impl Tool for MemorySearchTool {
     }
 
     async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
-        to_tool_result(
-            &call.id,
-            self.name(),
-            self.context.handle_memory_search(&call.arguments),
-        )
+        match self.context.handle_memory_search_execution(&call.arguments) {
+            Ok(execution) => {
+                self.store_emitted_signal(&call.id, execution.signal);
+                ToolResult::success(&call.id, self.name(), execution.output)
+            }
+            Err(error) => ToolResult::failure(
+                &call.id,
+                self.name(),
+                error,
+                fx_kernel::act::FailureClass::Unknown,
+            ),
+        }
     }
 
     fn is_available(&self) -> bool {
@@ -283,6 +302,13 @@ impl Tool for MemorySearchTool {
 
     fn action_category(&self) -> &'static str {
         "tool_call"
+    }
+
+    fn take_emitted_signals(&self, call_id: &str) -> Option<Vec<Signal>> {
+        self.emitted_signals
+            .lock()
+            .expect("memory_search emitted_signals lock")
+            .remove(call_id)
     }
 }
 
@@ -312,6 +338,11 @@ struct MemorySearchResult {
     key: String,
     value: String,
     score: Option<f32>,
+}
+
+struct MemorySearchOutcome {
+    output: String,
+    signal: Signal,
 }
 
 impl ToolContext {
@@ -349,12 +380,24 @@ impl ToolContext {
         Ok(format_memory_list(&entries))
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_memory_search(&self, args: &serde_json::Value) -> Result<String, String> {
+        self.handle_memory_search_execution(args)
+            .map(|outcome| outcome.output)
+    }
+
+    fn handle_memory_search_execution(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<MemorySearchOutcome, String> {
         let parsed: MemorySearchArgs = parse_args(args)?;
         let max_results = parsed.max_results.unwrap_or(DEFAULT_MEMORY_SEARCH_RESULTS);
         let results = self.memory_search_results(&parsed.query, max_results)?;
         self.touch_memory_search_results(&results)?;
-        Ok(format_memory_search_results(&parsed.query, &results))
+        Ok(MemorySearchOutcome {
+            output: format_memory_search_results(&parsed.query, &results),
+            signal: build_memory_search_signal(&parsed.query, &results),
+        })
     }
 
     pub(crate) fn handle_memory_delete(&self, args: &serde_json::Value) -> Result<String, String> {
@@ -511,4 +554,28 @@ fn truncate_preview(value: &str, max_len: usize) -> String {
         end -= 1;
     }
     format!("{}...", &value[..end])
+}
+
+fn build_memory_search_signal(query: &str, results: &[MemorySearchResult]) -> Signal {
+    let mut metadata = serde_json::json!({
+        "query": query,
+        "result_count": results.len(),
+    });
+    if let Some(top_score) = results.iter().find_map(|result| result.score) {
+        metadata["top_score"] = serde_json::json!(top_score);
+    }
+
+    let (kind, message) = if results.is_empty() {
+        (
+            SignalKind::MemoryMiss,
+            "memory search returned no relevant results",
+        )
+    } else {
+        (
+            SignalKind::MemoryHit,
+            "memory search returned relevant results",
+        )
+    };
+
+    Signal::new(LoopStep::Act, kind, message, metadata, Signal::now_ms())
 }

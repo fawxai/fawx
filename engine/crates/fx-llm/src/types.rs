@@ -19,6 +19,7 @@ pub const THINKING_BUDGET_HIGH: u32 = 10_000;
 pub const THINKING_BUDGET_ADAPTIVE: u32 = 5_000;
 /// Token budget for "low" thinking mode.
 pub const THINKING_BUDGET_LOW: u32 = 1_024;
+const MAX_PROMPT_CACHE_AFFINITY_KEY_LEN: usize = 128;
 
 /// Thinking/reasoning configuration for LLM requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,8 +34,75 @@ pub enum ThinkingConfig {
     Off,
 }
 
+/// Provider prompt-cache preference for stable request sections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCachePolicy {
+    /// Do not attach provider-specific prompt-cache hints.
+    #[default]
+    Disabled,
+    /// Ask capable providers to cache stable system/tool blocks ephemerally.
+    Ephemeral,
+}
+
+impl PromptCachePolicy {
+    /// Whether this policy should be omitted from serialized disabled requests.
+    pub const fn is_disabled(value: &Self) -> bool {
+        matches!(value, Self::Disabled)
+    }
+
+    /// Whether stable system/tool blocks should receive ephemeral cache hints.
+    pub const fn wants_ephemeral(self) -> bool {
+        matches!(self, Self::Ephemeral)
+    }
+}
+
+/// Stable routing key for providers with automatic prompt-cache placement.
+///
+/// The key is a provider-agnostic hint derived from Fawx's own thread/session
+/// identity. Providers translate it to their native request field or header.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheAffinity {
+    key: String,
+}
+
+impl PromptCacheAffinity {
+    /// Build a header/body-safe cache-affinity key.
+    pub fn new(key: impl Into<String>) -> Option<Self> {
+        let key = normalize_prompt_cache_affinity_key(&key.into());
+        (!key.is_empty()).then_some(Self { key })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.key
+    }
+}
+
+fn normalize_prompt_cache_affinity_key(key: &str) -> String {
+    let mut normalized = String::new();
+    for ch in key.trim().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            ch
+        } else {
+            '-'
+        };
+        if mapped == '-' && normalized.ends_with('-') {
+            continue;
+        }
+        normalized.push(mapped);
+        if normalized.len() >= MAX_PROMPT_CACHE_AFFINITY_KEY_LEN {
+            break;
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
 /// A model completion request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `Default` intentionally produces an empty request so tests and request builders
+/// can use struct-update syntax as the request contract grows. Provider calls
+/// should still set at least `model` and `messages` explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CompletionRequest {
     /// Target model identifier.
     pub model: String,
@@ -49,6 +117,12 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     /// Optional top-level system prompt.
     pub system_prompt: Option<String>,
+    /// Provider prompt-cache policy for stable request sections.
+    #[serde(default, skip_serializing_if = "PromptCachePolicy::is_disabled")]
+    pub prompt_cache: PromptCachePolicy,
+    /// Stable provider-routing hint for automatic prompt caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_affinity: Option<PromptCacheAffinity>,
     /// Extended thinking configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
@@ -231,6 +305,39 @@ pub struct Usage {
     pub input_tokens: u32,
     /// Output tokens produced by generation.
     pub output_tokens: u32,
+    /// Input tokens served from a provider prompt cache.
+    #[serde(default)]
+    pub cached_input_tokens: u32,
+    /// Input tokens written into a provider prompt cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+}
+
+impl Usage {
+    /// Construct usage without provider prompt-cache accounting.
+    pub const fn new(input_tokens: u32, output_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    /// Construct usage with provider prompt-cache accounting.
+    pub const fn with_prompt_cache(
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_input_tokens: u32,
+        cache_creation_input_tokens: u32,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        }
+    }
 }
 
 /// Incremental stream update from a provider.
@@ -503,13 +610,34 @@ mod tests {
         let request = CompletionRequest {
             model: "test".to_string(),
             messages: vec![],
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            system_prompt: None,
-            thinking: None,
+            ..Default::default()
         };
         assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn prompt_cache_policy_defaults_to_disabled() {
+        let request = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![],
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(request.prompt_cache, PromptCachePolicy::Disabled);
+        assert!(serialized.get("prompt_cache").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_affinity_normalizes_to_header_safe_key() {
+        let affinity = PromptCacheAffinity::new(" sess 123 / workspace ").unwrap();
+
+        assert_eq!(affinity.as_str(), "sess-123-workspace");
+    }
+
+    #[test]
+    fn prompt_cache_affinity_rejects_empty_key() {
+        assert_eq!(PromptCacheAffinity::new("   "), None);
     }
 
     #[test]
@@ -520,11 +648,8 @@ mod tests {
         let request = CompletionRequest {
             model: "test".to_string(),
             messages: vec![],
-            tools: vec![],
-            temperature: None,
-            max_tokens: None,
-            system_prompt: None,
             thinking: thinking.clone(),
+            ..Default::default()
         };
         assert_eq!(request.thinking, thinking);
     }

@@ -38,7 +38,9 @@ use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::loop_engine::{LlmProvider as LoopLlmProvider, LoopEngine, LoopResult};
 use fx_kernel::signals::Signal;
 use fx_kernel::types::PerceptionSnapshot;
-use fx_kernel::{ErrorCategory, PermissionPromptState, StreamCallback, StreamEvent};
+use fx_kernel::{
+    ErrorCategory, PermissionPromptState, SharedExecutionRoot, StreamCallback, StreamEvent,
+};
 use fx_llm::CompletionProvider;
 use fx_llm::{
     CompletionRequest, CompletionResponse, CompletionStream, DocumentAttachment, ImageAttachment,
@@ -73,9 +75,10 @@ use self::auth::{
 use self::command::process_command_input;
 use self::keys::handle_headless_keys_command;
 use self::model::{
-    active_model_thinking_levels, apply_headless_active_model, handle_headless_synthesis_command,
-    preferred_supported_budget, resolve_headless_model_selector, sync_headless_model_from_config,
-    thinking_adjustment_reason, update_context_limit_for_active_model,
+    active_model_thinking_levels, apply_headless_active_model, compatible_thinking_budget,
+    handle_headless_synthesis_command, preferred_supported_budget, resolve_headless_model_selector,
+    sync_headless_model_from_config, thinking_adjustment_reason,
+    update_context_limit_for_active_model,
 };
 #[cfg(test)]
 use self::output::json_output_from_cycle;
@@ -93,14 +96,15 @@ use crate::context::load_context_files;
 #[cfg(test)]
 use crate::helpers::render_model_menu_text;
 use crate::helpers::{
-    format_memory_for_prompt, read_router, resolve_model_alias, trim_history, write_router,
-    AnalysisCompletionProvider, RouterLoopLlmProvider, SharedModelRouter,
+    format_memory_for_prompt, read_router, resolve_model_alias, sync_shared_available_models,
+    thinking_config_for_active_model, trim_history, write_router, AnalysisCompletionProvider,
+    RouterLoopLlmProvider, SharedModelRouter,
 };
 use crate::proposal_review::ReviewContext;
 use crate::startup::{
     build_headless_loop_engine_bundle, configured_data_dir as startup_configured_data_dir,
     configured_working_dir, fawx_data_dir as startup_fawx_data_dir, HeadlessLoopBuildOptions,
-    SharedMemoryStore, SharedTokenBroker,
+    SharedCredentialStore, SharedMemoryStore, SharedTokenBroker,
 };
 use fx_subagent::{
     CreatedSubagentSession, SpawnConfig, SubagentError, SubagentFactory, SubagentLimits,
@@ -117,7 +121,7 @@ use fx_subagent::{
 const DEFAULT_HTTP_MODEL: &str = "claude-opus-4-6";
 
 pub const MAIN_SESSION_KEY: &str = "main";
-const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
+pub(crate) const HEADLESS_SIGNAL_SESSION_ID: &str = "headless";
 
 pub fn main_session_key() -> SessionKey {
     match SessionKey::new(MAIN_SESSION_KEY) {
@@ -235,6 +239,7 @@ pub struct HeadlessAppDeps {
     pub router: SharedModelRouter,
     pub runtime_info: Arc<RwLock<RuntimeInfo>>,
     pub config: FawxConfig,
+    pub execution_root: SharedExecutionRoot,
     pub memory: Option<SharedMemoryStore>,
     pub embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     pub system_prompt_path: Option<PathBuf>,
@@ -249,6 +254,9 @@ pub struct HeadlessAppDeps {
     pub stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     pub permission_prompt_state: Option<Arc<PermissionPromptState>>,
     pub ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
+    pub improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
+    pub credential_store: Option<SharedCredentialStore>,
+    pub token_broker: Option<SharedTokenBroker>,
     #[cfg(feature = "http")]
     pub experiment_registry: Option<fx_api::SharedExperimentRegistry>,
 }
@@ -259,13 +267,13 @@ pub struct HeadlessApp {
     router: SharedModelRouter,
     runtime_info: Arc<RwLock<RuntimeInfo>>,
     config: FawxConfig,
+    execution_root: SharedExecutionRoot,
     memory: Option<SharedMemoryStore>,
     embedding_index_persistence: Option<crate::startup::EmbeddingIndexPersistence>,
     _subagent_manager: Arc<SubagentManager>,
     active_model: String,
     conversation_history: Vec<Message>,
     last_signals: Vec<Signal>,
-    max_history: usize,
     custom_system_prompt: Option<String>,
     canary_monitor: Option<CanaryMonitor>,
     /// Config manager for runtime config tools. Read via `config_manager()`
@@ -287,6 +295,9 @@ pub struct HeadlessApp {
     stream_callback_slot: Arc<std::sync::Mutex<Option<fx_kernel::streaming::StreamCallback>>>,
     permission_prompt_state: Option<Arc<PermissionPromptState>>,
     ripcord_journal: Arc<fx_ripcord::RipcordJournal>,
+    improvement_provider: Option<Arc<dyn CompletionProvider + Send + Sync>>,
+    credential_store: Option<SharedCredentialStore>,
+    token_broker: Option<SharedTokenBroker>,
     /// Bus message receiver. Stored for Phase 2 loop integration —
     /// will be polled via `tokio::select!` alongside user input to
     /// process incoming cross-session messages during conversation.
@@ -594,11 +605,23 @@ impl SessionTurnCollector {
                 self.flush_pending_tool_results();
             }
             StreamEvent::ToolError { .. }
+            | StreamEvent::TextPreviewDelta { .. }
+            | StreamEvent::WorkingNarrationDelta { .. }
+            | StreamEvent::TextReset
             | StreamEvent::TextDelta { .. }
+            | StreamEvent::FinalAnswerDelta { .. }
             | StreamEvent::Progress { .. }
             | StreamEvent::Notification { .. }
+            | StreamEvent::ActivityStart { .. }
+            | StreamEvent::ActivityEnd { .. }
+            | StreamEvent::ActivityToolCallStart { .. }
+            | StreamEvent::ActivityToolCallComplete { .. }
+            | StreamEvent::ActivityToolResult { .. }
+            | StreamEvent::ToolProgress { .. }
+            | StreamEvent::CompletedSummary { .. }
             | StreamEvent::PermissionPrompt(_)
             | StreamEvent::PhaseChange { .. }
+            | StreamEvent::TranscriptPhaseBoundary { .. }
             | StreamEvent::ContextCompacted { .. } => {}
         }
     }
@@ -801,10 +824,7 @@ fn aggregate_message_usage(messages: &[SessionMessage]) -> Option<Usage> {
         saw_usage = true;
     }
 
-    saw_usage.then_some(Usage {
-        input_tokens,
-        output_tokens,
-    })
+    saw_usage.then_some(Usage::new(input_tokens, output_tokens))
 }
 
 fn aggregate_total_token_count(messages: &[SessionMessage]) -> Option<u32> {
@@ -827,26 +847,26 @@ fn terminal_assistant_message(
     fallback_response: &str,
     timestamp: u64,
 ) -> Option<SessionMessage> {
+    if !has_meaningful_response(Some(fallback_response)) {
+        return None;
+    }
+
     let recorded_terminal = responses.iter().rev().find_map(|response| {
         let recorded_turn = assistant_turn_from_response(response.clone(), timestamp)?;
         (!recorded_turn.has_tool_use).then_some(recorded_turn.message)
     });
 
-    if has_meaningful_response(Some(fallback_response)) {
-        let matching_terminal = recorded_terminal.as_ref().filter(|message| {
-            last_visible_assistant_text(message).is_some_and(|existing| {
-                normalize_session_message_text(&existing)
-                    == normalize_session_message_text(fallback_response)
-            })
-        });
-        return Some(fallback_assistant_message_from_template(
-            fallback_response,
-            timestamp,
-            matching_terminal,
-        ));
-    }
-
-    recorded_terminal
+    let matching_terminal = recorded_terminal.as_ref().filter(|message| {
+        last_visible_assistant_text(message).is_some_and(|existing| {
+            normalize_session_message_text(&existing)
+                == normalize_session_message_text(fallback_response)
+        })
+    });
+    Some(fallback_assistant_message_from_template(
+        fallback_response,
+        timestamp,
+        matching_terminal,
+    ))
 }
 
 fn assistant_turn_from_response(
@@ -966,13 +986,31 @@ fn merge_stream_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage
 
     let left_in = left.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
     let left_out = left.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+    let left_cached = left
+        .as_ref()
+        .map(|usage| usage.cached_input_tokens)
+        .unwrap_or(0);
+    let left_cache_creation = left
+        .as_ref()
+        .map(|usage| usage.cache_creation_input_tokens)
+        .unwrap_or(0);
     let right_in = right.as_ref().map(|usage| usage.input_tokens).unwrap_or(0);
     let right_out = right.as_ref().map(|usage| usage.output_tokens).unwrap_or(0);
+    let right_cached = right
+        .as_ref()
+        .map(|usage| usage.cached_input_tokens)
+        .unwrap_or(0);
+    let right_cache_creation = right
+        .as_ref()
+        .map(|usage| usage.cache_creation_input_tokens)
+        .unwrap_or(0);
 
-    Some(Usage {
-        input_tokens: left_in.saturating_add(right_in),
-        output_tokens: left_out.saturating_add(right_out),
-    })
+    Some(Usage::with_prompt_cache(
+        left_in.saturating_add(right_in),
+        left_out.saturating_add(right_out),
+        left_cached.saturating_add(right_cached),
+        left_cache_creation.saturating_add(right_cache_creation),
+    ))
 }
 
 fn streamed_tool_index(
@@ -1187,7 +1225,6 @@ impl HeadlessApp {
             });
         }
         let bus_receiver = Self::initial_bus_receiver(&deps);
-        let max_history = deps.config.general.max_history;
         let data_dir = configured_data_dir(&fawx_data_dir(), &deps.config);
         let custom_system_prompt = resolve_system_prompt(
             deps.system_prompt_text,
@@ -1200,13 +1237,13 @@ impl HeadlessApp {
             router: deps.router,
             runtime_info: deps.runtime_info,
             config: deps.config,
+            execution_root: deps.execution_root,
             memory: deps.memory,
             embedding_index_persistence: deps.embedding_index_persistence,
             _subagent_manager: deps.subagent_manager,
             active_model,
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
-            max_history,
             custom_system_prompt,
             canary_monitor: deps.canary_monitor,
             config_manager: deps.config_manager,
@@ -1222,9 +1259,13 @@ impl HeadlessApp {
             stream_callback_slot: deps.stream_callback_slot,
             permission_prompt_state: deps.permission_prompt_state,
             ripcord_journal: deps.ripcord_journal,
+            improvement_provider: deps.improvement_provider,
+            credential_store: deps.credential_store,
+            token_broker: deps.token_broker,
             bus_receiver,
         };
         app.seed_runtime_info();
+        app.sync_execution_context();
         if !app.active_model.is_empty() {
             update_context_limit_for_active_model(&mut app);
         }
@@ -1275,26 +1316,6 @@ impl HeadlessApp {
         self.startup_warnings.clear();
     }
 
-    fn emit_error(
-        &mut self,
-        callback: Option<&StreamCallback>,
-        category: ErrorCategory,
-        message: String,
-        recoverable: bool,
-    ) {
-        self.record_error(category, message.clone(), recoverable);
-        let Some(callback) = callback else {
-            return;
-        };
-        let event = StreamEvent::Error {
-            category,
-            message,
-            recoverable,
-        };
-        Self::report_stream_error(&event);
-        callback(event);
-    }
-
     fn record_error(&mut self, category: ErrorCategory, message: String, recoverable: bool) {
         if self.error_history.len() == MAX_ERROR_HISTORY {
             self.error_history.pop_front();
@@ -1324,6 +1345,13 @@ impl HeadlessApp {
 
     pub fn available_models(&self) -> Vec<ModelInfo> {
         read_router(&self.router, ModelRouter::available_models)
+    }
+
+    #[cfg(feature = "http")]
+    pub async fn available_models_dynamic(&mut self) -> Vec<ModelInfo> {
+        let models = sync_shared_available_models(&self.router).await;
+        self.reapply_configured_default_model_after_catalog_refresh();
+        models
     }
 
     pub fn thinking_budget(&self) -> fx_config::ThinkingBudget {
@@ -1378,9 +1406,23 @@ impl HeadlessApp {
         active_model_thinking_levels(&self.router, &self.active_model)
     }
 
+    pub fn thinking_available_levels_for_model(&self, model: &str) -> Vec<String> {
+        active_model_thinking_levels(&self.router, model)
+    }
+
     pub fn set_active_model(&mut self, selector: &str) -> anyhow::Result<String> {
         self.apply_active_model_selection(selector)
             .map(|(active_model, _)| active_model)
+    }
+
+    #[cfg(feature = "http")]
+    pub fn replace_active_model_for_turn(&mut self, selector: &str) -> anyhow::Result<String> {
+        let previous_model = self.active_model.clone();
+        let active_model = read_router(&self.router, |router| {
+            resolve_headless_model_selector(router, selector)
+        })?;
+        apply_headless_active_model(self, &active_model);
+        Ok(previous_model)
     }
 
     #[cfg(feature = "http")]
@@ -1499,6 +1541,49 @@ impl HeadlessApp {
         Ok((active_model, thinking_adjusted))
     }
 
+    #[cfg(feature = "http")]
+    fn reapply_configured_default_model_after_catalog_refresh(&mut self) {
+        let Some(configured_model) = self
+            .config
+            .model
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+
+        let resolved_model = read_router(&self.router, |router| {
+            resolve_headless_model_selector(router, &configured_model)
+        });
+
+        let Ok(resolved_model) = resolved_model else {
+            return;
+        };
+
+        if resolved_model == self.active_model {
+            return;
+        }
+
+        let previous_model = self.active_model.clone();
+        apply_headless_active_model(self, &resolved_model);
+        if let Err(error) = self.align_thinking_for_active_model() {
+            tracing::warn!(
+                error = %error,
+                model = %resolved_model,
+                "failed to align thinking after configured default model became available"
+            );
+        }
+        tracing::info!(
+            configured_model = %configured_model,
+            previous_model,
+            active_model = %resolved_model,
+            "reapplied configured default_model after dynamic model catalog refresh"
+        );
+    }
+
     fn align_thinking_for_active_model(
         &mut self,
     ) -> anyhow::Result<Option<(ThinkingBudget, ThinkingBudget)>> {
@@ -1523,6 +1608,45 @@ impl HeadlessApp {
         self.thinking_available_levels()
             .iter()
             .any(|candidate| candidate == &level)
+    }
+
+    fn turn_thinking_budget_for_model(
+        &self,
+        requested: Option<&str>,
+        model: &str,
+    ) -> anyhow::Result<ThinkingBudget> {
+        let available = self.thinking_available_levels_for_model(model);
+        let requested_budget = match requested {
+            Some(level) => level
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error))?,
+            None => self.current_thinking_budget(),
+        };
+
+        if let Some(compatible) = compatible_thinking_budget(requested_budget, &available) {
+            return Ok(compatible);
+        }
+
+        if requested.is_some() {
+            return Err(anyhow::anyhow!(
+                "Thinking level '{}' is not supported by model '{}'. Available: {}",
+                requested_budget,
+                model,
+                available.join(", ")
+            ));
+        }
+
+        Ok(preferred_supported_budget(&available))
+    }
+
+    pub fn apply_turn_thinking_level(&mut self, level: Option<&str>) -> anyhow::Result<()> {
+        let budget = self.turn_thinking_budget_for_model(level, &self.active_model)?;
+        self.loop_engine
+            .set_thinking_config(thinking_config_for_active_model(
+                &budget,
+                &self.active_model,
+            ));
+        Ok(())
     }
 
     pub fn context_info_snapshot(&self) -> ContextInfoSnapshot {
@@ -1655,8 +1779,25 @@ impl HeadlessApp {
 
     pub fn reload_providers(&mut self) -> anyhow::Result<()> {
         let auth_manager = crate::startup::load_auth_manager()?;
-        let router = crate::startup::build_router(&auth_manager)?;
+        let data_dir = configured_data_dir(&fawx_data_dir(), &self.config);
+        let router = crate::startup::build_router_for_data_dir(&auth_manager, &data_dir)?;
         self.apply_reloaded_router(router)
+    }
+
+    pub fn reload_runtime_config_from_disk(&mut self) -> anyhow::Result<()> {
+        let config_path = headless_config_path(&self.config, self.config_manager.as_ref())?;
+        self.config = crate::commands::slash::reload_runtime_config(
+            self.config_manager.as_ref(),
+            &config_path,
+        )?;
+        let thinking_budget = self.config.general.thinking.unwrap_or_default();
+        sync_headless_model_from_config(self, self.config.model.default_model.clone())?;
+        self.loop_engine
+            .set_thinking_config(thinking_config_for_active_model(
+                &thinking_budget,
+                &self.active_model,
+            ));
+        Ok(())
     }
 }
 
@@ -1695,22 +1836,25 @@ fn text_turn_messages(
     user_timestamp: u64,
     assistant_timestamp: u64,
 ) -> Vec<SessionMessage> {
-    vec![
-        SessionMessage::structured(
-            SessionRecordRole::User,
-            user_message_blocks(user_text, &[], &[]),
-            user_timestamp,
-            None,
-        ),
-        SessionMessage::structured(
+    let mut messages = vec![SessionMessage::structured(
+        SessionRecordRole::User,
+        user_message_blocks(user_text, &[], &[]),
+        user_timestamp,
+        None,
+    )];
+
+    if has_meaningful_response(Some(assistant_text)) {
+        messages.push(SessionMessage::structured(
             SessionRecordRole::Assistant,
             vec![SessionContentBlock::Text {
                 text: assistant_text.to_string(),
             }],
             assistant_timestamp,
             None,
-        ),
-    ]
+        ));
+    }
+
+    messages
 }
 
 #[cfg(feature = "http")]
@@ -1732,6 +1876,38 @@ impl AppEngine for HeadlessApp {
             self.conversation_history.clone(),
             &source,
             callback,
+        )
+        .await?;
+        self.conversation_history = updated_history;
+
+        let result_kind = result.result_kind.into();
+
+        Ok(ApiCycleResult {
+            response: result.response,
+            model: result.model,
+            iterations: result.iterations,
+            result_kind,
+        })
+    }
+
+    async fn process_message_with_steering(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+        steering: Option<String>,
+    ) -> Result<ApiCycleResult, anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context_and_steering(
+            self,
+            input,
+            images,
+            documents,
+            self.conversation_history.clone(),
+            &source,
+            callback,
+            steering,
         )
         .await?;
         self.conversation_history = updated_history;
@@ -1774,6 +1950,43 @@ impl AppEngine for HeadlessApp {
         ))
     }
 
+    async fn process_message_with_context_and_steering(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
+        context: Vec<Message>,
+        source: InputSource,
+        callback: Option<StreamCallback>,
+        steering: Option<String>,
+    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+        let (result, updated_history) = HeadlessApp::process_message_with_context_and_steering(
+            self, input, images, documents, context, &source, callback, steering,
+        )
+        .await?;
+
+        Ok((
+            {
+                let result_kind = result.result_kind.into();
+                ApiCycleResult {
+                    response: result.response,
+                    model: result.model,
+                    iterations: result.iterations,
+                    result_kind,
+                }
+            },
+            updated_history,
+        ))
+    }
+
+    fn set_turn_cancel_token(&mut self, token: fx_kernel::CancellationToken) {
+        self.loop_engine.set_cancel_token(token);
+    }
+
+    fn set_turn_input_channel(&mut self, channel: fx_kernel::LoopInputChannel) {
+        self.loop_engine.set_input_channel(channel);
+    }
+
     fn active_model(&self) -> &str {
         HeadlessApp::active_model(self)
     }
@@ -1785,8 +1998,28 @@ impl AppEngine for HeadlessApp {
             .collect()
     }
 
+    async fn available_models_dynamic(&mut self) -> Vec<ModelInfoDto> {
+        HeadlessApp::available_models_dynamic(self)
+            .await
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
     fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
         HeadlessApp::switch_active_model(self, selector)
+    }
+
+    fn replace_active_model(&mut self, selector: &str) -> Result<Option<String>, anyhow::Error> {
+        HeadlessApp::replace_active_model_for_turn(self, selector).map(Some)
+    }
+
+    fn apply_turn_thinking_level(&mut self, level: Option<&str>) -> Result<(), anyhow::Error> {
+        HeadlessApp::apply_turn_thinking_level(self, level)
+    }
+
+    fn thinking_levels_for_model(&self, model: &str) -> Vec<String> {
+        HeadlessApp::thinking_available_levels_for_model(self, model)
     }
 
     fn thinking_level(&self) -> ThinkingLevelDto {
@@ -1834,6 +2067,67 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::reload_providers(self)
     }
 
+    fn reload_config(&mut self) -> Result<(), anyhow::Error> {
+        HeadlessApp::reload_runtime_config_from_disk(self)
+    }
+
+    fn spawn_session_engine(
+        &self,
+        session_key: &SessionKey,
+        execution_root: PathBuf,
+    ) -> Result<Option<Box<dyn AppEngine>>, anyhow::Error> {
+        let subagent_control: Arc<dyn fx_subagent::SubagentControl> =
+            Arc::clone(&self._subagent_manager) as Arc<dyn fx_subagent::SubagentControl>;
+        let bundle = build_headless_loop_engine_bundle(
+            &self.config,
+            self.improvement_provider.clone(),
+            HeadlessLoopBuildOptions {
+                working_dir: Some(execution_root),
+                memory_enabled: true,
+                disable_skill_watcher: true,
+                signal_session_id: Some(session_key.as_str().to_string()),
+                subagent_control: Some(subagent_control),
+                config_manager: self.config_manager.clone(),
+                session_bus: self.session_bus.clone(),
+                permission_prompt_state: self.permission_prompt_state.clone(),
+                ripcord_journal: Some(Arc::clone(&self.ripcord_journal)),
+                credential_store: self.credential_store.clone(),
+                token_broker: self.token_broker.clone(),
+                cron_store: self.cron_store.clone(),
+                #[cfg(feature = "http")]
+                experiment_registry: self.experiment_registry.clone(),
+                ..HeadlessLoopBuildOptions::default()
+            },
+        )?;
+        let app = HeadlessApp::new(HeadlessAppDeps {
+            loop_engine: bundle.engine,
+            router: Arc::clone(&self.router),
+            runtime_info: bundle.runtime_info,
+            config: self.config.clone(),
+            execution_root: bundle.execution_root,
+            memory: bundle.memory,
+            embedding_index_persistence: bundle.embedding_index_persistence,
+            system_prompt_path: None,
+            config_manager: self.config_manager.clone(),
+            system_prompt_text: self.custom_system_prompt.clone(),
+            subagent_manager: Arc::clone(&self._subagent_manager),
+            canary_monitor: None,
+            session_bus: self.session_bus.clone(),
+            session_key: Some(session_key.clone()),
+            cron_store: bundle.cron_store,
+            startup_warnings: Vec::new(),
+            stream_callback_slot: bundle.stream_callback_slot,
+            permission_prompt_state: Some(bundle.permission_prompt_state),
+            ripcord_journal: bundle.ripcord_journal,
+            improvement_provider: self.improvement_provider.clone(),
+            credential_store: self.credential_store.clone(),
+            token_broker: self.token_broker.clone(),
+            #[cfg(feature = "http")]
+            experiment_registry: self.experiment_registry.clone(),
+        })?;
+        Ok(Some(Box::new(app)))
+    }
+
     fn recent_errors(&self, limit: usize) -> Vec<fx_api::ErrorRecordDto> {
         HeadlessApp::recent_errors(self, limit)
             .into_iter()
@@ -1847,14 +2141,11 @@ impl AppEngine for HeadlessApp {
     }
 
     fn max_history(&self) -> usize {
-        self.max_history
+        self.config.general.max_history
     }
 
-    fn session_token_usage(&self) -> (u64, u64) {
-        (
-            self.cumulative_tokens.input_tokens,
-            self.cumulative_tokens.output_tokens,
-        )
+    fn session_token_usage(&self) -> TokenUsage {
+        self.cumulative_tokens
     }
 
     fn replace_session_memory(
@@ -1872,8 +2163,18 @@ impl AppEngine for HeadlessApp {
         self.session_key.clone()
     }
 
+    fn replace_execution_root(&mut self, root: PathBuf) -> Option<PathBuf> {
+        let previous = self.execution_root.replace(root);
+        self.sync_execution_context();
+        Some(previous)
+    }
+
     fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
         HeadlessApp::take_last_session_messages(self)
+    }
+
+    fn take_last_cycle_signals(&mut self) -> Vec<fx_kernel::signals::Signal> {
+        std::mem::take(&mut self.last_signals)
     }
 }
 
@@ -1905,25 +2206,7 @@ fn context_usage_percentage(used_tokens: usize, max_tokens: usize) -> f32 {
 
 fn headless_signal_store(config: &FawxConfig) -> anyhow::Result<SignalStore> {
     let data_dir = configured_data_dir(&fawx_data_dir(), config);
-    SignalStore::new(&data_dir, HEADLESS_SIGNAL_SESSION_ID).map_err(anyhow::Error::new)
-}
-
-fn persist_headless_signals(app: &mut HeadlessApp, signals: &[Signal]) {
-    if let Ok(signal_store) = headless_signal_store(&app.config) {
-        if let Err(error) = signal_store.persist(signals) {
-            let message = format!("Signal persist failed: {error}");
-            eprintln!("warning: signal persist failed: {error}");
-            app.emit_error(None, ErrorCategory::System, message, true);
-        }
-        return;
-    }
-    eprintln!("warning: signal store unavailable for headless session");
-    app.emit_error(
-        None,
-        ErrorCategory::System,
-        "Signal store unavailable for headless session".to_string(),
-        true,
-    );
+    SignalStore::open(&data_dir, HEADLESS_SIGNAL_SESSION_ID).map_err(anyhow::Error::new)
 }
 
 fn build_headless_improve_context(
@@ -2180,7 +2463,11 @@ impl HeadlessSubagentFactory {
         config: &SpawnConfig,
         cancel_token: CancellationToken,
     ) -> Result<HeadlessApp, SubagentError> {
-        let options = self.subagent_build_options(config, cancel_token);
+        let session_key = new_subagent_session_key(self.deps.session_bus.as_ref())?;
+        let mut options = self.subagent_build_options(config, cancel_token);
+        if let Some(session_key) = session_key.as_ref() {
+            options.signal_session_id = Some(session_key.as_str().to_string());
+        }
         let bundle = build_headless_loop_engine_bundle(
             &self.deps.config,
             self.deps.improvement_provider.clone(),
@@ -2192,6 +2479,7 @@ impl HeadlessSubagentFactory {
             router: Arc::clone(&self.deps.router),
             runtime_info: bundle.runtime_info,
             config: self.deps.config.clone(),
+            execution_root: bundle.execution_root,
             memory: bundle.memory,
             embedding_index_persistence: bundle.embedding_index_persistence,
             system_prompt_path: None,
@@ -2200,12 +2488,15 @@ impl HeadlessSubagentFactory {
             subagent_manager: Arc::clone(&self.disabled_manager),
             canary_monitor: None,
             session_bus: self.deps.session_bus.clone(),
-            session_key: new_subagent_session_key(self.deps.session_bus.as_ref())?,
+            session_key,
             cron_store: None,
             startup_warnings: bundle.startup_warnings,
             stream_callback_slot: bundle.stream_callback_slot,
             permission_prompt_state: Some(bundle.permission_prompt_state),
             ripcord_journal: bundle.ripcord_journal,
+            improvement_provider: self.deps.improvement_provider.clone(),
+            credential_store: self.deps.credential_store.clone(),
+            token_broker: self.deps.token_broker.clone(),
             #[cfg(feature = "http")]
             experiment_registry: None,
         };
@@ -2442,14 +2733,12 @@ fn extract_response_text(result: &LoopResult) -> String {
             }
         }
         LoopResult::Incomplete {
-            partial_response,
-            reason,
-            ..
+            partial_response, ..
         } => {
             if has_meaningful_response(partial_response.as_deref()) {
                 partial_response.clone().unwrap_or_default()
             } else {
-                reason.clone()
+                String::new()
             }
         }
         LoopResult::UserStopped {
@@ -2538,6 +2827,7 @@ mod tests {
     #[cfg(feature = "http")]
     use fx_api::engine::AppEngine;
     use fx_bus::{BusStore, Payload};
+    use fx_core::runtime_info::SkillInfo;
     use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
     use fx_kernel::budget::{BudgetConfig, BudgetTracker};
     use fx_kernel::cancellation::CancellationToken;
@@ -2578,6 +2868,23 @@ mod tests {
             .expect("test engine")
     }
 
+    fn runtime_skill_info(name: &str, description: Option<&str>) -> SkillInfo {
+        SkillInfo {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            tool_names: Vec::new(),
+            routing_tools: Vec::new(),
+            capabilities: Vec::new(),
+            version: None,
+            source: None,
+            revision_hash: None,
+            manifest_hash: None,
+            activated_at_ms: None,
+            signature_status: None,
+            stale_source: None,
+        }
+    }
+
     fn shared_router(router: ModelRouter) -> SharedModelRouter {
         Arc::new(RwLock::new(router))
     }
@@ -2607,13 +2914,13 @@ mod tests {
             router: shared_router(ModelRouter::new()),
             runtime_info: test_runtime_info(),
             config,
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
-            max_history: 20,
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
@@ -2631,6 +2938,9 @@ mod tests {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             bus_receiver: None,
         }
     }
@@ -2677,6 +2987,7 @@ mod tests {
                 usage: Some(fx_llm::Usage {
                     input_tokens: 3,
                     output_tokens: 2,
+                    ..Default::default()
                 }),
                 stop_reason: Some("end_turn".to_string()),
             };
@@ -2695,6 +3006,8 @@ mod tests {
             fx_llm::ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -2758,6 +3071,8 @@ mod tests {
             fx_llm::ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -2780,6 +3095,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 3,
                 output_tokens: 2,
+                ..Default::default()
             }),
             stop_reason: Some("end_turn".to_string()),
         }
@@ -2876,6 +3192,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -2893,6 +3210,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 7,
                 output_tokens: 3,
+                ..Default::default()
             }),
             stop_reason: Some("end_turn".to_string()),
         });
@@ -2969,6 +3287,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 3,
                 output_tokens: 2,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3005,6 +3324,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 8,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3055,6 +3375,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 6,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3098,6 +3419,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 8,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3139,6 +3461,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 8,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3183,6 +3506,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 4,
                 output_tokens: 2,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3203,6 +3527,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3220,6 +3545,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 6,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("end_turn".to_string()),
         });
@@ -3425,6 +3751,119 @@ mod tests {
         assert!(!request_replays_tool_use(&captured_request, "call_orphan"));
     }
 
+    #[tokio::test]
+    async fn process_message_includes_runtime_skill_capabilities_in_reasoning_request() {
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReplaySafeCaptureProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("replay-safe-model")
+            .expect("set active replay-safe model");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("replay-safe-model".to_string());
+        let mut app = HeadlessApp::new(headless_deps(router, config)).expect("app");
+
+        if let Ok(mut info) = app.runtime_info.write() {
+            info.skills = vec![
+                runtime_skill_info(
+                    "git",
+                    Some(
+                        "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+                    ),
+                ),
+                runtime_skill_info("blank", Some("   ")),
+            ];
+        }
+        app.loop_engine.invalidate_runtime_skill_prompt_cache();
+
+        app.process_message("hello")
+            .await
+            .expect("process message should succeed");
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+        let system_prompt = captured_request
+            .system_prompt
+            .as_deref()
+            .expect("reasoning request should include a system prompt");
+
+        assert!(system_prompt.contains("Your capabilities:"));
+        assert!(
+            system_prompt.contains(
+                "- git: Inspect and manage git repositories, branches, merges, pushes, and PR creation."
+            )
+        );
+        assert!(
+            !system_prompt.contains("- blank:"),
+            "blank runtime skill descriptions should not render as empty bullets"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_syncs_reasoning_prompt_to_current_execution_root() {
+        let captured = Arc::new(std::sync::Mutex::new(
+            Vec::<fx_llm::CompletionRequest>::new(),
+        ));
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(ReplaySafeCaptureProvider {
+            captured: Arc::clone(&captured),
+        }));
+        router
+            .set_active("replay-safe-model")
+            .expect("set active replay-safe model");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let startup_root = temp.path().join("fawx");
+        let session_root = temp.path().join("autoproject");
+        std::fs::create_dir_all(&startup_root).expect("create startup root");
+        std::fs::create_dir_all(&session_root).expect("create session root");
+
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("replay-safe-model".to_string());
+        config.tools.working_dir = Some(startup_root.clone());
+        let mut app = HeadlessApp::new(headless_deps(router, config)).expect("app");
+        app.execution_root.replace(session_root.clone());
+
+        app.process_message("Review PR 30 and post the comment on the PR")
+            .await
+            .expect("process message should succeed");
+
+        let captured_request = captured
+            .lock()
+            .expect("capture lock")
+            .last()
+            .cloned()
+            .expect("captured request");
+        let system_prompt = captured_request
+            .system_prompt
+            .as_deref()
+            .expect("reasoning request should include a system prompt");
+
+        assert!(system_prompt.contains(&format!(
+            "Current working directory: {}",
+            session_root.display()
+        )));
+        assert!(
+            !system_prompt.contains(&format!(
+                "Current working directory: {}",
+                startup_root.display()
+            )),
+            "prompt must not retain stale startup workspace after execution root changes"
+        );
+        assert!(system_prompt.contains(
+            "active repository/workspace for local files, shell commands, git commands, and GitHub pull request operations"
+        ));
+    }
+
     #[test]
     fn build_turn_tool_history_messages_reassigns_tool_results_by_tool_use_id() {
         let snapshot = SessionTurnSnapshot {
@@ -3588,6 +4027,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 3,
                 output_tokens: 1,
+                ..Default::default()
             }),
             stop_reason: None,
         });
@@ -3603,6 +4043,7 @@ mod tests {
             usage: Some(fx_llm::Usage {
                 input_tokens: 2,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         });
@@ -3632,6 +4073,7 @@ mod tests {
             Some(fx_llm::Usage {
                 input_tokens: 5,
                 output_tokens: 5,
+                ..Default::default()
             })
         );
         assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
@@ -3752,6 +4194,8 @@ mod tests {
             fx_llm::ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -3801,6 +4245,8 @@ mod tests {
             fx_llm::ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -3861,11 +4307,18 @@ mod tests {
         }
 
         seed_headless_router_active_model(&mut router, &config);
+        let runtime_info = test_runtime_info();
+        let mut loop_engine = test_engine();
+        loop_engine.set_runtime_info(Arc::clone(&runtime_info));
+        let execution_root = Arc::new(fx_kernel::ExecutionRoot::new(configured_working_dir(
+            &config,
+        )));
         HeadlessAppDeps {
-            loop_engine: test_engine(),
+            loop_engine,
             router: shared_router(router),
-            runtime_info: test_runtime_info(),
+            runtime_info,
             config,
+            execution_root,
             memory: None,
             embedding_index_persistence: None,
             system_prompt_path: None,
@@ -3882,6 +4335,9 @@ mod tests {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             #[cfg(feature = "http")]
             experiment_registry: None,
         }
@@ -3990,6 +4446,38 @@ mod tests {
 
         assert!(rendered.contains("dynamic-model"));
         assert!(!rendered.contains("static-model (api_key)"));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn dynamic_model_refresh_reapplies_configured_default_when_available() {
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(StaticModelsProvider {
+            name: "dynamic-models",
+            models: vec!["fallback-model"],
+            dynamic_models: Some(vec![
+                "fallback-model".to_string(),
+                "z-ai/glm-5.1".to_string(),
+            ]),
+        }));
+        let mut config = FawxConfig::default();
+        config.model.default_model = Some("z-ai/glm-5.1".to_string());
+        let mut app = HeadlessApp::new(headless_deps(router, config)).expect("test app");
+
+        assert_eq!(app.active_model, "fallback-model");
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("fallback-model")
+        );
+
+        let models = app.available_models_dynamic().await;
+
+        assert!(models.iter().any(|model| model.model_id == "z-ai/glm-5.1"));
+        assert_eq!(app.active_model, "z-ai/glm-5.1");
+        assert_eq!(
+            router_active_model(&app.router).as_deref(),
+            Some("z-ai/glm-5.1")
+        );
     }
 
     #[test]
@@ -4127,6 +4615,8 @@ mod tests {
                 fx_llm::ProviderCapabilities {
                     supports_temperature: false,
                     requires_streaming: false,
+                    prompt_cache: Default::default(),
+                    prompt_cache_affinity: Default::default(),
                 }
             }
         }
@@ -4152,13 +4642,13 @@ mod tests {
             router: shared_router(router),
             runtime_info: test_runtime_info(),
             config,
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "claude-opus-4-6".to_string(),
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
-            max_history: 20,
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: Some(manager),
@@ -4176,6 +4666,9 @@ mod tests {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             bus_receiver: None,
         };
 
@@ -4185,7 +4678,8 @@ mod tests {
         )
         .expect("write updated config");
 
-        let response = app.reload_config().expect("reload config");
+        let response =
+            crate::commands::slash::CommandHost::reload_config(&mut app).expect("reload config");
 
         assert_eq!(app.active_model, "gpt-5.4");
         assert_eq!(router_active_model(&app.router).as_deref(), Some("gpt-5.4"));
@@ -4289,6 +4783,8 @@ mod tests {
                 fx_llm::ProviderCapabilities {
                     supports_temperature: false,
                     requires_streaming: false,
+                    prompt_cache: Default::default(),
+                    prompt_cache_affinity: Default::default(),
                 }
             }
         }
@@ -4332,6 +4828,9 @@ mod tests {
                 model_id: "gpt-4o".to_string(),
                 provider_name: "openai".to_string(),
                 auth_method: "oauth".to_string(),
+                display_name: None,
+                recommended: true,
+                thinking_levels: vec!["off".to_string()],
             }],
             vec![
                 StoredAuthProviderEntry {
@@ -4360,6 +4859,9 @@ mod tests {
                 model_id: "gpt-4o-mini".to_string(),
                 provider_name: "github".to_string(),
                 auth_method: "api_key".to_string(),
+                display_name: None,
+                recommended: true,
+                thinking_levels: vec!["off".to_string()],
             }],
             vec![StoredAuthProviderEntry {
                 provider: "github".to_string(),
@@ -4486,6 +4988,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_steering_does_not_bypass_headless_slash_commands() {
+        let mut app = test_app();
+
+        let (result, _updated_history) = app
+            .process_message_with_context_and_steering(
+                "/status",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &InputSource::Http,
+                None,
+                Some("keep it terse".to_string()),
+            )
+            .await
+            .expect("process status command with steering");
+
+        assert_eq!(result.iterations, 0);
+        assert!(result.response.contains("Fawx Status"));
+    }
+
+    #[tokio::test]
     async fn process_input_with_commands_returns_client_only_message_for_quit() {
         let mut app = test_app();
 
@@ -4526,13 +5049,13 @@ mod tests {
     #[tokio::test]
     async fn loop_and_debug_commands_work_in_headless_mode() {
         let mut app = test_app();
-        app.last_signals.push(Signal {
-            step: fx_core::signals::LoopStep::Act,
-            kind: fx_core::signals::SignalKind::Friction,
-            message: "tool timed out".to_string(),
-            metadata: serde_json::Value::Null,
-            timestamp_ms: 42,
-        });
+        app.last_signals.push(Signal::new(
+            fx_core::signals::LoopStep::Act,
+            fx_core::signals::SignalKind::Friction,
+            "tool timed out",
+            serde_json::Value::Null,
+            42,
+        ));
 
         let loop_status = process_input_with_commands(&mut app, "/loop", None)
             .await
@@ -4542,7 +5065,11 @@ mod tests {
         let debug = process_input_with_commands(&mut app, "/debug", None)
             .await
             .expect("process debug command");
-        assert_eq!(debug.response, "[Act/Friction] tool timed out (42)");
+        assert_eq!(
+            debug.response,
+            fx_kernel::signals::SignalCollector::from_signals(app.last_signals.clone())
+                .debug_dump()
+        );
     }
 
     #[tokio::test]
@@ -4681,13 +5208,13 @@ mod tests {
             router: test_router(),
             runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
-            max_history: 20,
             custom_system_prompt: None,
             canary_monitor: None,
             config_manager: None,
@@ -4705,6 +5232,9 @@ mod tests {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             bus_receiver: None,
         };
 
@@ -4730,13 +5260,13 @@ mod tests {
             router: test_router(),
             runtime_info: test_runtime_info(),
             config: FawxConfig::default(),
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             _subagent_manager: new_disabled_subagent_manager(),
             active_model: "mock-model".to_string(),
             conversation_history: Vec::new(),
             last_signals: Vec::new(),
-            max_history: 20,
             custom_system_prompt: None,
             canary_monitor: Some(
                 CanaryMonitor::new(
@@ -4763,6 +5293,9 @@ mod tests {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             bus_receiver: None,
         };
 
@@ -4785,6 +5318,7 @@ mod tests {
             tokens_used: fx_kernel::act::TokenUsage {
                 input_tokens: 3,
                 output_tokens: 2,
+                ..Default::default()
             },
             signals: Vec::new(),
         };
@@ -4892,6 +5426,20 @@ mod tests {
     }
 
     #[test]
+    fn extract_response_from_incomplete_without_content_is_empty() {
+        let result = LoopResult::Incomplete {
+            partial_response: None,
+            reason: "iteration limit reached before a usable final response was produced"
+                .to_string(),
+            iterations: 3,
+            signals: Vec::new(),
+        };
+
+        assert_eq!(extract_response_text(&result), "");
+        assert_eq!(extract_result_kind(&result), ResultKind::Empty);
+    }
+
+    #[test]
     fn extract_response_from_user_stopped_preserves_partial_response() {
         let result = LoopResult::UserStopped {
             partial_response: Some("partial".to_string()),
@@ -4977,7 +5525,7 @@ mod tests {
     #[test]
     fn conversation_history_trimmed() {
         let mut app = test_app();
-        app.max_history = 4;
+        app.config.general.max_history = 4;
         for i in 0..10 {
             app.record_turn(&format!("q{i}"), &format!("a{i}"));
         }

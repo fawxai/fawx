@@ -57,6 +57,7 @@ impl ScopedToolExecutor {
                 call.name,
                 self.allowed_order.join(", ")
             ),
+            failure_class: None,
         }
     }
 }
@@ -222,6 +223,7 @@ mod tests {
                     tool_name: call.name.clone(),
                     success: true,
                     output: format!("executed {}", call.name),
+                    failure_class: None,
                 })
                 .collect())
         }

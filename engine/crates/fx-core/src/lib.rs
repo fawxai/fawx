@@ -12,6 +12,7 @@
 //!   enabling the same agent code to work with real Android devices.
 
 pub mod channel;
+pub mod command_text;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -23,6 +24,7 @@ pub mod path;
 pub mod runtime_info;
 pub mod self_modify;
 pub mod signals;
+pub mod tool_routing;
 pub mod types;
 
 pub use config::Config;

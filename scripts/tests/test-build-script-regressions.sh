@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/scripts/build.sh"
+BUILD_DMG_SCRIPT="$ROOT_DIR/scripts/build-dmg.sh"
+BUILD_MACOS_APP_SCRIPT="$ROOT_DIR/scripts/build-macos-app.sh"
 SKILLS_BUILD_SCRIPT="$ROOT_DIR/skills/build.sh"
 LIB_SCRIPT="$ROOT_DIR/scripts/lib.sh"
 SKILL_WASM_TARGET="wasm32-wasip1"
@@ -15,7 +17,7 @@ fail() {
 require_contains() {
   local file="$1"
   local expected="$2"
-  grep -Fq "$expected" "$file" || fail "$file missing: $expected"
+  grep -Fq -- "$expected" "$file" || fail "$file missing: $expected"
 }
 
 make_fake_command() {
@@ -68,6 +70,7 @@ CARGO_LOG="$TMP_DIR/cargo.log"
 REAL_AWK="$(command -v awk)"
 REAL_BASH="$(command -v bash)"
 REAL_CAT="$(command -v cat)"
+REAL_CHMOD="$(command -v chmod)"
 REAL_CP="$(command -v cp)"
 REAL_DATE="$(command -v date)"
 REAL_DIRNAME="$(command -v dirname)"
@@ -78,10 +81,20 @@ mkdir -p "$FAKE_BIN" "$FAKE_HOME/.cargo/bin"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 require_contains "$BUILD_SCRIPT" 'source "$SCRIPT_DIR/lib.sh"'
+require_contains "$BUILD_SCRIPT" '[[ -f "$fawx_binary" ]]'
+require_contains "$BUILD_SCRIPT" '[[ -f "$ripcord_binary" ]]'
 require_contains "$BUILD_SCRIPT" 'local skills_args=(${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"})'
 require_contains "$BUILD_SCRIPT" './build.sh ${skills_args[@]+"${skills_args[@]}"}'
 require_contains "$BUILD_SCRIPT" 'clippy ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"} -- -D warnings'
 require_contains "$BUILD_SCRIPT" 'test ${WORKSPACE_CHECK_ARGS[@]+"${WORKSPACE_CHECK_ARGS[@]}"}'
+require_contains "$BUILD_DMG_SCRIPT" '--app-only'
+require_contains "$BUILD_DMG_SCRIPT" 'APP_ONLY=false'
+require_contains "$BUILD_DMG_SCRIPT" 'RIPCORD_BINARY="fawx-ripcord"'
+require_contains "$BUILD_DMG_SCRIPT" 'cargo build $CARGO_FLAGS -p fx-cli -p fawx-ripcord'
+require_contains "$BUILD_DMG_SCRIPT" 'cp "$REPO_ROOT/target/$CARGO_PROFILE/$RIPCORD_BINARY" "$macos_dir/$RIPCORD_BINARY"'
+require_contains "$BUILD_DMG_SCRIPT" 'if $APP_ONLY; then'
+require_contains "$BUILD_DMG_SCRIPT" 'App bundle: $app_bundle'
+require_contains "$BUILD_MACOS_APP_SCRIPT" 'exec "$SCRIPT_DIR/build-dmg.sh" --app-only "$@"'
 require_contains "$SKILLS_BUILD_SCRIPT" 'source "$SCRIPT_DIR/../scripts/lib.sh"'
 require_contains "$SKILLS_BUILD_SCRIPT" "\"\$CARGO_BIN\" build --target $SKILL_WASM_TARGET -j \"\$CARGO_BUILD_JOBS_VALUE\" \${CARGO_ARGS[@]+\"\${CARGO_ARGS[@]}\"}"
 require_contains "$LIB_SCRIPT" 'detect_cpu_count()'
@@ -92,6 +105,7 @@ make_fake_command "$FAKE_BIN/dirname" 'exec "'"$REAL_DIRNAME"'" "$@"'
 make_fake_command "$FAKE_BIN/date" 'exec "'"$REAL_DATE"'" "$@"'
 make_fake_command "$FAKE_BIN/awk" 'exec "'"$REAL_AWK"'" "$@"'
 make_fake_command "$FAKE_BIN/cat" 'exec "'"$REAL_CAT"'" "$@"'
+make_fake_command "$FAKE_BIN/chmod" 'exec "'"$REAL_CHMOD"'" "$@"'
 make_fake_command "$FAKE_BIN/grep" 'exec "'"$REAL_GREP"'" "$@"'
 make_fake_command "$FAKE_BIN/mkdir" 'exec "'"$REAL_MKDIR"'" "$@"'
 make_fake_command "$FAKE_BIN/cp" 'exec "'"$REAL_CP"'" "$@"'
@@ -116,6 +130,33 @@ for arg in "$@"; do
   fi
 done
 
+if [[ "$PWD" == "'"$ROOT_DIR"'" ]]; then
+  target_dir="$PWD/target/$profile"
+  mkdir -p "$target_dir"
+  for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" != "-p" ]]; then
+      continue
+    fi
+    next_index=$((i + 1))
+    package="${!next_index:-}"
+    case "$package" in
+      fx-cli)
+        printf "fake binary\n" >"$target_dir/fawx"
+        chmod +x "$target_dir/fawx"
+        ;;
+      fawx-ripcord)
+        printf "fake binary\n" >"$target_dir/fawx-ripcord"
+        chmod +x "$target_dir/fawx-ripcord"
+        ;;
+      fawx-tui)
+        printf "fake binary\n" >"$target_dir/fawx-tui"
+        chmod +x "$target_dir/fawx-tui"
+        ;;
+    esac
+  done
+  exit 0
+fi
+
 crate="${PWD##*/}"
 crate="${crate//-/_}"
 target_dir="$PWD/target/'"$SKILL_WASM_TARGET"'/$profile"
@@ -137,8 +178,10 @@ exit 0
 
 SKILLS_OUTPUT="$TMP_DIR/skills.out"
 SKILLS_INSTALL_OUTPUT="$TMP_DIR/skills-install.out"
+ENGINE_OUTPUT="$TMP_DIR/engine.out"
 
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --check >/dev/null
+PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --engine >"$ENGINE_OUTPUT"
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$SKILLS_BUILD_SCRIPT" --help >/dev/null
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --skills >"$SKILLS_OUTPUT"
 PATH="$FAKE_BIN" HOME="$FAKE_HOME" /bin/bash "$BUILD_SCRIPT" --skills --install >"$SKILLS_INSTALL_OUTPUT"
@@ -149,6 +192,8 @@ assert_logged_invocation "$CARGO_LOG" 'arg=test'
 assert_logged_invocation "$CARGO_LOG" 'arg=--workspace'
 assert_logged_invocation "$CARGO_LOG" 'arg=--exclude'
 assert_logged_invocation "$CARGO_LOG" 'arg=llama-cpp-sys'
+assert_logged_invocation "$CARGO_LOG" 'arg=fawx-ripcord'
+require_contains "$ENGINE_OUTPUT" '✓ fawx-ripcord built'
 require_contains "$SKILLS_OUTPUT" '✓ 8 skills built'
 require_contains "$SKILLS_INSTALL_OUTPUT" 'Installed to ~/.fawx/skills/'
 

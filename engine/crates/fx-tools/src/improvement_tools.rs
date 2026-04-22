@@ -499,6 +499,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                ..Default::default()
             }
         }
     }
@@ -561,7 +563,7 @@ mod tests {
         provider: MockProvider,
     ) -> (ImprovementToolsState, std::path::PathBuf) {
         let data_dir = tmp.path().join("data");
-        let store = SignalStore::new(&data_dir, "test-session").expect("signal store");
+        let store = SignalStore::open(&data_dir, "test-session").expect("signal store");
         let config = ImprovementToolsConfig {
             enabled: true,
             ..ImprovementToolsConfig::default()
@@ -575,15 +577,15 @@ mod tests {
         provider: MockProvider,
     ) -> (ImprovementToolsState, std::path::PathBuf) {
         let data_dir = tmp.path().join("data");
-        let store = SignalStore::new(&data_dir, "test-session").expect("signal store");
+        let store = SignalStore::open(&data_dir, "test-session").expect("signal store");
         store
-            .persist(&[Signal {
-                step: LoopStep::Act,
-                kind: SignalKind::Friction,
-                message: "test friction".to_string(),
-                metadata: serde_json::json!({}),
-                timestamp_ms: 1000,
-            }])
+            .persist(&[Signal::new(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "test friction",
+                serde_json::json!({}),
+                1000,
+            )])
             .expect("persist signal");
 
         let config = ImprovementToolsConfig {

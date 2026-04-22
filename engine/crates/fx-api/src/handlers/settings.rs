@@ -7,10 +7,25 @@ use axum::Json;
 use serde_json::{json, Value};
 
 pub async fn handle_list_models(State(state): State<HttpState>) -> Json<Value> {
-    let snap = state.shared.read().await;
+    // Lock order is intentionally app -> shared. Dynamic catalog refresh can
+    // reconcile a boot-time fallback, so publish the post-refresh active model.
+    let (active_model, thinking, models, max_history) = {
+        let mut app = state.app.lock().await;
+        let models = app.available_models_dynamic().await;
+        (
+            app.active_model().to_string(),
+            app.thinking_level(),
+            models,
+            app.max_history(),
+        )
+    };
+    state
+        .shared
+        .update_model(&active_model, &thinking, models.clone(), max_history)
+        .await;
     Json(json!({
-        "active_model": snap.active_model,
-        "models": snap.available_models,
+        "active_model": active_model,
+        "models": models,
     }))
 }
 
@@ -18,17 +33,18 @@ pub async fn handle_set_model(
     State(state): State<HttpState>,
     Json(request): Json<SetModelRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorBody>)> {
-    let (switched, active_model, thinking, models) = {
+    let (switched, active_model, thinking, models, max_history) = {
         let mut app = state.app.lock().await;
         let switched = app.set_active_model(&request.model).map_err(bad_request)?;
         let active_model = app.active_model().to_owned();
         let thinking = app.thinking_level();
         let models = app.available_models();
-        (switched, active_model, thinking, models)
+        let max_history = app.max_history();
+        (switched, active_model, thinking, models, max_history)
     };
     state
         .shared
-        .update_model(&active_model, &thinking, models)
+        .update_model(&active_model, &thinking, models, max_history)
         .await;
     Ok(Json(json!(switched)))
 }

@@ -72,6 +72,36 @@ impl HeadlessApp {
         result.map(|cycle| (cycle, updated_history))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_message_with_context_and_steering(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        documents: Vec<DocumentAttachment>,
+        context: Vec<Message>,
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+        steering: Option<String>,
+    ) -> Result<(CycleResult, Vec<Message>), anyhow::Error> {
+        if steering.is_none()
+            || (images.is_empty() && documents.is_empty() && is_command_input(input))
+        {
+            return self
+                .process_message_with_context(input, images, documents, context, source, callback)
+                .await;
+        }
+
+        let original_history = std::mem::replace(&mut self.conversation_history, context);
+        let result = self
+            .run_cycle_result_with_attachments_and_steering(
+                input, &images, &documents, source, callback, steering,
+            )
+            .await;
+        let updated_history = self.conversation_history.clone();
+        self.conversation_history = original_history;
+        result.map(|cycle| (cycle, updated_history))
+    }
+
     pub async fn process_message_for_source_streaming(
         &mut self,
         input: &str,
@@ -117,8 +147,6 @@ impl HeadlessApp {
             .output_tokens
             .saturating_add(tokens_used.output_tokens);
         self.last_signals = result.signals().to_vec();
-        let signals = self.last_signals.clone();
-        persist_headless_signals(self, &signals);
         let session_messages = build_turn_messages(input, context, &response);
         self.record_session_turn_messages(session_messages);
         CycleResult {
@@ -157,11 +185,26 @@ impl HeadlessApp {
         source: &InputSource,
         callback: Option<StreamCallback>,
     ) -> Result<CycleResult, anyhow::Error> {
+        self.run_cycle_result_with_attachments_and_steering(
+            input, images, documents, source, callback, None,
+        )
+        .await
+    }
+
+    async fn run_cycle_result_with_attachments_and_steering(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
+        source: &InputSource,
+        callback: Option<StreamCallback>,
+        steering: Option<String>,
+    ) -> Result<CycleResult, anyhow::Error> {
         self.last_session_messages.clear();
         let user_timestamp = current_epoch_secs();
         let execution = self.prepare_cycle_execution(input, callback);
         let result = self
-            .execute_cycle(input, images, documents, source, &execution)
+            .execute_cycle(input, images, documents, source, steering, &execution)
             .await?;
         let assistant_timestamp = current_epoch_secs();
         self.set_stream_callback(None);
@@ -221,7 +264,10 @@ impl HeadlessApp {
         self.last_session_messages = session_messages.clone();
         self.conversation_history
             .extend(session_messages.iter().map(SessionMessage::to_llm_message));
-        trim_history(&mut self.conversation_history, self.max_history);
+        trim_history(
+            &mut self.conversation_history,
+            self.config.general.max_history,
+        );
     }
 
     fn set_stream_callback(&self, callback: Option<fx_kernel::streaming::StreamCallback>) {
@@ -258,12 +304,26 @@ impl HeadlessApp {
         }
     }
 
+    #[cfg(test)]
     fn build_perception_snapshot_with_attachments(
         &self,
         input: &str,
         source: &InputSource,
         images: &[ImageAttachment],
         documents: &[DocumentAttachment],
+    ) -> PerceptionSnapshot {
+        self.build_perception_snapshot_with_attachments_and_steering(
+            input, source, images, documents, None,
+        )
+    }
+
+    fn build_perception_snapshot_with_attachments_and_steering(
+        &self,
+        input: &str,
+        source: &InputSource,
+        images: &[ImageAttachment],
+        documents: &[DocumentAttachment],
+        steering: Option<String>,
     ) -> PerceptionSnapshot {
         let timestamp_ms = current_time_ms();
         let image_pairs = images.to_vec();
@@ -287,7 +347,7 @@ impl HeadlessApp {
                 documents: document_pairs,
             }),
             conversation_history: self.conversation_history.clone(),
-            steer_context: None,
+            steer_context: steering,
         }
     }
 
@@ -301,11 +361,17 @@ impl HeadlessApp {
         let combined_callback = collector.callback(callback.clone());
         self.set_stream_callback(Some(Arc::clone(&combined_callback)));
         self.emit_cycle_startup_warnings(callback.is_some(), &combined_callback);
+        self.sync_execution_context();
         self.update_memory_context(input);
         CycleExecutionContext {
             collector,
             callback: combined_callback,
         }
+    }
+
+    pub(super) fn sync_execution_context(&mut self) {
+        let working_dir = self.execution_root.current().to_string_lossy().into_owned();
+        self.loop_engine.set_execution_context(working_dir);
     }
 
     fn emit_cycle_startup_warnings(&mut self, streaming: bool, combined_callback: &StreamCallback) {
@@ -322,10 +388,12 @@ impl HeadlessApp {
         images: &[ImageAttachment],
         documents: &[DocumentAttachment],
         source: &InputSource,
+        steering: Option<String>,
         execution: &CycleExecutionContext,
     ) -> Result<LoopResult, anyhow::Error> {
-        let snapshot =
-            self.build_perception_snapshot_with_attachments(input, source, images, documents);
+        let snapshot = self.build_perception_snapshot_with_attachments_and_steering(
+            input, source, images, documents, steering,
+        );
         let llm = RecordingLoopLlmProvider::new(
             RouterLoopLlmProvider::new(Arc::clone(&self.router), self.active_model.clone()),
             execution.collector.clone(),

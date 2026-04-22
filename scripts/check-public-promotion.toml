@@ -2,10 +2,22 @@ base_ref = "public/main"
 review_warning_file_count = 40
 review_warning_area_count = 4
 
+# Fail closed: any path matching neither list is rejected as an allowlist miss.
+# Reviewed app globs are intentional; new files in those audited slices still go
+# through private-marker scanning and normal promotion review.
 allowlist = [
   ".cargo/**",
   ".github/workflows/ci.yml",
   "assets/**",
+  # Reviewed Swift app surface that passed the PR 2 sanitization gate.
+  "app/Fawx/Models/*.swift",
+  "app/Fawx/Networking/*.swift",
+  "app/Fawx/Utilities/*.swift",
+  "app/Fawx/ViewModels/*.swift",
+  "app/Fawx/Views/Shared/PairingSettingsPanel.swift",
+  "app/Fawx/Views/Shared/SetupWizard/*.swift",
+  "app/FawxTests/Utilities/*.swift",
+  "app/FawxTests/ViewModels/*.swift",
   "bindings/**",
   "engine/**",
   "tui/**",
@@ -30,7 +42,31 @@ allowlist = [
 ]
 
 blocklist = [
-  "app/**",
+  # Still-private or not-yet-reviewed app surface.
+  "app/Fawx.xcodeproj/**",
+  "app/Fawx/Fawx-macOS.entitlements",
+  "app/Fawx/FawxApp.swift",
+  "app/Fawx/Info-iOS.plist",
+  "app/Fawx/Info.plist",
+  "app/Fawx/LaunchScreen.storyboard",
+  "app/Fawx/Assets.xcassets/**",
+  "app/Fawx/Resources/**",
+  "app/Fawx/Services/**",
+  "app/Fawx/Theme/**",
+  "app/Fawx/Views/Ripcord/**",
+  "app/Fawx/Views/Shared/*.swift",
+  "app/Fawx/Views/iOS/**",
+  "app/Fawx/Views/macOS/**",
+  "app/FawxTests/Models/**",
+  "app/FawxTests/Networking/**",
+  "app/FawxTests/README.md",
+  "app/FawxTests/Services/**",
+  "app/FawxTests/Views/**",
+  "app/FawxUITests/**",
+  "app/Package.resolved",
+  "app/Package.swift",
+  "app/README.md",
+  "app/project.yml",
   "docs/strategy/**",
   "memory/**",
   "AGENTS.md",
@@ -73,13 +109,19 @@ pattern = "\\babbudjoe/fawx\\b"
 name = "internal assistant name"
 pattern = "\\bclawdio\\b"
 
+# Marker ordering matters because the guard reports the first named match.
+# Keep more-specific patterns above broader ones when multiple markers could overlap.
 [[markers]]
 name = "Tailscale hostname"
 pattern = "\\b[a-z0-9-]+(?:\\.[a-z0-9-]+)+\\.ts\\.net\\b"
 
 [[markers]]
 name = "Tailscale IPv4"
-pattern = "\\b100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(?:\\.\\d{1,3}){2}\\b"
+pattern = "\\b100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\b"
+
+[[markers]]
+name = "RFC1918 private IPv4"
+pattern = "\\b(?:10\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)|192\\.168\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)|172\\.(?:1[6-9]|2[0-9]|3[01])\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d))\\b"
 
 [[markers]]
 name = "suspicious credential token"
@@ -95,4 +137,4 @@ pattern = "(?:\\.ts\\.net\\b|tailscale_https|wss://[^\\s\"']*\\.ts\\.net\\b)"
 
 [[workflow_private_markers]]
 name = "internal IP address"
-pattern = "\\b(?:10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2[0-9]|3[01])(?:\\.\\d{1,3}){2}|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(?:\\.\\d{1,3}){2})\\b"
+pattern = "\\b(?:10\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)|192\\.168\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)|172\\.(?:1[6-9]|2[0-9]|3[01])\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d))\\b"

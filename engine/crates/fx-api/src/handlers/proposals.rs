@@ -160,7 +160,7 @@ pub async fn handle_history(State(state): State<HttpState>) -> Json<ProposalHist
             });
         }
     }
-    entries.sort_by(|a, b| b.decided_at.cmp(&a.decided_at));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.decided_at));
     let total = entries.len();
     Json(ProposalHistoryResponse { entries, total })
 }

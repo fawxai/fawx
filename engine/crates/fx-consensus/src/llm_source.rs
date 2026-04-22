@@ -42,6 +42,8 @@ impl PatchSource for LlmPatchSource {
             temperature: None,
             max_tokens: None,
             system_prompt: Some(system_prompt.to_owned()),
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
         let response = self.router.complete(request).await.map_err(|error| {
@@ -342,6 +344,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                ..Default::default()
             }
         }
     }

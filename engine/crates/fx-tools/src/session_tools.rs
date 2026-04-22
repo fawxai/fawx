@@ -256,6 +256,7 @@ mod tests {
                 SessionConfig {
                     label: Some("primary".to_string()),
                     model: "gpt-4".to_string(),
+                    thinking: None,
                 },
             )
             .expect("create main");
@@ -266,6 +267,7 @@ mod tests {
                 SessionConfig {
                     label: Some("worker".to_string()),
                     model: "claude".to_string(),
+                    thinking: None,
                 },
             )
             .expect("create sub");
@@ -284,6 +286,7 @@ mod tests {
                 SessionConfig {
                     label: Some("primary".to_string()),
                     model: "gpt-4".to_string(),
+                    thinking: None,
                 },
             )
             .expect("create session");
@@ -352,9 +355,11 @@ mod tests {
             status: SessionStatus::Idle,
             label: Some("poisoned".to_string()),
             model: "gpt-4".to_string(),
+            thinking: None,
             created_at: 1,
             updated_at: 2,
             archived_at: None,
+            thread_binding: None,
             messages: vec![
                 SessionMessage::structured(
                     MessageRole::Tool,

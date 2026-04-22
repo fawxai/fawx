@@ -16,15 +16,22 @@ use crate::handlers::phase4::{
 };
 use crate::handlers::sessions::{
     handle_archive_session, handle_clear_session, handle_create_session, handle_delete_session,
-    handle_export_session, handle_get_context, handle_get_messages, handle_get_session,
-    handle_get_session_memory, handle_list_sessions, handle_send_message, handle_send_to_session,
-    handle_unarchive_session, handle_update_session_memory,
+    handle_export_session, handle_failed_turn_diagnostic, handle_get_context, handle_get_messages,
+    handle_get_session, handle_get_session_memory, handle_list_sessions, handle_send_message,
+    handle_send_to_session, handle_steer_session, handle_stop_session, handle_unarchive_session,
+    handle_update_session_memory, handle_update_session_model, handle_update_session_thinking,
 };
 use crate::handlers::settings::{
     handle_get_thinking, handle_list_auth, handle_list_models, handle_list_skills,
     handle_set_model, handle_set_thinking,
 };
+use crate::handlers::threads::{handle_create_thread, handle_list_workspace_threads};
 use crate::handlers::webhook::handle_webhook;
+use crate::handlers::workspaces::{handle_list_workspaces, handle_open_workspace};
+use crate::handlers::worktrees::{
+    handle_archive_worktree, handle_attach_worktree_thread, handle_create_worktree,
+    handle_delete_worktree, handle_list_workspace_worktrees,
+};
 use crate::middleware::auth_middleware;
 use crate::state::HttpState;
 use crate::telegram::webhook::handle_telegram_webhook;
@@ -40,6 +47,25 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManager>>>) -> Router {
     let v1_router = Router::new()
+        // Workspace read model
+        .route("/workspaces", get(handle_list_workspaces))
+        .route("/workspaces/open", post(handle_open_workspace))
+        .route(
+            "/workspaces/{id}/threads",
+            get(handle_list_workspace_threads),
+        )
+        .route(
+            "/workspaces/{id}/worktrees",
+            get(handle_list_workspace_worktrees),
+        )
+        .route("/threads", post(handle_create_thread))
+        .route("/worktrees", post(handle_create_worktree))
+        .route(
+            "/worktrees/{id}/attach-thread",
+            post(handle_attach_worktree_thread),
+        )
+        .route("/worktrees/{id}/archive", post(handle_archive_worktree))
+        .route("/worktrees/{id}", delete(handle_delete_worktree))
         .route(
             "/sessions",
             post(handle_create_session).get(handle_list_sessions),
@@ -53,16 +79,27 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             post(handle_archive_session).delete(handle_unarchive_session),
         )
         .route("/sessions/{id}/export", get(handle_export_session))
+        .route(
+            "/sessions/{id}/failed-turn",
+            get(handle_failed_turn_diagnostic),
+        )
         .route("/sessions/{id}/clear", post(handle_clear_session))
         .route(
             "/sessions/{id}/messages",
             get(handle_get_messages).post(handle_send_message),
         )
+        .route("/sessions/{id}/stop", post(handle_stop_session))
+        .route("/sessions/{id}/steer", post(handle_steer_session))
         .route("/sessions/{id}/send", post(handle_send_to_session))
         .route("/sessions/{id}/context", get(handle_get_context))
         .route(
             "/sessions/{id}/memory",
             get(handle_get_session_memory).put(handle_update_session_memory),
+        )
+        .route("/sessions/{id}/model", put(handle_update_session_model))
+        .route(
+            "/sessions/{id}/thinking",
+            put(handle_update_session_thinking),
         )
         .route(
             "/proposals/pending",
@@ -99,6 +136,11 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
             "/skills/{name}",
             delete(handlers::marketplace::handle_remove_skill)
                 .patch(handlers::marketplace::handle_update_skill_permissions),
+        )
+        .route(
+            "/skills/{name}/settings",
+            get(handlers::marketplace::handle_get_skill_settings)
+                .put(handlers::marketplace::handle_update_skill_settings),
         )
         .route("/usage", get(handlers::usage::handle_usage))
         .route(

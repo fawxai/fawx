@@ -13,15 +13,21 @@ use crate::middleware::verify_token;
 use crate::pairing::PairingState;
 use crate::router::build_router;
 use crate::server_runtime::ServerRuntime;
-use crate::sse::{send_sse_frame, serialize_stream_event};
-use crate::state::{
-    build_channel_runtime, in_memory_telemetry, ChannelRuntime, HttpState, SharedReadState,
+use crate::sse::{
+    send_sse_frame, serialize_stream_event, SseEventKind, SseFrame, SseStreamContext,
+    SseStreamState,
 };
+use crate::state::{
+    build_channel_runtime, in_memory_telemetry, ChannelRuntime, HttpState, SessionRunCancelReason,
+    SessionRunRegistry, SharedReadState, StopSessionRunOutcome,
+};
+use crate::test_support::StubAppEngine;
 use crate::token::{validate_bearer_token, BearerTokenStore};
 use crate::types::{
-    ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, DocumentPayload,
-    ErrorBody, ErrorRecordDto, HealthResponse, MessageRequest, MessageResponse, ModelInfoDto,
-    ModelSwitchDto, SetupTokenRequest, SkillSummaryDto, StatusResponse, ThinkingLevelDto,
+    ApiKeyRequest, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike, CreateThreadRequest,
+    CreateWorktreeRequest, DocumentPayload, ErrorBody, ErrorRecordDto, HealthResponse,
+    MessageRequest, MessageResponse, ModelInfoDto, ModelSwitchDto, SetupTokenRequest,
+    SkillSummaryDto, StatusResponse, ThinkingLevelDto, WorkspaceScope,
 };
 use async_trait::async_trait;
 use axum::body::Body;
@@ -39,9 +45,10 @@ use fx_cli::headless::{
     process_input_with_commands, process_input_with_commands_streaming, HeadlessApp,
     HeadlessAppDeps,
 };
-use fx_config::HttpConfig;
+use fx_config::{HttpConfig, MAX_CUSTOM_INSTRUCTION_LENGTH};
 use fx_core::channel::{Channel, ResponseContext};
 use fx_core::runtime_info::{ConfigSummary, RuntimeInfo};
+use fx_core::signals::{LoopStep, Signal, SignalKind};
 use fx_core::types::InputSource;
 use fx_fleet::FleetManager;
 use fx_kernel::{
@@ -52,12 +59,12 @@ use fx_llm::{
     CompletionResponse, CompletionStream, ContentBlock, DocumentAttachment, ImageAttachment,
     Message, StreamChunk,
 };
+use fx_memory::SignalStore;
 use fx_telemetry::{SignalCategory, SignalCollector, TelemetryConsent};
 use http_body_util::BodyExt;
 use hyper::Request;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -66,103 +73,10 @@ use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-secret-token-abc123";
 
-struct PromptStateApp {
-    prompt_state: Arc<PermissionPromptState>,
-}
-
-#[async_trait]
-impl AppEngine for PromptStateApp {
-    async fn process_message(
-        &mut self,
-        _input: &str,
-        _images: Vec<ImageAttachment>,
-        _documents: Vec<DocumentAttachment>,
-        _source: InputSource,
-        _callback: Option<StreamCallback>,
-    ) -> Result<ApiCycleResult, anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    async fn process_message_with_context(
-        &mut self,
-        _input: &str,
-        _images: Vec<ImageAttachment>,
-        _documents: Vec<DocumentAttachment>,
-        _context: Vec<Message>,
-        _source: InputSource,
-        _callback: Option<StreamCallback>,
-    ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    fn active_model(&self) -> &str {
-        "mock-model"
-    }
-
-    fn available_models(&self) -> Vec<ModelInfoDto> {
-        Vec::new()
-    }
-
-    fn set_active_model(&mut self, _selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
-        unreachable!("not used in prompt state tests")
-    }
-
-    fn thinking_level(&self) -> ThinkingLevelDto {
-        ThinkingLevelDto {
-            level: "normal".to_string(),
-            budget_tokens: None,
-            available: Vec::new(),
-        }
-    }
-
-    fn context_info(&self) -> ContextInfoDto {
-        ContextInfoDto {
-            used_tokens: 0,
-            max_tokens: 4_096,
-            percentage: 0.0,
-            compaction_threshold: 0.8,
-        }
-    }
-
-    fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
-        self.context_info()
-    }
-
-    fn set_thinking_level(&mut self, _level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
-        Ok(self.thinking_level())
-    }
-
-    fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
-        Vec::new()
-    }
-
-    fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
-        Vec::new()
-    }
-
-    fn config_manager(&self) -> Option<ConfigManagerHandle> {
-        None
-    }
-
-    fn session_bus(&self) -> Option<&SessionBus> {
-        None
-    }
-
-    fn permission_prompt_state(&self) -> Option<Arc<PermissionPromptState>> {
-        Some(Arc::clone(&self.prompt_state))
-    }
-
-    fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
-        Vec::new()
-    }
-}
-
 #[test]
 fn app_permission_prompts_reuses_app_owned_prompt_state() {
     let prompt_state = Arc::new(PermissionPromptState::new());
-    let app = PromptStateApp {
-        prompt_state: Arc::clone(&prompt_state),
-    };
+    let app = StubAppEngine::default().with_permission_prompt_state(Arc::clone(&prompt_state));
 
     let resolved = crate::app_permission_prompts(&app);
 
@@ -252,6 +166,14 @@ impl AppEngine for HeadlessApp {
             .collect()
     }
 
+    async fn available_models_dynamic(&mut self) -> Vec<ModelInfoDto> {
+        HeadlessApp::available_models_dynamic(self)
+            .await
+            .into_iter()
+            .map(ModelInfoDto::from)
+            .collect()
+    }
+
     fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
         let switched = HeadlessApp::switch_active_model(self, selector)?;
         Ok(ModelSwitchDto {
@@ -265,6 +187,18 @@ impl AppEngine for HeadlessApp {
                 }
             }),
         })
+    }
+
+    fn replace_active_model(&mut self, selector: &str) -> Result<Option<String>, anyhow::Error> {
+        HeadlessApp::replace_active_model_for_turn(self, selector).map(Some)
+    }
+
+    fn apply_turn_thinking_level(&mut self, level: Option<&str>) -> Result<(), anyhow::Error> {
+        HeadlessApp::apply_turn_thinking_level(self, level)
+    }
+
+    fn thinking_levels_for_model(&self, model: &str) -> Vec<String> {
+        HeadlessApp::thinking_available_levels_for_model(self, model)
     }
 
     fn thinking_level(&self) -> ThinkingLevelDto {
@@ -333,8 +267,16 @@ impl AppEngine for HeadlessApp {
         HeadlessApp::config_manager(self).cloned()
     }
 
+    fn reload_config(&mut self) -> Result<(), anyhow::Error> {
+        HeadlessApp::reload_runtime_config_from_disk(self)
+    }
+
     fn session_bus(&self) -> Option<&SessionBus> {
         HeadlessApp::session_bus(self)
+    }
+
+    fn max_history(&self) -> usize {
+        self.config().general.max_history
     }
 
     fn recent_errors(&self, limit: usize) -> Vec<ErrorRecordDto> {
@@ -752,10 +694,62 @@ fn message_request_deserializes() {
 }
 
 #[test]
+fn message_request_deserializes_turn_steering() {
+    let json = r#"{"message": "hello", "steering": "keep it terse"}"#;
+    let req: MessageRequest = serde_json::from_str(json).expect("valid json");
+    assert_eq!(req.steering.as_deref(), Some("keep it terse"));
+}
+
+#[test]
 fn message_request_rejects_missing_message() {
     let json = r#"{}"#;
     let result = serde_json::from_str::<MessageRequest>(json);
     assert!(result.is_err());
+}
+
+#[test]
+fn workspace_scope_roundtrips_as_string() {
+    let scope = WorkspaceScope::explicit("/tmp/repo");
+
+    assert_eq!(scope.requested_path(), Some("/tmp/repo"));
+    assert_eq!(
+        serde_json::to_value(&scope).expect("serialize workspace scope"),
+        serde_json::json!("/tmp/repo")
+    );
+}
+
+#[test]
+fn create_thread_request_uses_workspace_path_wire_key() {
+    let request = CreateThreadRequest {
+        workspace_id: "ws-repo".to_string(),
+        title: Some("Thread title".to_string()),
+        model: Some("gpt-5.4".to_string()),
+        thinking: Some("high".to_string()),
+        workspace_scope: WorkspaceScope::explicit("/tmp/repo"),
+        worktree_id: Some("wt-1".to_string()),
+    };
+
+    let json = serde_json::to_value(&request).expect("serialize thread request");
+
+    assert_eq!(json["workspace_id"], "ws-repo");
+    assert_eq!(json["workspace_path"], "/tmp/repo");
+    assert!(json.get("workspace_scope").is_none());
+}
+
+#[test]
+fn create_worktree_request_omits_workspace_path_when_scope_is_default() {
+    let request = CreateWorktreeRequest {
+        workspace_id: "ws-repo".to_string(),
+        branch: "feature/thread-state".to_string(),
+        workspace_scope: WorkspaceScope::default(),
+        base_ref: Some("origin/main".to_string()),
+    };
+
+    let json = serde_json::to_value(&request).expect("serialize worktree request");
+
+    assert_eq!(json["workspace_id"], "ws-repo");
+    assert_eq!(json["branch"], "feature/thread-state");
+    assert!(json.get("workspace_path").is_none());
 }
 
 #[test]
@@ -1143,6 +1137,19 @@ fn serialize_stream_event_serializes_typed_phase() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_transcript_phase_boundary() {
+    let frame = serialize_stream_event(StreamEvent::TranscriptPhaseBoundary {
+        phase: fx_kernel::TranscriptTurnPhase::Finalizing,
+    })
+    .expect("phase boundary frame");
+
+    assert_eq!(
+        frame,
+        "event: phase_boundary\ndata: {\"phase\":\"finalizing\"}\n\n"
+    );
+}
+
+#[test]
 fn serialize_stream_event_serializes_notification_payload() {
     let frame = serialize_stream_event(StreamEvent::Notification {
         title: "Fawx".to_string(),
@@ -1188,6 +1195,42 @@ fn serialize_stream_event_serializes_tool_result_payload() {
 }
 
 #[test]
+fn serialize_stream_event_serializes_tool_progress_payload() {
+    let frame = serialize_stream_event(StreamEvent::ToolProgress {
+        activity_id: Some("tool-round-call-1".to_string()),
+        id: "call-1".to_string(),
+        tool_name: "read_file".to_string(),
+        class: fx_kernel::StreamToolProgressClass::Observation,
+        target: Some("PR 1834".to_string()),
+        advances_slot: Some("evidence:required:pr:1834".to_string()),
+        outcome: fx_kernel::StreamToolProgressOutcome::Advanced,
+    })
+    .expect("tool progress frame");
+
+    assert!(frame.contains("event: tool_progress"));
+    assert!(frame.contains("\"activity_id\":\"tool-round-call-1\""));
+    assert!(frame.contains("\"id\":\"call-1\""));
+    assert!(frame.contains("\"tool_name\":\"read_file\""));
+    assert!(frame.contains("\"class\":\"observation\""));
+    assert!(frame.contains("\"target\":\"PR 1834\""));
+    assert!(frame.contains("\"advances_slot\":\"evidence:required:pr:1834\""));
+    assert!(frame.contains("\"outcome\":\"advanced\""));
+}
+
+#[test]
+fn serialize_stream_event_serializes_completed_summary_payload() {
+    let frame = serialize_stream_event(StreamEvent::CompletedSummary {
+        text: "Worked this turn: 2 searches.".to_string(),
+    })
+    .expect("completed summary frame");
+
+    assert_eq!(
+        frame,
+        "event: completed_summary\ndata: {\"text\":\"Worked this turn: 2 searches.\"}\n\n"
+    );
+}
+
+#[test]
 fn serialize_stream_event_serializes_tool_error_payload() {
     let frame = serialize_stream_event(StreamEvent::ToolError {
         tool_name: "read_file".to_string(),
@@ -1203,26 +1246,69 @@ fn serialize_stream_event_serializes_tool_error_payload() {
 #[test]
 fn send_sse_frame_stops_when_receiver_is_closed() {
     let (sender, receiver) = mpsc::channel(1);
-    let disconnected = Arc::new(AtomicBool::new(false));
+    let stream_state = SseStreamState::shared();
+    let context = SseStreamContext::new("test");
     drop(receiver);
 
-    assert!(!send_sse_frame(&sender, &disconnected, "frame".to_string()));
-    assert!(disconnected.load(Ordering::Relaxed));
+    assert!(!send_sse_frame(
+        &sender,
+        &stream_state,
+        &context,
+        SseFrame::new(SseEventKind::Done, "frame".to_string())
+    ));
+    assert!(stream_state.is_disconnected());
 }
 
 #[test]
-fn send_sse_frame_stops_when_channel_is_full() {
+fn send_sse_frame_drops_coalescible_when_channel_is_full() {
     let (sender, mut receiver) = mpsc::channel(1);
-    let disconnected = Arc::new(AtomicBool::new(false));
+    let stream_state = SseStreamState::shared();
+    let context = SseStreamContext::new("test");
 
-    assert!(send_sse_frame(&sender, &disconnected, "first".to_string()));
-    assert!(!send_sse_frame(
+    assert!(send_sse_frame(
         &sender,
-        &disconnected,
-        "second".to_string()
+        &stream_state,
+        &context,
+        SseFrame::new(SseEventKind::TextPreviewDelta, "first".to_string())
     ));
-    assert!(disconnected.load(Ordering::Relaxed));
-    assert_eq!(receiver.try_recv().expect("queued frame"), "first");
+    assert!(send_sse_frame(
+        &sender,
+        &stream_state,
+        &context,
+        SseFrame::new(SseEventKind::TextPreviewDelta, "second".to_string())
+    ));
+    assert!(!stream_state.is_disconnected());
+    assert_eq!(
+        receiver.try_recv().expect("queued frame").into_body(),
+        "first"
+    );
+    assert_eq!(stream_state.lifetime_dropped_coalescible(), 1);
+}
+
+#[test]
+fn send_sse_frame_buffers_required_frame_when_channel_is_full() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let stream_state = SseStreamState::shared();
+    let context = SseStreamContext::new("test");
+
+    assert!(send_sse_frame(
+        &sender,
+        &stream_state,
+        &context,
+        SseFrame::new(SseEventKind::TextPreviewDelta, "first".to_string())
+    ));
+    assert!(send_sse_frame(
+        &sender,
+        &stream_state,
+        &context,
+        SseFrame::new(SseEventKind::Done, "second".to_string())
+    ));
+    assert!(!stream_state.is_disconnected());
+    assert_eq!(
+        receiver.try_recv().expect("queued frame").into_body(),
+        "first"
+    );
+    assert_eq!(stream_state.lifetime_upstream_full(), 1);
 }
 
 #[test]
@@ -1338,6 +1424,7 @@ fn validate_bearer_token_store_ignores_empty() {
 
 mod routing_and_status {
     use super::*;
+    use crate::handlers::workspace_catalog::GENERAL_WORKSPACE_ID;
     use crate::server_runtime::{RestartAction, RestartController, RestartRequestor};
     use async_trait::async_trait;
     use fx_bus::{BusStore, Payload, SessionBus};
@@ -1354,12 +1441,17 @@ mod routing_and_status {
     use fx_session::{
         MessageRole as SessionMessageRole, Session, SessionConfig, SessionContentBlock,
         SessionError, SessionKey, SessionKind, SessionMemory, SessionMessage, SessionRegistry,
-        SessionStatus, SessionStore,
+        SessionStatus, SessionStore, SessionThreadBinding,
     };
     use fx_subagent::{
         test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager, SubagentManagerDeps,
     };
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
+    };
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -1417,6 +1509,8 @@ mod routing_and_status {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -1430,6 +1524,9 @@ mod routing_and_status {
         match (name, model) {
             ("anthropic", "claude-opus-4-6") => {
                 &["off", "adaptive", "low", "medium", "high", "max"]
+            }
+            ("anthropic", "claude-sonnet-4-20250514") => {
+                &["off", "adaptive", "low", "medium", "high"]
             }
             ("anthropic", "claude-sonnet-4-6") => &["off", "adaptive", "low", "medium", "high"],
             ("openai", "gpt-5.4") => &["none", "low", "medium", "high", "xhigh"],
@@ -1465,6 +1562,8 @@ mod routing_and_status {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
 
@@ -1579,6 +1678,7 @@ mod routing_and_status {
             router: Arc::new(std::sync::RwLock::new(router)),
             runtime_info,
             config,
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             system_prompt_path: None,
@@ -1595,6 +1695,9 @@ mod routing_and_status {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             experiment_registry: None,
         })
         .expect("test app")
@@ -1602,8 +1705,12 @@ mod routing_and_status {
 
     #[derive(Debug, Default)]
     struct SessionMemoryPersistingState {
+        current_model: String,
+        processed_models: Vec<String>,
         current_memory: SessionMemory,
+        current_execution_root: Option<PathBuf>,
         loaded_memories: Vec<SessionMemory>,
+        loaded_execution_roots: Vec<PathBuf>,
         last_session_messages: Vec<SessionMessage>,
         loaded_session_key: Option<SessionKey>,
     }
@@ -1617,8 +1724,12 @@ mod routing_and_status {
         fn new(initial_memory: SessionMemory, loaded_session_key: Option<SessionKey>) -> Self {
             Self {
                 state: Arc::new(StdMutex::new(SessionMemoryPersistingState {
+                    current_model: "mock-model".to_string(),
+                    processed_models: Vec::new(),
                     current_memory: initial_memory,
+                    current_execution_root: None,
                     loaded_memories: Vec::new(),
+                    loaded_execution_roots: Vec::new(),
                     last_session_messages: Vec::new(),
                     loaded_session_key,
                 })),
@@ -1659,10 +1770,16 @@ mod routing_and_status {
             callback: Option<StreamCallback>,
         ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
             let response = "Stored memory response".to_string();
+            let model;
             {
                 let mut state = self.state.lock().expect("state lock");
+                model = state.current_model.clone();
+                state.processed_models.push(model.clone());
                 let loaded_memory = state.current_memory.clone();
                 state.loaded_memories.push(loaded_memory);
+                if let Some(root) = state.current_execution_root.clone() {
+                    state.loaded_execution_roots.push(root);
+                }
                 state.current_memory.current_state = Some("updated during turn".to_string());
                 state.last_session_messages = vec![
                     SessionMessage::text(SessionMessageRole::User, input, 2),
@@ -1673,7 +1790,7 @@ mod routing_and_status {
                 callback(StreamEvent::PhaseChange {
                     phase: fx_kernel::Phase::Synthesize,
                 });
-                callback(StreamEvent::TextDelta {
+                callback(StreamEvent::FinalAnswerDelta {
                     text: response.clone(),
                 });
                 callback(StreamEvent::Done {
@@ -1683,7 +1800,7 @@ mod routing_and_status {
             Ok((
                 ApiCycleResult {
                     response,
-                    model: "mock-model".to_string(),
+                    model,
                     iterations: 1,
                     result_kind: ResultKind::Complete,
                 },
@@ -1700,6 +1817,9 @@ mod routing_and_status {
                 model_id: "mock-model".to_string(),
                 provider: "test".to_string(),
                 auth_method: "none".to_string(),
+                display_name: None,
+                recommended: true,
+                thinking_levels: vec!["off".to_string()],
             }]
         }
 
@@ -1709,6 +1829,15 @@ mod routing_and_status {
                 active_model: selector.to_string(),
                 thinking_adjusted: None,
             })
+        }
+
+        fn replace_active_model(
+            &mut self,
+            selector: &str,
+        ) -> Result<Option<String>, anyhow::Error> {
+            let mut state = self.state.lock().expect("state lock");
+            let previous = std::mem::replace(&mut state.current_model, selector.to_string());
+            Ok(Some(previous))
         }
 
         fn thinking_level(&self) -> ThinkingLevelDto {
@@ -1781,6 +1910,11 @@ mod routing_and_status {
                 .clone()
         }
 
+        fn replace_execution_root(&mut self, root: PathBuf) -> Option<PathBuf> {
+            let mut state = self.state.lock().expect("state lock");
+            state.current_execution_root.replace(root)
+        }
+
         fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
             std::mem::take(&mut self.state.lock().expect("state lock").last_session_messages)
         }
@@ -1799,6 +1933,244 @@ mod routing_and_status {
         (build_router(state, None), app_state)
     }
 
+    #[derive(Clone)]
+    struct BlockingSessionTurnControl {
+        started_calls: Arc<AtomicUsize>,
+        release_first_turn: Arc<tokio::sync::Notify>,
+        first_turn_started: Arc<tokio::sync::Notify>,
+        processed_inputs: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl BlockingSessionTurnControl {
+        fn new() -> Self {
+            Self {
+                started_calls: Arc::new(AtomicUsize::new(0)),
+                release_first_turn: Arc::new(tokio::sync::Notify::new()),
+                first_turn_started: Arc::new(tokio::sync::Notify::new()),
+                processed_inputs: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        async fn wait_for_first_turn(&self) {
+            if self.started_calls.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            self.first_turn_started.notified().await;
+        }
+
+        fn release_first_turn(&self) {
+            self.release_first_turn.notify_one();
+        }
+
+        fn processed_inputs(&self) -> Vec<String> {
+            self.processed_inputs
+                .lock()
+                .expect("processed inputs lock")
+                .clone()
+        }
+    }
+
+    struct BlockingSessionTurnTestApp {
+        control: BlockingSessionTurnControl,
+        current_model: String,
+        current_memory: SessionMemory,
+        last_session_messages: Vec<SessionMessage>,
+    }
+
+    impl BlockingSessionTurnTestApp {
+        fn new(control: BlockingSessionTurnControl) -> Self {
+            Self {
+                control,
+                current_model: "mock-model".to_string(),
+                current_memory: SessionMemory::default(),
+                last_session_messages: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AppEngine for BlockingSessionTurnTestApp {
+        async fn process_message(
+            &mut self,
+            input: &str,
+            images: Vec<ImageAttachment>,
+            documents: Vec<DocumentAttachment>,
+            source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<ApiCycleResult, anyhow::Error> {
+            let (result, _) = self
+                .process_message_with_context(
+                    input,
+                    images,
+                    documents,
+                    Vec::new(),
+                    source,
+                    callback,
+                )
+                .await?;
+            Ok(result)
+        }
+
+        async fn process_message_with_context(
+            &mut self,
+            input: &str,
+            _images: Vec<ImageAttachment>,
+            _documents: Vec<DocumentAttachment>,
+            context: Vec<Message>,
+            _source: InputSource,
+            callback: Option<StreamCallback>,
+        ) -> Result<(ApiCycleResult, Vec<Message>), anyhow::Error> {
+            self.control
+                .processed_inputs
+                .lock()
+                .expect("processed inputs lock")
+                .push(input.to_string());
+            self.control.started_calls.fetch_add(1, Ordering::AcqRel);
+            if input == "first" {
+                self.control.first_turn_started.notify_waiters();
+                self.control.release_first_turn.notified().await;
+            }
+
+            let response = format!("response for {input}");
+            self.last_session_messages = vec![
+                SessionMessage::text(SessionMessageRole::User, input, 2),
+                SessionMessage::text(SessionMessageRole::Assistant, &response, 3),
+            ];
+            if let Some(callback) = callback {
+                callback(StreamEvent::FinalAnswerDelta {
+                    text: response.clone(),
+                });
+                callback(StreamEvent::Done {
+                    response: response.clone(),
+                });
+            }
+
+            Ok((
+                ApiCycleResult {
+                    response,
+                    model: self.current_model.clone(),
+                    iterations: 1,
+                    result_kind: ResultKind::Complete,
+                },
+                context,
+            ))
+        }
+
+        fn active_model(&self) -> &str {
+            &self.current_model
+        }
+
+        fn available_models(&self) -> Vec<ModelInfoDto> {
+            vec![ModelInfoDto {
+                model_id: "mock-model".to_string(),
+                provider: "test".to_string(),
+                auth_method: "none".to_string(),
+                display_name: None,
+                recommended: true,
+                thinking_levels: vec!["off".to_string()],
+            }]
+        }
+
+        fn set_active_model(&mut self, selector: &str) -> Result<ModelSwitchDto, anyhow::Error> {
+            let previous_model = std::mem::replace(&mut self.current_model, selector.to_string());
+            Ok(ModelSwitchDto {
+                previous_model,
+                active_model: self.current_model.clone(),
+                thinking_adjusted: None,
+            })
+        }
+
+        fn replace_active_model(
+            &mut self,
+            selector: &str,
+        ) -> Result<Option<String>, anyhow::Error> {
+            Ok(Some(std::mem::replace(
+                &mut self.current_model,
+                selector.to_string(),
+            )))
+        }
+
+        fn spawn_session_engine(
+            &self,
+            _session_key: &SessionKey,
+            _execution_root: PathBuf,
+        ) -> Result<Option<Box<dyn AppEngine>>, anyhow::Error> {
+            Ok(Some(Box::new(Self::new(self.control.clone()))))
+        }
+
+        fn thinking_level(&self) -> ThinkingLevelDto {
+            ThinkingLevelDto {
+                level: "off".to_string(),
+                budget_tokens: None,
+                available: vec!["off".to_string()],
+            }
+        }
+
+        fn context_info(&self) -> ContextInfoDto {
+            ContextInfoDto {
+                used_tokens: 0,
+                max_tokens: 4_096,
+                percentage: 0.0,
+                compaction_threshold: 0.8,
+            }
+        }
+
+        fn context_info_for_messages(&self, _messages: &[Message]) -> ContextInfoDto {
+            self.context_info()
+        }
+
+        fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error> {
+            Ok(ThinkingLevelDto {
+                level: level.to_string(),
+                budget_tokens: None,
+                available: vec![level.to_string()],
+            })
+        }
+
+        fn skill_summaries(&self) -> Vec<SkillSummaryDto> {
+            Vec::new()
+        }
+
+        fn auth_provider_statuses(&self) -> Vec<AuthProviderDto> {
+            Vec::new()
+        }
+
+        fn config_manager(&self) -> Option<ConfigManagerHandle> {
+            None
+        }
+
+        fn session_bus(&self) -> Option<&SessionBus> {
+            None
+        }
+
+        fn recent_errors(&self, _limit: usize) -> Vec<ErrorRecordDto> {
+            Vec::new()
+        }
+
+        fn replace_session_memory(&mut self, memory: SessionMemory) -> SessionMemory {
+            std::mem::replace(&mut self.current_memory, memory)
+        }
+
+        fn session_memory(&self) -> SessionMemory {
+            self.current_memory.clone()
+        }
+
+        fn take_last_session_messages(&mut self) -> Vec<SessionMessage> {
+            std::mem::take(&mut self.last_session_messages)
+        }
+    }
+
+    fn blocking_session_turn_router(
+        registry: SessionRegistry,
+    ) -> (Router, BlockingSessionTurnControl) {
+        let control = BlockingSessionTurnControl::new();
+        let app = BlockingSessionTurnTestApp::new(control.clone());
+        let mut state = test_state_with_sessions(registry);
+        state.shared = Arc::new(SharedReadState::from_app(&app));
+        state.app = Arc::new(Mutex::new(app));
+        (build_router(state, None), control)
+    }
+
     fn runtime_info_with_skills(
         skills: &[(&str, Option<&str>, &[&str])],
     ) -> Arc<std::sync::RwLock<RuntimeInfo>> {
@@ -1811,6 +2183,7 @@ mod routing_and_status {
                     name: (*name).to_string(),
                     description: (*description).map(ToString::to_string),
                     tool_names: tools.iter().map(ToString::to_string).collect(),
+                    routing_tools: Vec::new(),
                     capabilities: Vec::new(),
                     version: None,
                     source: None,
@@ -1890,6 +2263,8 @@ mod routing_and_status {
             shared,
             config_manager: None,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
             tailscale_ip: None,
@@ -1900,6 +2275,48 @@ mod routing_and_status {
             channels: build_channel_runtime(None, webhooks),
             data_dir,
             synthesis: synthesis_state(has_synthesis),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
+            fleet_manager: None,
+            cron_store: None,
+            experiment_registry: {
+                let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                Arc::new(tokio::sync::Mutex::new(registry))
+            },
+            improvement_provider: None,
+            telemetry: in_memory_telemetry(),
+        }
+    }
+
+    fn test_state_with_engine(app: impl AppEngine + 'static) -> HttpState {
+        let data_dir = std::env::temp_dir().join(format!(
+            "fawx-api-engine-tests-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        let shared = Arc::new(SharedReadState::from_app(&app));
+
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
+            session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
+            start_time: Instant::now(),
+            server_runtime: test_server_runtime(),
+            tailscale_ip: None,
+            bearer_token: TEST_TOKEN.to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
+            channels: build_channel_runtime(None, Vec::new()),
+            data_dir,
+            synthesis: synthesis_state(false),
             oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
             permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
             ripcord: None,
@@ -1932,6 +2349,8 @@ mod routing_and_status {
             shared,
             config_manager,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
             tailscale_ip: None,
@@ -1988,6 +2407,17 @@ mod routing_and_status {
             .method(method)
             .uri(uri)
             .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    fn authed_sse_json_request(method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("accept", "text/event-stream")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request")
@@ -2416,6 +2846,66 @@ mod routing_and_status {
     }
 
     #[tokio::test]
+    async fn config_patch_endpoint_refreshes_shared_max_history_snapshot() {
+        let (_temp, config, manager) = temp_config_manager(
+            "[model]\ndefault_model = \"mock-model\"\n\n[general]\nmax_history = 3\n",
+        );
+        let state = test_state_with_config(config, Some(manager), Vec::new());
+        let shared = Arc::clone(&state.shared);
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PATCH",
+                "/v1/config",
+                r#"{"changes":{"general":{"max_history":9}}}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(shared.read().await.max_history, 9);
+    }
+
+    #[tokio::test]
+    async fn config_patch_endpoint_rejects_invalid_custom_instructions_without_writing() {
+        let (temp, config, manager) = temp_config_manager(
+            "[agent.behavior]\ncustom_instructions = \"Keep changes focused.\"\n",
+        );
+        let app = build_router(
+            test_state_with_config(config, Some(manager), Vec::new()),
+            None,
+        );
+        let oversized = "x".repeat(MAX_CUSTOM_INSTRUCTION_LENGTH + 1);
+        let body = serde_json::json!({
+            "changes": {
+                "agent": {
+                    "behavior": {
+                        "custom_instructions": oversized
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(authed_json_request("PATCH", "/v1/config", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("agent.behavior.custom_instructions")));
+
+        let content =
+            std::fs::read_to_string(temp.path().join("config.toml")).expect("read config");
+        assert!(content.contains("Keep changes focused."));
+        assert!(!content.contains(&"x".repeat(MAX_CUSTOM_INSTRUCTION_LENGTH + 1)));
+    }
+
+    #[tokio::test]
     async fn config_presets_endpoint_lists_available_presets() {
         let temp = TempDir::new().expect("tempdir");
         let mut config = fx_config::FawxConfig::default();
@@ -2586,6 +3076,7 @@ mod routing_and_status {
                 SessionConfig {
                     label: Some(format!("label-{key}")),
                     model: "mock-model".to_string(),
+                    thinking: None,
                 },
             )
             .expect("create session");
@@ -2601,6 +3092,180 @@ mod routing_and_status {
         key
     }
 
+    #[tokio::test]
+    async fn stop_session_endpoint_cancels_active_session_run() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-stop");
+        let state = test_state_with_sessions(registry);
+        let run_permit = state.session_runs.begin(&key).await;
+        let app = build_router(state, None);
+
+        let json = expect_ok_json(app, "POST", "/v1/sessions/sess-stop/stop").await;
+
+        assert_eq!(json["key"], "sess-stop");
+        assert_eq!(json["stopped"], true);
+        assert!(run_permit.is_cancelled());
+        assert_eq!(
+            run_permit.cancel_reason(),
+            Some(SessionRunCancelReason::StoppedByUser)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_session_endpoint_is_idempotent_when_no_run_is_active() {
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-idle-stop");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let json = expect_ok_json(app, "POST", "/v1/sessions/sess-idle-stop/stop").await;
+
+        assert_eq!(json["key"], "sess-idle-stop");
+        assert_eq!(json["stopped"], false);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_on_same_active_run_reports_no_new_stop() {
+        let runs = SessionRunRegistry::default();
+        let key = SessionKey::new("sess-stop-twice").expect("session key");
+        let permit = runs.begin(&key).await;
+
+        assert_eq!(runs.stop(&key).await, StopSessionRunOutcome::Stopped);
+        assert_eq!(runs.stop(&key).await, StopSessionRunOutcome::NoActiveRun);
+        assert!(permit.is_cancelled());
+        assert_eq!(
+            permit.cancel_reason(),
+            Some(SessionRunCancelReason::StoppedByUser)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_registry_steer_delivers_to_active_run() {
+        let runs = SessionRunRegistry::default();
+        let key = SessionKey::new("sess-steer").expect("session key");
+        let mut permit = runs.begin(&key).await;
+        let mut input_channel = permit.take_input_channel().expect("input channel");
+
+        assert_eq!(
+            runs.steer(&key, "keep checking the reducer".to_string())
+                .await,
+            crate::state::SteerSessionRunOutcome::Steered
+        );
+
+        assert_eq!(
+            input_channel.try_recv(),
+            Some(fx_kernel::LoopCommand::Steer(
+                "keep checking the reducer".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_session_endpoint_delivers_to_active_run() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-active-steer");
+        let state = test_state_with_sessions(registry);
+        let mut run_permit = state.session_runs.begin(&key).await;
+        let mut input_channel = run_permit.take_input_channel().expect("input channel");
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/sessions/sess-active-steer/steer",
+                r#"{"text": "keep checking the reducer"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], "sess-active-steer");
+        assert_eq!(json["steered"], true);
+        assert!(json.get("reason").is_none());
+        assert_eq!(
+            input_channel.try_recv(),
+            Some(fx_kernel::LoopCommand::Steer(
+                "keep checking the reducer".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_session_endpoint_rejects_empty_text() {
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-empty-steer");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/sessions/sess-empty-steer/steer",
+                r#"{"text": "   "}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "steering text must not be empty");
+    }
+
+    #[tokio::test]
+    async fn steer_session_endpoint_reports_no_active_run_when_idle() {
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-idle-steer");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/sessions/sess-idle-steer/steer",
+                r#"{"text": "focus on the UI"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["key"], "sess-idle-steer");
+        assert_eq!(json["steered"], false);
+        assert_eq!(json["reason"], "no_active_run");
+    }
+
+    #[tokio::test]
+    async fn overlapping_session_runs_cancel_previous_with_superseded_reason() {
+        let runs = SessionRunRegistry::default();
+        let key = SessionKey::new("sess-overlap").expect("session key");
+
+        let first = runs.begin(&key).await;
+        let second = runs.begin(&key).await;
+
+        assert!(first.is_cancelled());
+        assert_eq!(
+            first.cancel_reason(),
+            Some(SessionRunCancelReason::SupersededByNewerRequest)
+        );
+        assert!(!second.is_cancelled());
+        assert_eq!(second.cancel_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn finishing_superseded_run_does_not_clear_replacement() {
+        let runs = SessionRunRegistry::default();
+        let key = SessionKey::new("sess-finish-race").expect("session key");
+
+        let first = runs.begin(&key).await;
+        let second = runs.begin(&key).await;
+        runs.finish(&first).await;
+
+        assert_eq!(runs.stop(&key).await, StopSessionRunOutcome::Stopped);
+        assert!(second.is_cancelled());
+        assert_eq!(
+            second.cancel_reason(),
+            Some(SessionRunCancelReason::StoppedByUser)
+        );
+    }
+
     fn record_session_messages(
         registry: &SessionRegistry,
         key: &SessionKey,
@@ -2611,6 +3276,49 @@ mod routing_and_status {
                 .record_message(key, *role, content)
                 .expect("record session message");
         }
+    }
+
+    fn failed_turn_terminal_signal(id: u64, timestamp_ms: u64) -> Signal {
+        Signal::new(
+            LoopStep::Synthesize,
+            SignalKind::Trace,
+            "loop turn terminal status",
+            serde_json::json!({
+                "decision_kind": "turn_stop",
+                "decision": "failed",
+                "failed": true,
+                "result_kind": "incomplete",
+                "stop_reason": "tool continuation did not produce a usable final response",
+                "iterations": 2,
+            }),
+            timestamp_ms,
+        )
+        .with_id(id)
+    }
+
+    fn complete_turn_terminal_signal(id: u64, timestamp_ms: u64) -> Signal {
+        Signal::new(
+            LoopStep::Synthesize,
+            SignalKind::Trace,
+            "loop turn terminal status",
+            serde_json::json!({
+                "decision_kind": "turn_stop",
+                "decision": "completed",
+                "failed": false,
+                "result_kind": "complete",
+                "stop_reason": "complete",
+                "iterations": 1,
+            }),
+            timestamp_ms,
+        )
+        .with_id(id)
+    }
+
+    fn persist_session_signals_for_test(data_dir: &Path, session_id: &str, signals: &[Signal]) {
+        SignalStore::open(data_dir, session_id)
+            .expect("open signal store")
+            .persist(signals)
+            .expect("persist signals");
     }
 
     fn seed_export_session(registry: &SessionRegistry, key: &str) -> SessionKey {
@@ -2627,6 +3335,146 @@ mod routing_and_status {
         key
     }
 
+    struct RepoWorkspaceFixture {
+        _repo_temp: TempDir,
+        _config_temp: TempDir,
+        repo_root: PathBuf,
+        linked_worktree: PathBuf,
+        config: fx_config::FawxConfig,
+        manager: Arc<StdMutex<ConfigManager>>,
+    }
+
+    struct GeneralWorkspaceFixture {
+        _workspace_temp: TempDir,
+        _config_temp: TempDir,
+        config: fx_config::FawxConfig,
+        manager: Arc<StdMutex<ConfigManager>>,
+    }
+
+    fn workspace_state(
+        config: fx_config::FawxConfig,
+        manager: Arc<StdMutex<ConfigManager>>,
+        registry: Option<SessionRegistry>,
+    ) -> HttpState {
+        let mut state = test_state_with_config(config, Some(manager), Vec::new());
+        state.session_registry = registry;
+        state
+    }
+
+    fn general_workspace_fixture() -> GeneralWorkspaceFixture {
+        let workspace_temp = TempDir::new().expect("tempdir");
+        let workspace_root = workspace_temp.path().join("general");
+        std::fs::create_dir_all(&workspace_root).expect("create general workspace root");
+        let config_toml = format!(
+            "[workspace]\nroot = \"{}\"\n\n[tools]\nworking_dir = \"{}\"\n",
+            workspace_root.display(),
+            workspace_root.display()
+        );
+        let (config_temp, config, manager) = temp_config_manager(&config_toml);
+        GeneralWorkspaceFixture {
+            _workspace_temp: workspace_temp,
+            _config_temp: config_temp,
+            config,
+            manager,
+        }
+    }
+
+    fn repo_workspace_fixture() -> RepoWorkspaceFixture {
+        let repo_temp = TempDir::new().expect("tempdir");
+        let repo_root = repo_temp.path().join("workspace");
+        std::fs::create_dir_all(&repo_root).expect("create repo root");
+        run_git(&repo_root, &["init"]);
+        run_git(&repo_root, &["config", "user.name", "Fawx Tests"]);
+        run_git(&repo_root, &["config", "user.email", "tests@example.com"]);
+        std::fs::write(repo_root.join("README.md"), "# workspace\n").expect("write readme");
+        run_git(&repo_root, &["add", "README.md"]);
+        run_git(&repo_root, &["commit", "-m", "initial commit"]);
+        run_git(&repo_root, &["branch", "-M", "main"]);
+
+        let linked_worktree = repo_temp.path().join("workspace-feature");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/worktree",
+                linked_worktree.to_str().expect("linked worktree path"),
+            ],
+        );
+        let repo_root = std::fs::canonicalize(repo_root).expect("canonical repo root");
+        let linked_worktree =
+            std::fs::canonicalize(linked_worktree).expect("canonical linked worktree");
+
+        let config_toml = format!(
+            "[workspace]\nroot = \"{}\"\n\n[tools]\nworking_dir = \"{}\"\n",
+            repo_root.display(),
+            repo_root.display()
+        );
+        let (config_temp, config, manager) = temp_config_manager(&config_toml);
+        RepoWorkspaceFixture {
+            _repo_temp: repo_temp,
+            _config_temp: config_temp,
+            repo_root,
+            linked_worktree,
+            config,
+            manager,
+        }
+    }
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed in {}:\nstdout: {}\nstderr: {}",
+            args,
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn listed_workspace_by_kind<'a>(
+        json: &'a serde_json::Value,
+        kind: &str,
+    ) -> &'a serde_json::Value {
+        json["workspaces"]
+            .as_array()
+            .expect("workspaces array")
+            .iter()
+            .find(|workspace| workspace["kind"] == kind)
+            .expect("workspace entry")
+    }
+
+    fn listed_worktree_by_path<'a>(
+        json: &'a serde_json::Value,
+        path: &Path,
+    ) -> &'a serde_json::Value {
+        let path = path.to_string_lossy();
+        json["worktrees"]
+            .as_array()
+            .expect("worktrees array")
+            .iter()
+            .find(|worktree| worktree["path"] == path.as_ref())
+            .expect("worktree entry")
+    }
+
+    fn listed_thread_by_session_id<'a>(
+        json: &'a serde_json::Value,
+        session_id: &str,
+    ) -> &'a serde_json::Value {
+        json["threads"]
+            .as_array()
+            .expect("threads array")
+            .iter()
+            .find(|thread| thread["active_session_id"] == session_id)
+            .expect("thread entry")
+    }
+
     fn poisoned_session(key: &str) -> Session {
         Session {
             key: SessionKey::new(key).expect("session key"),
@@ -2634,9 +3482,11 @@ mod routing_and_status {
             status: SessionStatus::Idle,
             label: Some("poisoned".to_string()),
             model: "mock-model".to_string(),
+            thinking: None,
             created_at: 1,
             updated_at: 2,
             archived_at: None,
+            thread_binding: None,
             messages: vec![
                 SessionMessage::structured(
                     SessionMessageRole::Tool,
@@ -2683,6 +3533,722 @@ mod routing_and_status {
         assert_eq!(sanitized["telegram"]["nested"]["api_key"], "[REDACTED]");
         assert_eq!(sanitized["http"]["bearer_token"], "[REDACTED]");
         assert_eq!(sanitized["limits"]["max_tokens"], 4096);
+    }
+
+    #[tokio::test]
+    async fn workspaces_endpoint_returns_synthetic_general_workspace_for_unbound_threads() {
+        let fixture = general_workspace_fixture();
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-general");
+
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        assert_eq!(workspaces["total"], 1);
+        let general = listed_workspace_by_kind(&workspaces, "general");
+        assert_eq!(general["id"], GENERAL_WORKSPACE_ID);
+        assert_eq!(general["path"], "");
+        assert!(general["repo"].is_null());
+
+        let threads = expect_ok_json(
+            app,
+            "GET",
+            &format!("/v1/workspaces/{GENERAL_WORKSPACE_ID}/threads"),
+        )
+        .await;
+        assert_eq!(threads["total"], 1);
+        let thread = &threads["threads"][0];
+        assert_eq!(thread["active_session_id"], key.as_str());
+        assert_eq!(thread["workspace_id"], GENERAL_WORKSPACE_ID);
+        assert_eq!(thread["kind"], "general");
+        assert!(thread["worktree_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn workspaces_endpoint_returns_general_and_repo_backed_workspace_shapes() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        seed_session(&registry, "sess-repo");
+
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app, "GET", "/v1/workspaces").await;
+        assert_eq!(workspaces["total"], 2);
+
+        let general = listed_workspace_by_kind(&workspaces, "general");
+        assert_eq!(general["path"], "");
+        assert!(general["repo"].is_null());
+
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        assert_eq!(
+            repository["path"],
+            fixture.repo_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(repository["repo"]["vcs"], "git");
+        assert_eq!(
+            repository["repo"]["root"],
+            fixture.repo_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(repository["repo"]["current_branch"], "main");
+        assert_eq!(repository["repo"]["clean"], true);
+        assert!(repository["repo"]["origin"].is_null());
+        assert!(
+            repository["last_opened_at"]
+                .as_u64()
+                .expect("repo last_opened_at")
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_threads_endpoint_returns_thread_first_summaries_mapped_to_sessions() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-thread");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (
+                    SessionMessageRole::User,
+                    "Implement the worktree read model",
+                ),
+                (
+                    SessionMessageRole::Assistant,
+                    "Backend read models are wired up",
+                ),
+            ],
+        );
+
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+
+        let threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{repo_id}/threads"),
+        )
+        .await;
+        assert_eq!(threads["total"], 1);
+        let thread = &threads["threads"][0];
+        assert_ne!(thread["id"], key.as_str());
+        assert_eq!(thread["active_session_id"], key.as_str());
+        assert_eq!(thread["workspace_id"], repo_id);
+        assert_eq!(thread["kind"], "coding");
+        assert_eq!(thread["title"], "Implement the worktree read model");
+        assert_eq!(thread["preview"], "Backend read models are wired up");
+        assert!(thread["worktree_id"].is_null());
+
+        let sessions = expect_ok_json(app.clone(), "GET", "/v1/sessions").await;
+        assert!(listed_session_keys(&sessions).contains(&key.to_string()));
+        assert_eq!(
+            listed_session(&sessions, &key)["preview"],
+            thread["preview"]
+        );
+
+        let general_threads = expect_ok_json(
+            app,
+            "GET",
+            &format!("/v1/workspaces/{GENERAL_WORKSPACE_ID}/threads"),
+        )
+        .await;
+        assert_eq!(general_threads["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_worktrees_endpoint_returns_repo_backed_read_only_metadata() {
+        let fixture = repo_workspace_fixture();
+        let app = build_router(
+            workspace_state(fixture.config.clone(), Arc::clone(&fixture.manager), None),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+
+        let worktrees =
+            expect_ok_json(app, "GET", &format!("/v1/workspaces/{repo_id}/worktrees")).await;
+        assert_eq!(worktrees["total"], 2);
+
+        let active = listed_worktree_by_path(&worktrees, &fixture.repo_root);
+        assert_eq!(active["workspace_id"], repo_id);
+        assert_eq!(active["status"], "active");
+        assert_eq!(active["branch"], "main");
+        assert_eq!(active["clean"], true);
+        assert_eq!(active["ahead_count"], 0);
+        assert_eq!(active["behind_count"], 0);
+
+        let linked = listed_worktree_by_path(&worktrees, &fixture.linked_worktree);
+        assert_eq!(linked["workspace_id"], repo_id);
+        assert_eq!(linked["status"], "available");
+        assert_eq!(linked["branch"], "feature/worktree");
+        assert_eq!(linked["clean"], true);
+        assert_eq!(linked["ahead_count"], 0);
+        assert_eq!(linked["behind_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_endpoints_handle_detached_active_head() {
+        let fixture = repo_workspace_fixture();
+        run_git(&fixture.repo_root, &["checkout", "--detach"]);
+
+        let app = build_router(
+            workspace_state(fixture.config.clone(), Arc::clone(&fixture.manager), None),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+        assert!(repository["repo"]["current_branch"]
+            .as_str()
+            .expect("current branch")
+            .starts_with("detached@"));
+
+        let worktrees =
+            expect_ok_json(app, "GET", &format!("/v1/workspaces/{repo_id}/worktrees")).await;
+        let active = listed_worktree_by_path(&worktrees, &fixture.repo_root);
+        assert_eq!(active["workspace_id"], repo_id);
+        assert_eq!(active["status"], "active");
+        assert!(active["branch"]
+            .as_str()
+            .expect("detached branch")
+            .starts_with("detached@"));
+        assert!(active["base_ref"].is_null());
+    }
+
+    #[tokio::test]
+    async fn workspace_threads_endpoint_returns_404_for_unknown_workspace() {
+        let fixture = general_workspace_fixture();
+        let app = build_router(
+            workspace_state(fixture.config.clone(), Arc::clone(&fixture.manager), None),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                "/v1/workspaces/workspace-missing/threads",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+
+        assert_eq!(json["error"], "workspace not found: workspace-missing");
+    }
+
+    #[tokio::test]
+    async fn workspace_worktrees_endpoint_returns_404_for_unknown_workspace() {
+        let fixture = general_workspace_fixture();
+        let app = build_router(
+            workspace_state(fixture.config.clone(), Arc::clone(&fixture.manager), None),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                "/v1/workspaces/workspace-missing/worktrees",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+
+        assert_eq!(json["error"], "workspace not found: workspace-missing");
+    }
+
+    #[tokio::test]
+    async fn open_workspace_endpoint_returns_repo_backed_summary_for_git_paths() {
+        let fixture = repo_workspace_fixture();
+        let app = build_router(
+            workspace_state(fixture.config.clone(), Arc::clone(&fixture.manager), None),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/workspaces/open",
+                &format!(
+                    "{{\"path\":\"{}\"}}",
+                    fixture.linked_worktree.to_string_lossy()
+                ),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let json = response_json(response).await;
+
+        assert_eq!(json["kind"], "repository");
+        assert_eq!(json["path"], fixture.repo_root.to_string_lossy().as_ref());
+        assert_eq!(json["repo"]["current_branch"], "feature/worktree");
+    }
+
+    #[tokio::test]
+    async fn create_thread_route_binds_general_threads_even_when_repo_workspace_exists() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/threads",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"title\":\"General lane\"}}",
+                    GENERAL_WORKSPACE_ID
+                ),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        let session_id = created["active_session_id"]
+            .as_str()
+            .expect("created session id")
+            .to_string();
+
+        let general_threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{GENERAL_WORKSPACE_ID}/threads"),
+        )
+        .await;
+        let general_thread = listed_thread_by_session_id(&general_threads, &session_id);
+        assert_eq!(general_thread["title"], "General lane");
+        assert_eq!(general_thread["kind"], "general");
+
+        let sessions = expect_ok_json(app, "GET", "/v1/sessions").await;
+        assert_eq!(
+            listed_session(
+                &sessions,
+                &SessionKey::new(&session_id).expect("created session key")
+            )["thread_binding"]["workspace_id"],
+            GENERAL_WORKSPACE_ID
+        );
+        assert_eq!(
+            listed_session(
+                &sessions,
+                &SessionKey::new(&session_id).expect("created session key")
+            )["thread_binding"]["execution_root"],
+            fixture.repo_root.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_thread_route_rejects_unknown_explicit_model() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/threads",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"title\":\"Wrong model\",\"model\":\"definitely-missing-model\"}}",
+                    GENERAL_WORKSPACE_ID
+                ),
+            ))
+            .await
+            .expect("response");
+
+        let status = response.status();
+        let json = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "json: {json}");
+        assert_eq!(json["error"], "model not found: definitely-missing-model");
+    }
+
+    #[tokio::test]
+    async fn create_thread_route_uses_explicit_workspace_path_for_off_catalog_repository() {
+        let active_fixture = repo_workspace_fixture();
+        let pinned_fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let app = build_router(
+            workspace_state(
+                active_fixture.config.clone(),
+                Arc::clone(&active_fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let repo_id = crate::handlers::entity_ids::stable_entity_id(
+            "workspace",
+            &pinned_fixture.repo_root.to_string_lossy(),
+        );
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/threads",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"workspace_path\":\"{}\",\"title\":\"Pinned repo thread\"}}",
+                    repo_id,
+                    pinned_fixture.repo_root.to_string_lossy()
+                ),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        let session_id = created["active_session_id"]
+            .as_str()
+            .expect("created session id")
+            .to_string();
+
+        let threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!(
+                "/v1/workspaces/{repo_id}/threads?workspace_path={}",
+                pinned_fixture.repo_root.to_string_lossy()
+            ),
+        )
+        .await;
+        let created_thread = listed_thread_by_session_id(&threads, &session_id);
+        assert_eq!(created_thread["title"], "Pinned repo thread");
+        assert_eq!(created_thread["workspace_id"], repo_id);
+
+        let sessions = expect_ok_json(app, "GET", "/v1/sessions").await;
+        let binding = &listed_session(
+            &sessions,
+            &SessionKey::new(session_id).expect("created session key"),
+        )["thread_binding"];
+        assert_eq!(binding["workspace_id"], repo_id);
+        assert_eq!(
+            binding["execution_root"],
+            pinned_fixture.repo_root.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_thread_routes_do_not_clone_legacy_sessions_into_explicit_workspace_path() {
+        let active_fixture = repo_workspace_fixture();
+        let pinned_fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let legacy_key = seed_session(&registry, "sess-legacy-thread");
+        let app = build_router(
+            workspace_state(
+                active_fixture.config.clone(),
+                Arc::clone(&active_fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let active_repo_id = crate::handlers::entity_ids::stable_entity_id(
+            "workspace",
+            &active_fixture.repo_root.to_string_lossy(),
+        );
+        let active_threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{active_repo_id}/threads"),
+        )
+        .await;
+        assert_eq!(
+            listed_thread_by_session_id(&active_threads, legacy_key.as_str())["workspace_id"],
+            active_repo_id
+        );
+
+        let pinned_repo_id = crate::handlers::entity_ids::stable_entity_id(
+            "workspace",
+            &pinned_fixture.repo_root.to_string_lossy(),
+        );
+        let pinned_threads = expect_ok_json(
+            app,
+            "GET",
+            &format!(
+                "/v1/workspaces/{pinned_repo_id}/threads?workspace_path={}",
+                pinned_fixture.repo_root.to_string_lossy()
+            ),
+        )
+        .await;
+        assert!(pinned_threads["threads"]
+            .as_array()
+            .expect("pinned threads")
+            .iter()
+            .all(|thread| thread["active_session_id"] != legacy_key.as_str()));
+    }
+
+    #[tokio::test]
+    async fn create_thread_route_persists_worktree_binding_and_surfaces_it_in_read_models() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry),
+            ),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+        let worktrees = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{repo_id}/worktrees"),
+        )
+        .await;
+        let linked = listed_worktree_by_path(&worktrees, &fixture.linked_worktree);
+        let worktree_id = linked["id"].as_str().expect("worktree id");
+
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/threads",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"title\":\"Lane thread\",\"worktree_id\":\"{}\"}}",
+                    repo_id, worktree_id
+                ),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        let session_id = created["active_session_id"]
+            .as_str()
+            .expect("created session id")
+            .to_string();
+
+        let threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{repo_id}/threads"),
+        )
+        .await;
+        let created_thread = listed_thread_by_session_id(&threads, &session_id);
+        assert_eq!(created_thread["worktree_id"], worktree_id);
+        assert_eq!(created_thread["title"], "Lane thread");
+
+        let sessions = expect_ok_json(app, "GET", "/v1/sessions").await;
+        let binding = &listed_session(
+            &sessions,
+            &SessionKey::new(session_id).expect("created session key"),
+        )["thread_binding"];
+        assert_eq!(binding["workspace_id"], repo_id);
+        assert_eq!(
+            binding["execution_root"],
+            fixture.linked_worktree.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            binding["worktree_path"],
+            fixture.linked_worktree.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_routes_use_explicit_workspace_path_for_off_catalog_repository() {
+        let active_fixture = repo_workspace_fixture();
+        let pinned_fixture = repo_workspace_fixture();
+        let app = build_router(
+            workspace_state(
+                active_fixture.config.clone(),
+                Arc::clone(&active_fixture.manager),
+                None,
+            ),
+            None,
+        );
+
+        let repo_id = crate::handlers::entity_ids::stable_entity_id(
+            "workspace",
+            &pinned_fixture.repo_root.to_string_lossy(),
+        );
+        let worktrees = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!(
+                "/v1/workspaces/{repo_id}/worktrees?workspace_path={}",
+                pinned_fixture.repo_root.to_string_lossy()
+            ),
+        )
+        .await;
+        let linked = listed_worktree_by_path(&worktrees, &pinned_fixture.linked_worktree);
+        assert_eq!(linked["workspace_id"], repo_id);
+
+        let response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/worktrees",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"workspace_path\":\"{}\",\"branch\":\"feature/off-catalog\",\"base_ref\":\"main\"}}",
+                    repo_id,
+                    pinned_fixture.repo_root.to_string_lossy()
+                ),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = response_json(response).await;
+        assert_eq!(created["workspace_id"], repo_id);
+        assert_eq!(created["branch"], "feature/off-catalog");
+    }
+
+    #[tokio::test]
+    async fn worktree_mutation_routes_create_attach_archive_and_delete_lanes() {
+        let fixture = repo_workspace_fixture();
+        let registry = make_session_registry();
+        let attached_key = seed_session(&registry, "sess-worktree-attach");
+        let app = build_router(
+            workspace_state(
+                fixture.config.clone(),
+                Arc::clone(&fixture.manager),
+                Some(registry.clone()),
+            ),
+            None,
+        );
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+
+        let create_response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                "/v1/worktrees",
+                &format!(
+                    "{{\"workspace_id\":\"{}\",\"branch\":\"feature/pr4-lifecycle\",\"base_ref\":\"main\"}}",
+                    repo_id
+                ),
+            ))
+            .await
+            .expect("create response");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let created_worktree = response_json(create_response).await;
+        let created_worktree_id = created_worktree["id"]
+            .as_str()
+            .expect("created worktree id");
+
+        let attach_response = app
+            .clone()
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/worktrees/{created_worktree_id}/attach-thread"),
+                &format!(
+                    "{{\"thread_id\":\"{}\"}}",
+                    crate::handlers::entity_ids::stable_entity_id("thread", attached_key.as_str())
+                ),
+            ))
+            .await
+            .expect("attach response");
+        assert_eq!(attach_response.status(), StatusCode::OK);
+
+        let threads = expect_ok_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/workspaces/{repo_id}/threads"),
+        )
+        .await;
+        let attached_thread = listed_thread_by_session_id(&threads, attached_key.as_str());
+        assert_eq!(attached_thread["worktree_id"], created_worktree_id);
+
+        let archive_response = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/v1/worktrees/{created_worktree_id}/archive"),
+            ))
+            .await
+            .expect("archive response");
+        assert_eq!(archive_response.status(), StatusCode::OK);
+        let archive_json = response_json(archive_response).await;
+        assert_eq!(archive_json["archived_thread_count"], 1);
+
+        let archived_sessions =
+            expect_ok_json(app.clone(), "GET", "/v1/sessions?archived=only").await;
+        assert!(listed_session_keys(&archived_sessions).contains(&attached_key.to_string()));
+
+        let delete_response = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/v1/worktrees/{created_worktree_id}"),
+            ))
+            .await
+            .expect("delete response");
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let delete_json = response_json(delete_response).await;
+        assert_eq!(delete_json["deleted"], true);
+
+        let refreshed_worktrees =
+            expect_ok_json(app, "GET", &format!("/v1/workspaces/{repo_id}/worktrees")).await;
+        assert!(refreshed_worktrees["worktrees"]
+            .as_array()
+            .expect("refreshed worktrees")
+            .iter()
+            .all(|worktree| worktree["id"] != created_worktree_id));
+    }
+
+    #[tokio::test]
+    async fn workspace_worktrees_endpoint_marks_configured_linked_worktree_as_active() {
+        let fixture = repo_workspace_fixture();
+        let config_toml = format!(
+            "[workspace]\nroot = \"{}\"\n\n[tools]\nworking_dir = \"{}\"\n",
+            fixture.linked_worktree.display(),
+            fixture.linked_worktree.display()
+        );
+        let (_config_temp, config, manager) = temp_config_manager(&config_toml);
+        let app = build_router(workspace_state(config, manager, None), None);
+
+        let workspaces = expect_ok_json(app.clone(), "GET", "/v1/workspaces").await;
+        let repository = listed_workspace_by_kind(&workspaces, "repository");
+        let repo_id = repository["id"].as_str().expect("repo id");
+
+        let worktrees =
+            expect_ok_json(app, "GET", &format!("/v1/workspaces/{repo_id}/worktrees")).await;
+        let active = listed_worktree_by_path(&worktrees, &fixture.linked_worktree);
+        let repo_root = listed_worktree_by_path(&worktrees, &fixture.repo_root);
+        assert_eq!(active["status"], "active");
+        assert_eq!(repo_root["status"], "available");
     }
 
     #[test]
@@ -2886,8 +4452,26 @@ allowed_chat_ids = [123]
         let body = resp.into_body().collect().await.expect("body").to_bytes();
         let text = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
-        assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
+        assert!(text.contains("event: final_answer_delta\ndata: {\"text\":\"Mock response\"}"));
         assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn session_message_sse_requires_bearer_token() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-sse-auth");
+        let app = build_router(test_state_with_sessions(registry), None);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sessions/{key}/messages"))
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"message":"hello there"}"#))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3016,6 +4600,348 @@ allowed_chat_ids = [123]
         assert_eq!(json["model"], "mock-model");
         assert_eq!(json["label"], "label-sess-info");
         assert_archive_metadata(&json, false);
+    }
+
+    #[tokio::test]
+    async fn update_session_model_updates_stored_thread_model() {
+        let registry = make_session_registry();
+        let key = SessionKey::new("sess-update-model").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("model update".to_string()),
+                    model: "legacy-model".to_string(),
+                    thinking: None,
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/model"),
+                r#"{"model":"mock-model"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "mock-model");
+        assert_eq!(
+            registry.get_info(&key).expect("session").model,
+            "mock-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_model_resolves_from_snapshot_while_engine_is_busy() {
+        let registry = make_session_registry();
+        let key = SessionKey::new("sess-update-model-busy").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("model update".to_string()),
+                    model: "old-model".to_string(),
+                    thinking: None,
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+
+        let mut state = test_state_with_engine(
+            StubAppEngine::default()
+                .with_active_model("old-model")
+                .with_static_models(vec![
+                    ModelInfoDto {
+                        model_id: "old-model".to_string(),
+                        provider: "test".to_string(),
+                        auth_method: "none".to_string(),
+                        display_name: None,
+                        recommended: true,
+                        thinking_levels: vec!["off".to_string()],
+                    },
+                    ModelInfoDto {
+                        model_id: "new-model".to_string(),
+                        provider: "test".to_string(),
+                        auth_method: "none".to_string(),
+                        display_name: None,
+                        recommended: true,
+                        thinking_levels: vec!["off".to_string(), "high".to_string()],
+                    },
+                ]),
+        );
+        state.session_registry = Some(registry.clone());
+        let engine = Arc::clone(&state.app);
+        let _busy_engine = engine.lock().await;
+        let app = build_router(state, None);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            app.oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/model"),
+                r#"{"model":"new-model"}"#,
+            )),
+        )
+        .await
+        .expect("session model update should not wait for the busy turn engine")
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "new-model");
+        assert_eq!(registry.get_info(&key).expect("session").model, "new-model");
+    }
+
+    #[tokio::test]
+    async fn update_session_model_clears_unsupported_thread_thinking() {
+        let registry = make_session_registry();
+        let key = SessionKey::new("sess-update-model-thinking-clear").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("model update".to_string()),
+                    model: "claude-sonnet-4-6".to_string(),
+                    thinking: Some("adaptive".to_string()),
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Arc::new(StaticProvider {
+                name: "anthropic",
+                models: vec!["claude-sonnet-4-6"],
+            }),
+            "api_key",
+        );
+        router.register_provider_with_auth(
+            Arc::new(StaticProvider {
+                name: "openai",
+                models: vec!["gpt-5.4"],
+            }),
+            "api_key",
+        );
+        router.set_active("claude-sonnet-4-6").expect("set active");
+        let mut state = test_state_with_app(
+            build_test_app(
+                router,
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        state.session_registry = Some(registry.clone());
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/model"),
+                r#"{"model":"gpt-5.4"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "gpt-5.4");
+        assert!(json["thinking"].is_null());
+        let info = registry.get_info(&key).expect("session");
+        assert_eq!(info.model, "gpt-5.4");
+        assert!(info.thinking.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_session_model_preserves_supported_thread_thinking() {
+        let registry = make_session_registry();
+        let key = SessionKey::new("sess-update-model-thinking-preserve").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("model update".to_string()),
+                    model: "claude-sonnet-4-6".to_string(),
+                    thinking: Some("high".to_string()),
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        let mut router = ModelRouter::new();
+        router.register_provider_with_auth(
+            Arc::new(StaticProvider {
+                name: "anthropic",
+                models: vec!["claude-sonnet-4-6"],
+            }),
+            "api_key",
+        );
+        router.register_provider_with_auth(
+            Arc::new(StaticProvider {
+                name: "openai",
+                models: vec!["gpt-5.4"],
+            }),
+            "api_key",
+        );
+        router.set_active("claude-sonnet-4-6").expect("set active");
+        let mut state = test_state_with_app(
+            build_test_app(
+                router,
+                fx_config::FawxConfig::default(),
+                None,
+                test_runtime_info(),
+            ),
+            Vec::new(),
+        );
+        state.session_registry = Some(registry.clone());
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/model"),
+                r#"{"model":"gpt-5.4"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "gpt-5.4");
+        assert_eq!(json["thinking"], "high");
+        let info = registry.get_info(&key).expect("session");
+        assert_eq!(info.model, "gpt-5.4");
+        assert_eq!(info.thinking.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn update_session_thinking_updates_stored_thread_thinking() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-update-thinking");
+        let app = build_router(test_state_with_sessions(registry.clone()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/thinking"),
+                r#"{"level":"off"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["thinking"], "off");
+        assert_eq!(
+            registry
+                .get_info(&key)
+                .expect("session")
+                .thinking
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_thinking_resolves_from_snapshot_while_engine_is_busy() {
+        let registry = make_session_registry();
+        let key = SessionKey::new("sess-update-thinking-busy").expect("session key");
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("thinking update".to_string()),
+                    model: "busy-model".to_string(),
+                    thinking: None,
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+
+        let mut state = test_state_with_engine(
+            StubAppEngine::default()
+                .with_active_model("busy-model")
+                .with_static_models(vec![ModelInfoDto {
+                    model_id: "busy-model".to_string(),
+                    provider: "test".to_string(),
+                    auth_method: "none".to_string(),
+                    display_name: None,
+                    recommended: true,
+                    thinking_levels: vec!["off".to_string(), "high".to_string()],
+                }]),
+        );
+        state.session_registry = Some(registry.clone());
+        let engine = Arc::clone(&state.app);
+        let _busy_engine = engine.lock().await;
+        let app = build_router(state, None);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            app.oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/thinking"),
+                r#"{"level":"high"}"#,
+            )),
+        )
+        .await
+        .expect("session thinking update should not wait for the busy turn engine")
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["thinking"], "high");
+        assert_eq!(
+            registry
+                .get_info(&key)
+                .expect("session")
+                .thinking
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_session_thinking_rejects_unsupported_level() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-update-thinking-invalid");
+        let app = build_router(test_state_with_sessions(registry), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                &format!("/v1/sessions/{key}/thinking"),
+                r#"{"level":"high"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(json["error"]
+            .as_str()
+            .expect("error")
+            .contains("is not supported by model"));
     }
 
     #[tokio::test]
@@ -3366,6 +5292,164 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn failed_turn_endpoint_returns_tool_chain_and_control_plane_traces() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-failed-diagnostic");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::User,
+                vec![SessionContentBlock::Text {
+                    text: "Why did this fail?".to_string(),
+                }],
+                None,
+            )
+            .expect("record user");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    provider_id: Some("provider-call-1".to_string()),
+                    name: "run_command".to_string(),
+                    input: serde_json::json!({"command":"print-secret"}),
+                }],
+                None,
+            )
+            .expect("record tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                SessionMessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: serde_json::json!("existing session result"),
+                    is_error: Some(true),
+                }],
+                None,
+            )
+            .expect("record tool result");
+        let state = test_state_with_sessions(registry);
+        let data_dir = state.data_dir.clone();
+        persist_session_signals_for_test(
+            &data_dir,
+            key.as_str(),
+            &[
+                Signal::new(
+                    LoopStep::Perceive,
+                    SignalKind::Trace,
+                    "resource-bearing request has no ready typed preflight route",
+                    serde_json::json!({
+                        "decision_kind": "preflight_route",
+                        "decision": "no_ready_typed_route",
+                        "fallback_mode": "public_web",
+                    }),
+                    2_001,
+                )
+                .with_id(1),
+                Signal::new(
+                    LoopStep::Act,
+                    SignalKind::Retry,
+                    "retrying tool 'run_command'",
+                    serde_json::json!({
+                        "decision_kind": "retry_policy",
+                        "decision": "retry_allowed",
+                        "retry_cause": "prior_failure",
+                    }),
+                    2_002,
+                )
+                .with_id(2),
+                Signal::new(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    "tool 'run_command' blocked: previous identical call failed permanently",
+                    serde_json::json!({
+                        "decision_kind": "tool_call_guardrail",
+                        "decision": "blocked",
+                        "source": "retry_policy",
+                        "block_kind": "permanent_failure",
+                        "failure_class": "permanent",
+                    }),
+                    2_003,
+                )
+                .with_id(3),
+                failed_turn_terminal_signal(4, 2_004),
+            ],
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/failed-turn?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["session_id"], key.as_str());
+        assert_eq!(json["user_message"], "Why did this fail?");
+        assert_eq!(json["tool_chain"][0]["kind"], "tool_use");
+        assert_eq!(json["tool_chain"][0]["name"], "run_command");
+        assert_eq!(json["tool_chain"][1]["kind"], "tool_result");
+        assert!(json["decision_traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trace| { trace["metadata"]["decision_kind"] == "preflight_route" }));
+        assert!(json["decision_traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trace| { trace["metadata"]["decision_kind"] == "retry_policy" }));
+        assert!(json["decision_traces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trace| { trace["metadata"]["source"] == "retry_policy" }));
+        assert_eq!(json["final_stop"]["result_kind"], "incomplete");
+    }
+
+    #[tokio::test]
+    async fn failed_turn_endpoint_returns_404_for_successful_session() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-success-no-diagnostic");
+        record_session_messages(
+            &registry,
+            &key,
+            &[
+                (SessionMessageRole::User, "hello"),
+                (SessionMessageRole::Assistant, "hi"),
+            ],
+        );
+        let state = test_state_with_sessions(registry);
+        persist_session_signals_for_test(
+            &state.data_dir,
+            key.as_str(),
+            &[complete_turn_terminal_signal(1, 2_000)],
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request(
+                "GET",
+                &format!("/v1/sessions/{key}/failed-turn?format=json"),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().expect("error text");
+        assert!(error.contains(&format!(
+            "failed-turn diagnostic not found for session: {key}"
+        )));
+        assert!(error.contains("signal data may be incomplete"));
+    }
+
+    #[tokio::test]
     async fn archive_export_lifecycle_restores_default_list_membership() {
         let registry = make_session_registry();
         let key = seed_export_session(&registry, "sess-archive-lifecycle");
@@ -3575,6 +5659,44 @@ allowed_chat_ids = [123]
                 .is_empty(),
             "provider execution must not start for poisoned sessions"
         );
+    }
+
+    #[tokio::test]
+    async fn send_message_binds_stored_session_model_for_turn() {
+        let key = SessionKey::new("sess-model-scope").expect("session key");
+        let registry = make_session_registry();
+        registry
+            .create(
+                key.clone(),
+                SessionKind::Main,
+                SessionConfig {
+                    label: Some("model scoped".to_string()),
+                    model: "thread-model".to_string(),
+                    thinking: None,
+                },
+            )
+            .expect("create session");
+        registry
+            .set_status(&key, SessionStatus::Idle)
+            .expect("set idle");
+        let (app, app_state) =
+            session_memory_test_router(registry, SessionMemory::default(), Some(key.clone()));
+
+        let response = app
+            .oneshot(authed_json_request(
+                "POST",
+                &format!("/v1/sessions/{key}/messages"),
+                r#"{"message":"continue"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["model"], "thread-model");
+        let state = app_state.lock().expect("state lock");
+        assert_eq!(state.processed_models, vec!["thread-model"]);
+        assert_eq!(state.current_model, "mock-model");
     }
 
     #[tokio::test]
@@ -3879,12 +6001,17 @@ allowed_chat_ids = [123]
                 fx_llm::ProviderCapabilities {
                     supports_temperature: false,
                     requires_streaming: false,
+                    prompt_cache: Default::default(),
+                    prompt_cache_affinity: Default::default(),
                 }
             }
         }
 
         let registry = make_session_registry();
         let key = seed_session(&registry, "sess-orphan-tool");
+        registry
+            .set_model(&key, "capturing-model".to_string())
+            .expect("set session model");
         registry
             .record_message(&key, SessionMessageRole::User, "first request")
             .expect("record user");
@@ -4228,8 +6355,74 @@ allowed_chat_ids = [123]
         let body = resp.into_body().collect().await.expect("body").to_bytes();
         let text = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(text.contains("event: phase\ndata: {\"phase\":\"perceive\"}"));
-        assert!(text.contains("event: text_delta\ndata: {\"text\":\"Mock response\"}"));
+        assert!(text.contains("event: final_answer_delta\ndata: {\"text\":\"Mock response\"}"));
         assert!(text.contains("event: done\ndata: {\"response\":\"Mock response\"}"));
+    }
+
+    #[tokio::test]
+    async fn second_session_stream_runs_while_first_session_turn_is_active() {
+        let registry = make_session_registry();
+        let first_key = seed_session(&registry, "sess-engine-first");
+        let second_key = seed_session(&registry, "sess-engine-second");
+        let (app, control) = blocking_session_turn_router(registry);
+
+        let first_task = tokio::spawn(app.clone().oneshot(authed_sse_json_request(
+            "POST",
+            &format!("/v1/sessions/{first_key}/messages"),
+            r#"{"message":"first"}"#,
+        )));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            control.wait_for_first_turn(),
+        )
+        .await
+        .expect("first turn should start");
+
+        let second_response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.clone().oneshot(authed_sse_json_request(
+                "POST",
+                &format!("/v1/sessions/{second_key}/messages"),
+                r#"{"message":"second"}"#,
+            )),
+        )
+        .await
+        .expect("second response should open while first is active")
+        .expect("second response");
+        assert_eq!(second_response.status(), StatusCode::OK);
+
+        let second_body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            second_response.into_body().collect(),
+        )
+        .await
+        .expect("second stream should complete while first is active")
+        .expect("second body");
+        let second_text = String::from_utf8(second_body.to_bytes().to_vec()).expect("second utf8");
+        assert!(!second_text.contains(r#""kind":"queued""#));
+        assert!(second_text.contains("response for second"));
+        assert_eq!(
+            control.processed_inputs(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+
+        control.release_first_turn();
+        let first_response = tokio::time::timeout(std::time::Duration::from_secs(1), first_task)
+            .await
+            .expect("first response should finish")
+            .expect("first task")
+            .expect("first response");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_response.into_body().collect(),
+        )
+        .await
+        .expect("first stream should complete")
+        .expect("first body");
+        assert!(String::from_utf8(first_body.to_bytes().to_vec())
+            .expect("first utf8")
+            .contains("response for first"));
     }
 
     #[tokio::test]
@@ -4350,6 +6543,43 @@ allowed_chat_ids = [123]
     }
 
     #[tokio::test]
+    async fn session_message_uses_bound_execution_root_instead_of_global_workspace_root() {
+        let registry = make_session_registry();
+        let key = seed_session(&registry, "sess-bound-root");
+        let execution_root = TempDir::new().expect("tempdir");
+        registry
+            .set_thread_binding(
+                &key,
+                Some(SessionThreadBinding {
+                    workspace_id: GENERAL_WORKSPACE_ID.to_string(),
+                    execution_root: Some(execution_root.path().to_string_lossy().into_owned()),
+                    worktree_path: None,
+                }),
+            )
+            .expect("set thread binding");
+
+        let (app, state) =
+            session_memory_test_router(registry, SessionMemory::default(), Some(key.clone()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/message")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"message":"hello bound root","session_id":"{}"}}"#,
+                key.as_str()
+            )))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let observed_roots = &state.lock().expect("state lock").loaded_execution_roots;
+        assert_eq!(observed_roots.len(), 1);
+        assert_eq!(observed_roots[0], execution_root.path());
+    }
+
+    #[tokio::test]
     async fn sessions_require_auth() {
         let registry = make_session_registry();
         let app = build_router(test_state_with_sessions(registry), None);
@@ -4375,6 +6605,7 @@ allowed_chat_ids = [123]
                 router: Arc::new(std::sync::RwLock::new(settings_router())),
                 runtime_info: test_runtime_info(),
                 config: fx_config::FawxConfig::default(),
+                execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
                 memory: None,
                 embedding_index_persistence: None,
                 system_prompt_path: None,
@@ -4394,6 +6625,9 @@ allowed_chat_ids = [123]
                 ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                     std::env::temp_dir().as_path(),
                 )),
+                improvement_provider: None,
+                credential_store: None,
+                token_broker: None,
                 experiment_registry: None,
             })
             .expect("test app"),
@@ -4440,7 +6674,81 @@ allowed_chat_ids = [123]
         assert_eq!(json["active_model"], "claude-sonnet-4-20250514");
         assert_eq!(json["models"].as_array().expect("models").len(), 2);
         assert_eq!(json["models"][0]["provider"], "anthropic");
+        assert_eq!(json["models"][0]["thinking_levels"][0], "off");
+        assert_eq!(json["models"][0]["thinking_levels"][1], "adaptive");
         assert_eq!(json["models"][1]["model_id"], "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn list_models_prefers_dynamic_catalog_metadata() {
+        let state = test_state_with_engine(
+            StubAppEngine::default()
+                .with_active_model("openai/gpt-5.4")
+                .with_static_models(vec![ModelInfoDto {
+                    model_id: "stale-model".to_string(),
+                    provider: "openrouter".to_string(),
+                    auth_method: "api_key".to_string(),
+                    display_name: None,
+                    recommended: true,
+                    thinking_levels: vec!["off".to_string()],
+                }])
+                .with_dynamic_models(vec![ModelInfoDto {
+                    model_id: "openai/gpt-5.4".to_string(),
+                    provider: "openrouter".to_string(),
+                    auth_method: "api_key".to_string(),
+                    display_name: Some("GPT-5.4".to_string()),
+                    recommended: false,
+                    thinking_levels: vec![
+                        "none".to_string(),
+                        "low".to_string(),
+                        "medium".to_string(),
+                        "high".to_string(),
+                        "xhigh".to_string(),
+                    ],
+                }]),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/models"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["models"].as_array().expect("models").len(), 1);
+        assert_eq!(json["models"][0]["model_id"], "openai/gpt-5.4");
+        assert_eq!(json["models"][0]["display_name"], "GPT-5.4");
+        assert_eq!(json["models"][0]["recommended"], false);
+        assert_eq!(json["models"][0]["thinking_levels"][0], "none");
+        assert_eq!(json["models"][0]["thinking_levels"][4], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn list_models_publishes_post_refresh_active_model() {
+        let state = test_state_with_engine(
+            StubAppEngine::default()
+                .with_active_model("accounts/fireworks/models/deepseek-v3p1")
+                .with_dynamic_active_model("z-ai/glm-5.1")
+                .with_dynamic_models(vec![ModelInfoDto {
+                    model_id: "z-ai/glm-5.1".to_string(),
+                    provider: "openrouter".to_string(),
+                    auth_method: "api_key".to_string(),
+                    display_name: Some("GLM 5.1".to_string()),
+                    recommended: true,
+                    thinking_levels: vec!["off".to_string()],
+                }]),
+        );
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/models"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["active_model"], "z-ai/glm-5.1");
     }
 
     #[tokio::test]
@@ -4861,6 +7169,112 @@ thinking = "high"
         assert!(json["skills"].as_array().expect("skills").is_empty());
     }
 
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
+            r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+{fields_toml}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn get_skill_settings_returns_schema_and_redacted_secret_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[settings.fields]]
+key = "region"
+label = "Region"
+type = "text"
+"#,
+            ),
+        )
+        .expect("write manifest");
+        fx_auth::credential_store::EncryptedFileCredentialStore::open(temp.path())
+            .expect("open skill store")
+            .set_generic("skill:brave-search:api_key", "brv_secret_123")
+            .expect("store secret");
+
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/skills/brave-search/settings"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["skill_name"], "brave-search");
+        assert_eq!(json["schema"]["fields"][0]["key"], "api_key");
+        assert_eq!(json["values"][0]["is_secret"], true);
+        assert_eq!(json["values"][0]["is_configured"], true);
+        assert_eq!(json["values"][0]["value"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn update_skill_settings_persists_without_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[settings.fields]]
+key = "safesearch"
+label = "Safe Search"
+type = "boolean"
+"#,
+            ),
+        )
+        .expect("write manifest");
+
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let app = build_router(test_state_with_config(config, None, Vec::new()), None);
+
+        let response = app
+            .oneshot(authed_json_request(
+                "PUT",
+                "/v1/skills/brave-search/settings",
+                r#"{"values":[{"key":"api_key","value":"brv_secret_123"},{"key":"safesearch","value":"true"}]}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["updated"], true);
+        assert_eq!(json["settings"]["values"][1]["value"], "true");
+    }
+
     #[tokio::test]
     async fn list_auth_returns_provider_statuses() {
         let state = test_state_with_app(
@@ -4925,6 +7339,11 @@ thinking = "high"
             Request::builder()
                 .method("GET")
                 .uri("/v1/skills")
+                .body(Body::empty())
+                .expect("request"),
+            Request::builder()
+                .method("GET")
+                .uri("/v1/skills/brave-search/settings")
                 .body(Body::empty())
                 .expect("request"),
             Request::builder()
@@ -5103,6 +7522,8 @@ thinking = "high"
             shared,
             config_manager: None,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: test_server_runtime(),
             tailscale_ip: None,
@@ -5557,6 +7978,450 @@ mod config_endpoint {
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    mod observation_round_restriction_live_api {
+        use super::*;
+        use axum::http::StatusCode;
+        use fx_kernel::act::{ToolExecutor, ToolExecutorError, ToolResult};
+        use fx_kernel::budget::{BudgetConfig, BudgetTracker};
+        use fx_kernel::cancellation::CancellationToken;
+        use fx_kernel::context_manager::ContextCompactor;
+        use fx_kernel::loop_engine::LoopEngine;
+        use fx_llm::{
+            CompletionProvider, CompletionRequest, CompletionResponse, CompletionStream,
+            ModelRouter, ProviderError as LlmError,
+        };
+        use fx_session::{
+            SessionConfig, SessionKey, SessionKind, SessionRegistry, SessionStatus, SessionStore,
+        };
+        use fx_subagent::{
+            test_support::DisabledSubagentFactory, SubagentLimits, SubagentManager,
+            SubagentManagerDeps,
+        };
+        use std::sync::Arc;
+
+        fn live_test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
+            Arc::new(std::sync::RwLock::new(RuntimeInfo {
+                active_model: String::new(),
+                provider: String::new(),
+                skills: Vec::new(),
+                config_summary: ConfigSummary {
+                    max_iterations: 3,
+                    max_history: 20,
+                    memory_enabled: false,
+                },
+                authority: None,
+                version: "test".to_string(),
+            }))
+        }
+
+        fn live_make_session_registry() -> SessionRegistry {
+            let storage = fx_storage::Storage::open_in_memory().expect("in-memory storage");
+            SessionRegistry::new(SessionStore::new(storage)).expect("session registry")
+        }
+
+        fn live_seed_session(registry: &SessionRegistry, key: &str) -> SessionKey {
+            let key = SessionKey::new(key).expect("session key");
+            registry
+                .create(
+                    key.clone(),
+                    SessionKind::Main,
+                    SessionConfig {
+                        label: Some(format!("label-{key}")),
+                        model: "mock-model".to_string(),
+                        thinking: None,
+                    },
+                )
+                .expect("create session");
+            registry
+                .set_status(&key, SessionStatus::Idle)
+                .expect("set idle");
+            key
+        }
+
+        fn live_test_state_with_app(
+            app: HeadlessApp,
+            webhooks: Vec<Arc<WebhookChannel>>,
+        ) -> HttpState {
+            let data_dir = app
+                .config()
+                .general
+                .data_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir);
+            let has_synthesis = app.config().model.synthesis_instruction.is_some();
+            let shared = Arc::new(SharedReadState::from_app(&app));
+            HttpState {
+                app: Arc::new(Mutex::new(app)),
+                shared,
+                config_manager: None,
+                session_registry: None,
+                session_runs: crate::state::SessionRunRegistry::default(),
+                session_engines: crate::state::SessionEnginePool::default(),
+                start_time: Instant::now(),
+                server_runtime: ServerRuntime::local(8400),
+                tailscale_ip: None,
+                bearer_token: TEST_TOKEN.to_string(),
+                pairing: Arc::new(Mutex::new(PairingState::new())),
+                devices: Arc::new(Mutex::new(DeviceStore::new())),
+                devices_path: None,
+                channels: build_channel_runtime(None, webhooks),
+                data_dir,
+                synthesis: synthesis_state(has_synthesis),
+                oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+                permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+                ripcord: None,
+                fleet_manager: None,
+                cron_store: None,
+                experiment_registry: {
+                    let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
+                    Arc::new(tokio::sync::Mutex::new(registry))
+                },
+                improvement_provider: None,
+                telemetry: in_memory_telemetry(),
+            }
+        }
+
+        fn synthesis_state(
+            has_initial_value: bool,
+        ) -> Arc<crate::handlers::synthesis::SynthesisState> {
+            Arc::new(crate::handlers::synthesis::SynthesisState::new(
+                has_initial_value,
+            ))
+        }
+
+        fn live_build_test_app_with_engine(
+            router: ModelRouter,
+            loop_engine: LoopEngine,
+            mut config: fx_config::FawxConfig,
+        ) -> HeadlessApp {
+            if config.general.data_dir.is_none() {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let data_dir = std::env::temp_dir().join(format!("fawx-api-tests-{unique}"));
+                std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+                config.general.data_dir = Some(data_dir);
+            }
+
+            let subagent_manager = Arc::new(SubagentManager::new(SubagentManagerDeps {
+                factory: Arc::new(DisabledSubagentFactory::new("disabled")),
+                limits: SubagentLimits::default(),
+            }));
+
+            HeadlessApp::new(HeadlessAppDeps {
+                loop_engine,
+                router: Arc::new(std::sync::RwLock::new(router)),
+                runtime_info: live_test_runtime_info(),
+                config,
+                execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
+                memory: None,
+                embedding_index_persistence: None,
+                system_prompt_path: None,
+                config_manager: None,
+                system_prompt_text: None,
+                subagent_manager,
+                canary_monitor: None,
+                session_bus: None,
+                session_key: None,
+                cron_store: None,
+                startup_warnings: Vec::new(),
+                stream_callback_slot: Arc::new(std::sync::Mutex::new(None)),
+                permission_prompt_state: None,
+                ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
+                    std::env::temp_dir().as_path(),
+                )),
+                improvement_provider: None,
+                credential_store: None,
+                token_broker: None,
+                experiment_registry: None,
+            })
+            .expect("test app")
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ObservationScenario {
+            DistinctReads,
+            RepeatedReads,
+        }
+
+        #[derive(Debug)]
+        struct ObservationRoundToolExecutor;
+
+        #[async_trait]
+        impl ToolExecutor for ObservationRoundToolExecutor {
+            async fn execute_tools(
+                &self,
+                calls: &[fx_llm::ToolCall],
+                _cancel: Option<&CancellationToken>,
+            ) -> Result<Vec<ToolResult>, ToolExecutorError> {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolResult {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        success: true,
+                        output: "ok".to_string(),
+                        failure_class: None,
+                    })
+                    .collect())
+            }
+
+            fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+                vec![fx_llm::ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }),
+                }]
+            }
+        }
+
+        #[derive(Debug)]
+        struct ObservationRoundProvider {
+            scenario: ObservationScenario,
+            requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        impl ObservationRoundProvider {
+            fn new(
+                scenario: ObservationScenario,
+                requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+            ) -> Self {
+                Self { scenario, requests }
+            }
+
+            fn request_has_nudge(request: &CompletionRequest) -> bool {
+                request.messages.iter().any(|message| {
+                    message.role == fx_llm::MessageRole::System
+                        && message.content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text { text } if text.contains("multiple tool rounds only gathering information"))
+                        })
+                })
+            }
+
+            fn tool_use_response(id: &str, path: &str) -> CompletionResponse {
+                CompletionResponse {
+                    content: Vec::new(),
+                    tool_calls: vec![fx_llm::ToolCall {
+                        id: id.to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": path }),
+                    }],
+                    usage: None,
+                    stop_reason: Some("tool_use".to_string()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl CompletionProvider for ObservationRoundProvider {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                let mut requests = self.requests.lock().expect("capture lock");
+                let request_index = requests.len();
+                requests.push(request.clone());
+                drop(requests);
+
+                if request.tools.is_empty() {
+                    return Ok(mock_completion_response());
+                }
+
+                match (self.scenario, request_index) {
+                    (ObservationScenario::DistinctReads, 0) => {
+                        Ok(Self::tool_use_response("call-1", "a.txt"))
+                    }
+                    (ObservationScenario::DistinctReads, 1) => {
+                        Ok(Self::tool_use_response("call-2", "b.txt"))
+                    }
+                    (ObservationScenario::DistinctReads, _) => Ok(mock_completion_response()),
+                    (ObservationScenario::RepeatedReads, 0) => {
+                        Ok(Self::tool_use_response("call-1", "a.txt"))
+                    }
+                    (ObservationScenario::RepeatedReads, 1) => {
+                        Ok(Self::tool_use_response("call-2", "a.txt"))
+                    }
+                    (ObservationScenario::RepeatedReads, _) => {
+                        if request_index >= 8 {
+                            Ok(mock_completion_response())
+                        } else {
+                            Ok(Self::tool_use_response("call-3", "a.txt"))
+                        }
+                    }
+                }
+            }
+
+            async fn complete_stream(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionStream, LlmError> {
+                let response = self.complete(request).await?;
+                let stream = futures::stream::once(async move {
+                    Ok(fx_llm::StreamChunk {
+                        delta_content: response.content.iter().find_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        }),
+                        stop_reason: response.stop_reason.clone(),
+                        ..Default::default()
+                    })
+                });
+                Ok(Box::pin(stream))
+            }
+
+            fn name(&self) -> &str {
+                "observation-rounds"
+            }
+
+            fn supported_models(&self) -> Vec<String> {
+                vec!["mock-model".to_string()]
+            }
+
+            fn capabilities(&self) -> fx_llm::ProviderCapabilities {
+                fx_llm::ProviderCapabilities {
+                    supports_temperature: false,
+                    requires_streaming: false,
+                    prompt_cache: Default::default(),
+                    prompt_cache_affinity: Default::default(),
+                }
+            }
+        }
+
+        fn observation_round_router(
+            scenario: ObservationScenario,
+            requests: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+        ) -> ModelRouter {
+            let mut router = ModelRouter::new();
+            router.register_provider(Box::new(ObservationRoundProvider::new(scenario, requests)));
+            router.set_active("mock-model").expect("set active");
+            router
+        }
+
+        struct LiveServerGuard(tokio::task::JoinHandle<()>);
+
+        impl Drop for LiveServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        async fn spawn_live_server(app: Router) -> (String, LiveServerGuard) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind live server");
+            let addr = listener.local_addr().expect("local addr");
+            let base_url = format!("http://{addr}");
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            (base_url, LiveServerGuard(handle))
+        }
+
+        async fn run_live_observation_scenario(
+            scenario: ObservationScenario,
+        ) -> (Vec<CompletionRequest>, serde_json::Value) {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let router = observation_round_router(scenario, Arc::clone(&captured));
+
+            let mut config = fx_config::FawxConfig::default();
+            config.model.default_model = Some("mock-model".to_string());
+            let app = live_build_test_app_with_engine(
+                router,
+                LoopEngine::builder()
+                    .budget(BudgetTracker::new(BudgetConfig::default(), 0, 0))
+                    .context(ContextCompactor::new(2048, 256))
+                    .max_iterations(8)
+                    .tool_executor(Arc::new(ObservationRoundToolExecutor))
+                    .synthesis_instruction("Summarize".to_string())
+                    .build()
+                    .expect("observation test engine"),
+                config,
+            );
+            let registry = live_make_session_registry();
+            let key = live_seed_session(&registry, "sess-observation-rounds");
+
+            let mut state = live_test_state_with_app(app, Vec::new());
+            state.session_registry = Some(registry);
+            let app = build_router(state, None);
+
+            let (base_url, _server) = spawn_live_server(app).await;
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!("{base_url}/v1/sessions/{key}/messages"))
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "message": "research two files and summarize the differences"
+                }))
+                .send()
+                .await
+                .expect("send live request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .expect("json body");
+
+            let requests = captured.lock().expect("capture lock").clone();
+            (requests, body)
+        }
+
+        #[tokio::test]
+        async fn live_headless_api_distinct_observation_rounds_keep_tools_available() {
+            let (requests, body) =
+                run_live_observation_scenario(ObservationScenario::DistinctReads).await;
+
+            assert_eq!(body["result_kind"], "complete");
+            assert!(
+                requests
+                    .iter()
+                    .take(3)
+                    .all(|request| !request.tools.is_empty()),
+                "distinct observation rounds should keep the tool surface available"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .take(3)
+                    .all(|request| !ObservationRoundProvider::request_has_nudge(request)),
+                "distinct research should not receive the repeated-observation nudge"
+            );
+        }
+
+        #[tokio::test]
+        async fn live_headless_api_repeated_observation_rounds_block_duplicate_evidence() {
+            let (requests, body) =
+                run_live_observation_scenario(ObservationScenario::RepeatedReads).await;
+
+            assert!(body["result_kind"] == "partial" || body["result_kind"] == "complete");
+            let terminal_request = requests
+                .iter()
+                .skip(2)
+                .find(|request| {
+                    request.tools.is_empty()
+                        && request.messages.iter().any(|message| {
+                            message.content.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text.contains("already gathered the same evidence"))
+                            })
+                        })
+                })
+                .expect(
+                    "exact duplicate observation should be blocked before the older observation nudge path",
+                );
+            assert!(
+                !ObservationRoundProvider::request_has_nudge(terminal_request),
+                "duplicate-evidence blocking should avoid reviving the older repeated-read nudge path"
+            );
+        }
+    }
 }
 
 mod telegram_update {
@@ -5636,6 +8501,8 @@ mod telegram_update {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -5675,6 +8542,8 @@ mod telegram_update {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -5715,6 +8584,8 @@ mod telegram_update {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -5805,6 +8676,7 @@ mod telegram_update {
             router: Arc::new(std::sync::RwLock::new(router)),
             runtime_info: test_runtime_info(),
             config: fx_config::FawxConfig::default(),
+            execution_root: Arc::new(fx_kernel::ExecutionRoot::new(std::env::temp_dir())),
             memory: None,
             embedding_index_persistence: None,
             system_prompt_path: None,
@@ -5821,6 +8693,9 @@ mod telegram_update {
             ripcord_journal: Arc::new(fx_ripcord::RipcordJournal::new(
                 std::env::temp_dir().as_path(),
             )),
+            improvement_provider: None,
+            credential_store: None,
+            token_broker: None,
             experiment_registry: None,
         })
         .expect("test app")
@@ -6066,6 +8941,7 @@ mod telegram_update {
                 routing_key: Some("12345".to_string()),
                 reply_to: None,
             },
+            None,
         )
         .await
         .expect("process with images");

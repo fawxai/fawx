@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use fx_auth::auth::AuthMethod;
 use fx_auth::github::validate_github_pat;
-use fx_llm::{ModelCatalog, OpenAiResponsesProvider};
+use fx_llm::{CompletionProvider, ModelCatalog, OpenAiResponsesProvider};
 use std::time::Duration;
 use tokio::time;
 use zeroize::Zeroizing;
@@ -102,13 +102,25 @@ pub async fn handle_verify_provider(
     let timeout = Duration::from_secs(timeout_seconds);
 
     match verify_auth_method(&provider, &auth_method, timeout).await {
-        Ok(message) => Ok(Json(VerifyResponse {
-            provider,
-            verified: true,
-            status: "authenticated".to_string(),
-            message,
-            checked_at,
-        })),
+        Ok(verification) => {
+            if !verification.discovered_models.is_empty() {
+                fx_config::update_provider_model_cache(
+                    &state.data_dir,
+                    &provider,
+                    &verification.discovered_models,
+                )
+                .map_err(internal_error)?;
+                reload_app_providers(&state).await;
+            }
+
+            Ok(Json(VerifyResponse {
+                provider,
+                verified: true,
+                status: "authenticated".to_string(),
+                message: verification.message,
+                checked_at,
+            }))
+        }
         Err(message) => Ok(Json(VerifyResponse {
             provider,
             verified: false,
@@ -119,13 +131,23 @@ pub async fn handle_verify_provider(
     }
 }
 
+struct VerificationSuccess {
+    message: String,
+    discovered_models: Vec<String>,
+}
+
 async fn verify_auth_method(
     provider: &str,
     auth_method: &AuthMethod,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<VerificationSuccess, String> {
     match auth_method {
-        AuthMethod::ApiKey { key, .. } if provider == "github" => verify_github_token(key).await,
+        AuthMethod::ApiKey { key, .. } if provider == "github" => verify_github_token(key)
+            .await
+            .map(|message| VerificationSuccess {
+                message,
+                discovered_models: Vec::new(),
+            }),
         AuthMethod::OAuth {
             provider: stored_provider,
             access_token,
@@ -158,8 +180,15 @@ async fn verify_auth_method(
                     })?;
 
                 verification
-                    .map(|_| "Credentials verified successfully.".to_string())
-                    .map_err(|error| verification_error_message(provider, error.to_string()))
+                    .map_err(|error| verification_error_message(provider, error.to_string()))?;
+
+                let discovered_models = CompletionProvider::list_models(&provider_client)
+                    .await
+                    .unwrap_or_default();
+                Ok(VerificationSuccess {
+                    message: "Credentials verified successfully.".to_string(),
+                    discovered_models,
+                })
             } else {
                 verify_with_catalog(provider, access_token, "oauth", timeout).await
             }
@@ -176,13 +205,17 @@ async fn verify_with_catalog(
     token: &str,
     auth_mode: &str,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<VerificationSuccess, String> {
     let catalog = ModelCatalog::with_timeout(timeout);
-    catalog
-        .verify_credentials(provider, token, auth_mode)
+    let models = catalog
+        .fetch_live_models(provider, token, auth_mode)
         .await
-        .map(|_| "Credentials verified successfully.".to_string())
-        .map_err(|error| verification_error_message(provider, error))
+        .map(unique_catalog_model_ids)
+        .map_err(|error| verification_error_message(provider, error))?;
+    Ok(VerificationSuccess {
+        message: "Credentials verified successfully.".to_string(),
+        discovered_models: models,
+    })
 }
 
 async fn verify_github_token(token: &str) -> Result<String, String> {
@@ -262,9 +295,17 @@ fn verification_error_message(provider: &str, error: String) -> String {
     format!("{provider_label} verification failed: {error}")
 }
 
+fn unique_catalog_model_ids(models: Vec<fx_llm::CatalogModel>) -> Vec<String> {
+    let mut ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn provider_display_name(provider: &str) -> &str {
     match provider {
         "anthropic" => "Anthropic",
+        "fireworks" => "Fireworks",
         "github" => "GitHub",
         "openai" => "OpenAI",
         "openrouter" => "OpenRouter",
@@ -304,6 +345,7 @@ async fn delete_provider_auth(
     store
         .save_auth_manager(&auth_manager)
         .map_err(internal_error)?;
+    fx_config::clear_provider_model_cache(&state.data_dir, provider).map_err(internal_error)?;
     reload_app_providers(state).await;
     Ok(())
 }
@@ -316,6 +358,7 @@ async fn reload_app_providers(state: &HttpState) {
                 app.active_model().to_owned(),
                 app.thinking_level(),
                 app.available_models(),
+                app.max_history(),
             )),
             Err(error) => {
                 tracing::warn!(error = %error, "failed to reload providers after auth change");
@@ -324,10 +367,10 @@ async fn reload_app_providers(state: &HttpState) {
         }
     };
 
-    if let Some((active_model, thinking, models)) = snapshot {
+    if let Some((active_model, thinking, models, max_history)) = snapshot {
         state
             .shared
-            .update_model(&active_model, &thinking, models)
+            .update_model(&active_model, &thinking, models, max_history)
             .await;
     }
 }
@@ -339,6 +382,49 @@ fn internal_error(error: String) -> (StatusCode, Json<ErrorBody>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices::DeviceStore;
+    use crate::pairing::PairingState;
+    use crate::server_runtime::ServerRuntime;
+    use crate::state::{build_channel_runtime, in_memory_telemetry, HttpState, SharedReadState};
+    use crate::test_support::StubAppEngine;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    fn test_state(data_dir: std::path::PathBuf) -> HttpState {
+        let app = StubAppEngine::default();
+        let shared = Arc::new(SharedReadState::from_app(&app));
+
+        HttpState {
+            app: Arc::new(Mutex::new(app)),
+            shared,
+            config_manager: None,
+            session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
+            start_time: Instant::now(),
+            server_runtime: ServerRuntime::local(8400),
+            tailscale_ip: None,
+            bearer_token: "test-token".to_string(),
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            devices: Arc::new(Mutex::new(DeviceStore::new())),
+            devices_path: None,
+            channels: build_channel_runtime(None, Vec::new()),
+            data_dir: data_dir.clone(),
+            synthesis: Arc::new(crate::handlers::synthesis::SynthesisState::new(false)),
+            oauth_flows: Arc::new(crate::handlers::oauth::OAuthFlowStore::new()),
+            permission_prompts: Arc::new(fx_kernel::PermissionPromptState::new()),
+            ripcord: None,
+            fleet_manager: None,
+            cron_store: None,
+            experiment_registry: Arc::new(tokio::sync::Mutex::new(
+                crate::experiment_registry::ExperimentRegistry::new(data_dir.as_path())
+                    .expect("experiment registry"),
+            )),
+            improvement_provider: None,
+            telemetry: in_memory_telemetry(),
+        }
+    }
 
     #[test]
     fn setup_token_response_serializes_expected_shape() {
@@ -421,5 +507,41 @@ mod tests {
         assert_eq!(request.0, "anthropic");
         assert_eq!(request.1, "setup-token-123");
         assert_eq!(request.2, "setup_token");
+    }
+
+    #[tokio::test]
+    async fn save_auth_method_preserves_provider_model_cache() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fx_config::update_provider_model_cache(
+            temp.path(),
+            "openrouter",
+            &[
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ],
+        )
+        .expect("seed provider model cache");
+        let state = test_state(temp.path().to_path_buf());
+
+        save_auth_method(
+            &state,
+            "openrouter",
+            AuthMethod::ApiKey {
+                provider: "openrouter".to_string(),
+                key: "or-test-key".to_string(),
+            },
+        )
+        .await
+        .expect("save auth");
+
+        let cache =
+            fx_config::load_provider_model_cache(temp.path()).expect("reload provider model cache");
+        assert_eq!(
+            cache.models_for("openrouter"),
+            Some(vec![
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "openai/gpt-5.4".to_string(),
+            ])
+        );
     }
 }

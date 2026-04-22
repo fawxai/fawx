@@ -2,10 +2,12 @@
 
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult, TurnCommitment,
+    ExternalActionKind, FailureClass, ProceedUnderConstraints, TokenUsage, ToolCacheability,
+    ToolCallClassification, ToolExecutionDiagnostics, ToolExecutor, ToolResult, TurnCommitment,
 };
 use crate::budget::{
-    estimate_complexity, ActionCost, BudgetRemaining, BudgetState, BudgetTracker, TerminationConfig,
+    estimate_complexity, ActionCost, BudgetRemaining, BudgetState, BudgetTracker,
+    TerminationConfig, ToolStrippingAfterNudge,
 };
 #[cfg(test)]
 use crate::budget::{AllocationPlan, BudgetConfig};
@@ -22,8 +24,15 @@ use crate::decide::Decision;
 use crate::input::{LoopCommand, LoopInputChannel};
 
 use crate::perceive::{ProcessedPerception, TrimmingPolicy};
-use crate::signals::{LoopStep, Signal, SignalCollector, SignalKind};
-use crate::streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
+use crate::signal_summarizer::{ObservationPressure, SignalSummarizer, SignalSummaryContext};
+use crate::signals::{
+    ControlPlaneDecisionKind, LoopStep, Signal, SignalCollector, SignalKind,
+    SignalToolClassification,
+};
+use crate::streaming::{
+    ErrorCategory, Phase, StreamCallback, StreamEvent, StreamToolProgressClass,
+    StreamToolProgressOutcome, TranscriptTurnPhase,
+};
 use crate::types::{
     Goal, IdentityContext, LoopError, PerceptionSnapshot, ReasoningContext, WorkingMemoryEntry,
 };
@@ -32,6 +41,8 @@ use async_trait::async_trait;
 #[cfg(test)]
 use futures_util::StreamExt;
 use fx_core::message::{InternalMessage, ProgressKind, StreamPhase};
+use fx_core::runtime_info::RuntimeInfo;
+use fx_core::tool_routing::{RouteAdvisory, ToolRoutingSummary};
 #[cfg(test)]
 use fx_core::types::{InputSource, ScreenState, UserInput};
 use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
@@ -39,15 +50,17 @@ use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGo
 use fx_decompose::{SubGoalOutcome, SubGoalResult};
 use fx_llm::{
     emit_default_stream_response, CompletionRequest, CompletionResponse, ContentBlock, Message,
-    MessageRole, ProviderError, StreamCallback as ProviderStreamCallback, StreamChunk, ToolCall,
-    ToolDefinition, ToolUseDelta, Usage,
+    MessageRole, PromptCacheAffinity, ProviderError, StreamCallback as ProviderStreamCallback,
+    StreamChunk, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
+use fx_memory::SignalSink;
 use fx_session::SessionMemory;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -59,11 +72,14 @@ mod continuation;
 mod decomposition;
 mod direct_inspection;
 mod direct_utility;
+mod preflight_route;
 mod progress;
 mod request;
 mod retry;
 mod streaming;
+mod tool_call_normalization;
 mod tool_execution;
+mod turn_control;
 
 #[cfg(test)]
 use self::compaction::CompactionTier;
@@ -82,27 +98,35 @@ use self::decomposition::{
     decomposition_results_all_skipped, estimate_plan_cost, is_decomposition_results_message,
     parse_decomposition_plan,
 };
+use self::preflight_route::{
+    build_degraded_public_web_fallback_plan, build_route_plan, detect_route_resource, RoutePlan,
+};
 #[cfg(test)]
 use self::request::{build_continuation_request, ContinuationRequestParams};
 use self::request::{
     build_forced_synthesis_request, build_reasoning_messages, build_reasoning_request,
     build_truncation_continuation_request, completion_request_to_prompt,
-    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, ToolRequestConfig,
-    TruncationContinuationRequestParams,
+    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, SkillPromptSummary,
+    ToolRequestConfig, TruncationContinuationRequestParams,
 };
 #[cfg(test)]
 use self::request::{
-    build_reasoning_system_prompt, build_reasoning_system_prompt_with_notify_guidance,
-    build_tool_continuation_system_prompt, decompose_tool_definition, reasoning_user_prompt,
-    tool_definitions_with_decompose,
+    build_reasoning_system_prompt, build_reasoning_system_prompt_with_agent_preferences,
+    build_reasoning_system_prompt_with_notify_guidance, build_tool_continuation_system_prompt,
+    build_tool_continuation_system_prompt_with_notify_guidance, decompose_tool_definition,
+    reasoning_user_prompt, tool_definitions_with_decompose,
 };
 #[cfg(test)]
 use self::retry::same_call_failure_reason;
-use self::retry::RetryTracker;
+use self::retry::{RetryTracker, ToolCallKey};
 use self::streaming::{StreamingRequestContext, TextStreamVisibility};
 use self::tool_execution::extract_tool_use_provider_ids;
 #[cfg(test)]
 use self::tool_execution::ToolRoundOutcome;
+use self::turn_control::{
+    FinalResponseValidationFacts, FinalResponseValidationOutcome, FinalResponseViolation,
+    TurnControlPlane,
+};
 
 #[cfg(test)]
 use self::tool_execution::{
@@ -118,8 +142,6 @@ use self::streaming::{
 };
 
 #[cfg(test)]
-use crate::act::ProceedUnderConstraints;
-#[cfg(test)]
 use crate::budget::{AllocationMode, BudgetAllocator, DepthMode};
 #[cfg(test)]
 use bounded_local::detect_turn_execution_profile;
@@ -129,7 +151,7 @@ use bounded_local::{
     BoundedLocalPhase, BoundedLocalTerminalReason, TurnExecutionProfile,
 };
 use continuation::{
-    commitment_tool_scope, render_turn_commitment_directive,
+    commitment_tool_scope, final_response_turn_commitment, render_turn_commitment_directive,
     tool_continuation_artifact_write_target, tool_continuation_turn_commitment,
     turn_commitment_metadata,
 };
@@ -295,8 +317,32 @@ impl<'a> CycleStream<'a> {
         self.emit(StreamEvent::PhaseChange { phase });
     }
 
+    fn phase_boundary(self, phase: TranscriptTurnPhase) {
+        self.emit(StreamEvent::TranscriptPhaseBoundary { phase });
+    }
+
     fn tool_call_start(self, call: &ToolCall) {
         self.emit(StreamEvent::ToolCallStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+        });
+    }
+
+    fn activity_start(self, id: &str, title: Option<String>) {
+        self.emit(StreamEvent::ActivityStart {
+            id: id.to_string(),
+            title,
+            kind: "tool_round".to_string(),
+        });
+    }
+
+    fn activity_end(self, id: &str) {
+        self.emit(StreamEvent::ActivityEnd { id: id.to_string() });
+    }
+
+    fn activity_tool_call_start(self, activity_id: &str, call: &ToolCall) {
+        self.emit(StreamEvent::ActivityToolCallStart {
+            activity_id: activity_id.to_string(),
             id: call.id.clone(),
             name: call.name.clone(),
         });
@@ -310,12 +356,49 @@ impl<'a> CycleStream<'a> {
         });
     }
 
+    fn activity_tool_call_complete(self, activity_id: &str, call: &ToolCall) {
+        self.emit(StreamEvent::ActivityToolCallComplete {
+            activity_id: activity_id.to_string(),
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.to_string(),
+        });
+    }
+
     fn tool_result(self, result: &ToolResult) {
         self.emit(StreamEvent::ToolResult {
             id: result.tool_call_id.clone(),
             tool_name: result.tool_name.clone(),
             output: result.output.clone(),
             is_error: !result.success,
+        });
+    }
+
+    fn activity_tool_result(self, activity_id: &str, result: &ToolResult) {
+        self.emit(StreamEvent::ActivityToolResult {
+            activity_id: activity_id.to_string(),
+            id: result.tool_call_id.clone(),
+            tool_name: result.tool_name.clone(),
+            output: result.output.clone(),
+            is_error: !result.success,
+        });
+    }
+
+    fn tool_progress(self, activity_id: Option<&str>, entry: &ToolProgressEntry) {
+        self.emit(StreamEvent::ToolProgress {
+            activity_id: activity_id.map(str::to_string),
+            id: entry.call_id.clone(),
+            tool_name: entry.tool_name.clone(),
+            class: entry.class.into(),
+            target: entry.target.clone(),
+            advances_slot: entry.advances_slot.clone(),
+            outcome: entry.outcome.into(),
+        });
+    }
+
+    fn completed_summary(self, text: &str) {
+        self.emit(StreamEvent::CompletedSummary {
+            text: text.to_string(),
         });
     }
 
@@ -339,6 +422,12 @@ impl<'a> CycleStream<'a> {
         });
     }
 
+    fn final_answer(self, response: &str) {
+        self.emit(StreamEvent::FinalAnswerDelta {
+            text: response.to_string(),
+        });
+    }
+
     fn done_result(self, result: &LoopResult) {
         if let Some(response) = result.stream_done_response() {
             self.done(&response);
@@ -357,6 +446,17 @@ fn build_user_message(snapshot: &PerceptionSnapshot, user_message: &str) -> Mess
         }
         _ => Message::user(user_message),
     }
+}
+
+fn normalize_turn_steer(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn turn_steering_guidance_message(steer: &str) -> String {
+    format!(
+        "Mid-turn user steering guidance (current turn only; do not treat this as a new queued task): {steer}"
+    )
 }
 
 /// Runtime loop status for `/loop` diagnostics.
@@ -455,20 +555,55 @@ impl LoopResult {
             ),
             Self::Incomplete {
                 partial_response, ..
-            } => Some(
+            } => {
+                // Incomplete turns without usable text should surface via the
+                // typed engine_error path, not as a fabricated final assistant
+                // answer. This keeps Swift from rendering placeholder failure
+                // text as completed work.
                 partial_response
                     .clone()
                     .filter(|text| !text.trim().is_empty())
-                    .unwrap_or_else(|| INCOMPLETE_FALLBACK_RESPONSE.to_string()),
-            ),
+            }
             Self::UserStopped {
                 partial_response, ..
             } => Some(
                 partial_response
                     .clone()
+                    .filter(|text| !text.trim().is_empty())
                     .unwrap_or_else(|| "user stopped".to_string()),
             ),
             Self::Error { .. } => None,
+        }
+    }
+
+    fn stream_final_answer_response(&self) -> Option<String> {
+        match self {
+            Self::Complete { response, .. } => Some(response.clone()),
+            Self::BudgetExhausted {
+                partial_response, ..
+            }
+            | Self::Incomplete {
+                partial_response, ..
+            } => partial_response
+                .clone()
+                .filter(|text| !text.trim().is_empty()),
+            Self::UserStopped { .. } | Self::Error { .. } => None,
+        }
+    }
+
+    fn stream_terminal_error(&self) -> Option<(ErrorCategory, String, bool)> {
+        match self {
+            Self::Incomplete {
+                partial_response,
+                reason,
+                ..
+            } if partial_response
+                .as_ref()
+                .is_none_or(|text| text.trim().is_empty()) =>
+            {
+                Some((ErrorCategory::System, reason.clone(), false))
+            }
+            _ => None,
         }
     }
 }
@@ -478,6 +613,83 @@ enum ExecutionVisibility {
     #[default]
     Public,
     Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnContract {
+    deliverables: Vec<RootTurnDeliverable>,
+    blocked_terminal_attempts: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootTurnDeliverable {
+    ResponseSection {
+        label: String,
+        normalized_label: String,
+    },
+    ArtifactWrite {
+        path: String,
+        satisfied: bool,
+    },
+    ExternalAction {
+        kind: RootTurnExternalActionKind,
+        label: String,
+        satisfied: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)]
+enum RootTurnExternalActionKind {
+    GitHubPrComment,
+    GitHubIssueComment,
+    GitHubPrReview,
+    GitPush,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnCompletionBlock {
+    missing_response_sections: Vec<String>,
+    pending_artifact_paths: Vec<String>,
+    pending_external_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootTurnContractExtraction {
+    contract: Option<RootTurnContract>,
+    deliverable_block_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliverableSectionParse {
+    labels: Vec<String>,
+    block_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContract {
+    inputs: Vec<InputRequirement>,
+    phase: TaskPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputRequirement {
+    description: String,
+    normalized_description: String,
+    satisfied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskPhase {
+    Gathering,
+    Synthesizing,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContractExtraction {
+    contract: Option<TaskContract>,
+    visible_text: Option<String>,
 }
 
 /// Core orchestrator for the 7-step agentic loop.
@@ -494,14 +706,18 @@ pub struct LoopEngine {
     max_iterations: u32,
     iteration_count: u32,
     synthesis_instruction: String,
+    agent_preferences: Option<String>,
     memory_context: Option<String>,
+    execution_context: Option<ExecutionContext>,
     session_memory: Arc<Mutex<SessionMemory>>,
     scratchpad_context: Option<String>,
     signals: SignalCollector,
+    signal_store: Option<Box<dyn SignalSink>>,
     cancel_token: Option<CancellationToken>,
     input_channel: Option<LoopInputChannel>,
     user_stop_requested: bool,
-    pending_steer: Option<String>,
+    active_turn_steer: Option<String>,
+    pending_flow_command: Option<LoopCommand>,
     event_bus: Option<fx_core::EventBus>,
     execution_visibility: ExecutionVisibility,
     compaction_config: CompactionConfig,
@@ -517,15 +733,39 @@ pub struct LoopEngine {
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     /// Cycle-scoped; `prepare_cycle()` resets it, so child cycles start fresh.
     consecutive_tool_turns: u16,
-    /// Consecutive tool rounds that used only non-side-effecting tools.
-    consecutive_observation_only_rounds: u16,
+    /// Cycle-scoped repetitive observation tracking for the observation-only gate.
+    observation_round_tracker: ObservationRoundTracker,
+    /// Cycle-scoped typed task-progress ledger for tool rounds.
+    ///
+    /// This is the control-plane primitive behind observation restrictions:
+    /// methodical read-only work should stay allowed while it advances distinct
+    /// evidence slots; repeated or ungrounded work accumulates pressure.
+    turn_progress_ledger: TurnProgressLedger,
+    /// Recent completed-cycle signals kept only for bounded prompt feedback.
+    recent_signal_cycles: VecDeque<Vec<Signal>>,
     /// Latest reasoning input messages for graceful budget-exhausted synthesis.
     /// Stored on `LoopEngine` because `perceive()` only has `&mut self`.
     last_reasoning_messages: Vec<Message>,
+    /// Last feedback advisory injected during the active cycle.
+    last_signal_feedback_summary: Option<String>,
     /// Tool retry tracker for the current cycle.
     tool_retry_tracker: RetryTracker,
+    /// Latest failed-tool signal ID for each retry signature in the current cycle.
+    /// Bounded by the number of distinct tool signatures seen in a single cycle.
+    last_tool_failure_signal_ids: HashMap<ToolCallKey, u64>,
+    /// Circuit breaker for repeated tool failures across outer-loop iterations.
+    repeated_tool_failure_tracker: RepeatedToolFailureTracker,
     /// Whether a successful `notify` tool call occurred during the current cycle.
     notify_called_this_cycle: bool,
+    /// Whether this cycle already emitted the terminal answer over the typed
+    /// final-answer stream. `done` carries text for lifecycle compatibility,
+    /// but UI reducers need this explicit channel to keep answer text out of
+    /// work-summary narration.
+    final_answer_streamed_this_cycle: bool,
+    /// Last high-level transcript phase emitted this cycle. This intentionally
+    /// differs from low-level loop phases (`perceive`, `reason`, `act`) so UI
+    /// clients can render transcript chunks without guessing from kernel steps.
+    transcript_turn_phase: Option<TranscriptTurnPhase>,
     /// Whether this cycle currently has an active notification delivery channel.
     notify_tool_guidance_enabled: bool,
     /// Shared iteration counter for scratchpad age tracking.
@@ -534,12 +774,34 @@ pub struct LoopEngine {
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     /// Provider-specific tool output item identifiers keyed by stable tool call id.
     tool_call_provider_ids: HashMap<String, String>,
+    /// Structured diagnostics captured for the latest executed tool results.
+    pending_tool_result_diagnostics: HashMap<String, ToolExecutionDiagnostics>,
+    /// Structured runtime signals emitted by loadable tools for the latest results.
+    pending_tool_result_signals: HashMap<String, Vec<Signal>>,
     /// Mixed text emitted alongside tool calls before tool execution begins.
     pending_tool_response_text: Option<String>,
     /// Optional scoped tool surface for the next root reasoning pass.
     pending_tool_scope: Option<ContinuationToolScope>,
     /// Optional typed turn commitment for the next root reasoning pass.
     pending_turn_commitment: Option<TurnCommitment>,
+    /// Cycle-scoped retry pressure for final-response protocol violations.
+    final_response_blocked_attempts: u8,
+    /// Cycle-scoped marker that the provider attempted tool activity while the
+    /// kernel was in final-response mode. The decide step can observe this
+    /// violation before the terminal completion gate sees the response text.
+    final_response_attempted_tool_activity: bool,
+    /// Cycle-scoped marker that the final-response candidate ended with a
+    /// non-terminal stop reason. Final output must be complete before the
+    /// kernel can accept it as the turn's terminal answer.
+    final_response_candidate_truncated: bool,
+    /// Kernel-owned first-route plan for external-resource requests.
+    preflight_route_plan: Option<RoutePlan>,
+    /// Advisory-only cross-session route memories loaded from typed memory surfaces.
+    route_advisories: Vec<RouteAdvisory>,
+    /// Typed completion contract for the active root turn, when the prompt declares one.
+    root_turn_contract: Option<RootTurnContract>,
+    /// Active task-input lifecycle contract for the current root turn, when declared by the model.
+    task_contract: Option<TaskContract>,
     /// Explicit artifact path requested by the user for this turn, if any.
     requested_artifact_target: Option<String>,
     /// Active gate requiring the next root pass to write the requested artifact first.
@@ -553,8 +815,20 @@ pub struct LoopEngine {
     error_callback: Option<StreamCallback>,
     /// Extended thinking configuration forwarded to completion requests.
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    /// Runtime snapshot used to surface loaded skill summaries in prompts.
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
+    /// Revision counter for cached runtime skill summaries.
+    runtime_skill_prompt_revision: Option<Arc<AtomicU64>>,
+    cached_runtime_skill_prompt_revision: u64,
+    cached_runtime_skill_prompt_summaries: Vec<SkillPromptSummary>,
     /// Whether this runner may expose and honor the kernel-level decompose tool.
     decompose_enabled: bool,
+    /// Whether experimental Graph-of-Thoughts decomposition is allowed.
+    ///
+    /// GoT is intentionally dormant by default. It remains available only to
+    /// explicit internal experiments so ordinary agent runs keep one typed
+    /// decomposition contract.
+    graph_of_thoughts_enabled: bool,
     /// Root-turn ownership for direct-inspection classification during decomposition.
     direct_inspection_ownership: DirectInspectionOwnership,
     /// Turn-scoped routing profile for bounded local work vs. general tasks.
@@ -577,16 +851,29 @@ impl std::fmt::Debug for LoopEngine {
             .field("max_iterations", &self.max_iterations)
             .field("iteration_count", &self.iteration_count)
             .field("memory_context", &self.memory_context)
+            .field("execution_context", &self.execution_context)
             .field("session_memory", &"SessionMemory")
             .field("scratchpad_context", &self.scratchpad_context)
+            .field("signal_store", &self.signal_store.is_some())
             .field("compaction_config", &self.compaction_config)
             .field("budget_low_signaled", &self.budget_low_signaled)
             .field("consecutive_tool_turns", &self.consecutive_tool_turns)
+            .field("observation_round_tracker", &self.observation_round_tracker)
+            .field("turn_progress_ledger", &self.turn_progress_ledger)
+            .field("recent_signal_cycles", &self.recent_signal_cycles.len())
             .field(
-                "consecutive_observation_only_rounds",
-                &self.consecutive_observation_only_rounds,
+                "last_signal_feedback_summary",
+                &self.last_signal_feedback_summary,
             )
             .field("tool_retry_tracker", &self.tool_retry_tracker)
+            .field(
+                "last_tool_failure_signal_ids",
+                &self.last_tool_failure_signal_ids.len(),
+            )
+            .field(
+                "repeated_tool_failure_tracker",
+                &self.repeated_tool_failure_tracker,
+            )
             .field("notify_called_this_cycle", &self.notify_called_this_cycle)
             .field(
                 "notify_tool_guidance_enabled",
@@ -594,6 +881,22 @@ impl std::fmt::Debug for LoopEngine {
             )
             .field("pending_tool_scope", &self.pending_tool_scope)
             .field("pending_turn_commitment", &self.pending_turn_commitment)
+            .field(
+                "final_response_blocked_attempts",
+                &self.final_response_blocked_attempts,
+            )
+            .field(
+                "final_response_attempted_tool_activity",
+                &self.final_response_attempted_tool_activity,
+            )
+            .field(
+                "final_response_candidate_truncated",
+                &self.final_response_candidate_truncated,
+            )
+            .field("preflight_route_plan", &self.preflight_route_plan)
+            .field("route_advisories", &self.route_advisories.len())
+            .field("root_turn_contract", &self.root_turn_contract)
+            .field("task_contract", &self.task_contract)
             .field("requested_artifact_target", &self.requested_artifact_target)
             .field(
                 "pending_artifact_write_target",
@@ -604,6 +907,25 @@ impl std::fmt::Debug for LoopEngine {
             .field(
                 "last_emitted_public_progress",
                 &self.last_emitted_public_progress,
+            )
+            .field(
+                "runtime_info",
+                &self.runtime_info.as_ref().map(|_| "RuntimeInfo"),
+            )
+            .field(
+                "runtime_skill_prompt_revision",
+                &self
+                    .runtime_skill_prompt_revision
+                    .as_ref()
+                    .map(|_| "AtomicU64"),
+            )
+            .field(
+                "cached_runtime_skill_prompt_revision",
+                &self.cached_runtime_skill_prompt_revision,
+            )
+            .field(
+                "cached_runtime_skill_prompt_summaries",
+                &self.cached_runtime_skill_prompt_summaries.len(),
             )
             .field(
                 "direct_inspection_ownership",
@@ -670,6 +992,7 @@ pub struct LoopEngineBuilder {
     tool_executor: Option<Arc<dyn ToolExecutor>>,
     max_iterations: Option<u32>,
     synthesis_instruction: Option<String>,
+    agent_preferences: Option<String>,
     compaction_config: Option<CompactionConfig>,
     compaction_llm: Option<Arc<dyn LlmProvider>>,
     memory_flush: Option<Arc<dyn CompactionMemoryFlush>>,
@@ -678,12 +1001,17 @@ pub struct LoopEngineBuilder {
     input_channel: Option<LoopInputChannel>,
     memory_context: Option<String>,
     session_memory: Option<Arc<Mutex<SessionMemory>>>,
+    route_advisories: Vec<RouteAdvisory>,
     scratchpad_context: Option<String>,
+    signal_store: Option<Box<dyn SignalSink>>,
     iteration_counter: Option<Arc<AtomicU32>>,
     scratchpad_provider: Option<Arc<dyn ScratchpadProvider>>,
     error_callback: Option<StreamCallback>,
     thinking_config: Option<fx_llm::ThinkingConfig>,
+    runtime_info: Option<Arc<RwLock<RuntimeInfo>>>,
+    runtime_skill_prompt_revision: Option<Arc<AtomicU64>>,
     decompose_enabled: Option<bool>,
+    graph_of_thoughts_enabled: Option<bool>,
     execution_visibility: ExecutionVisibility,
 }
 
@@ -698,6 +1026,10 @@ impl std::fmt::Debug for LoopEngineBuilder {
             )
             .field("max_iterations", &self.max_iterations)
             .field("synthesis_instruction", &self.synthesis_instruction)
+            .field(
+                "agent_preferences",
+                &self.agent_preferences.as_ref().map(|_| "<configured>"),
+            )
             .field("compaction_config", &self.compaction_config)
             .field(
                 "compaction_llm",
@@ -711,7 +1043,9 @@ impl std::fmt::Debug for LoopEngineBuilder {
             .field("cancel_token", &self.cancel_token)
             .field("input_channel", &self.input_channel)
             .field("memory_context", &self.memory_context)
+            .field("route_advisories", &self.route_advisories.len())
             .field("scratchpad_context", &self.scratchpad_context)
+            .field("signal_store", &self.signal_store.is_some())
             .field("iteration_counter", &self.iteration_counter)
             .field(
                 "scratchpad_provider",
@@ -721,6 +1055,17 @@ impl std::fmt::Debug for LoopEngineBuilder {
                     .map(|_| "ScratchpadProvider"),
             )
             .field("thinking_config", &self.thinking_config)
+            .field(
+                "runtime_info",
+                &self.runtime_info.as_ref().map(|_| "RuntimeInfo"),
+            )
+            .field(
+                "runtime_skill_prompt_revision",
+                &self
+                    .runtime_skill_prompt_revision
+                    .as_ref()
+                    .map(|_| "AtomicU64"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -748,6 +1093,16 @@ impl LoopEngineBuilder {
 
     pub fn synthesis_instruction(mut self, synthesis_instruction: impl Into<String>) -> Self {
         self.synthesis_instruction = Some(synthesis_instruction.into());
+        self
+    }
+
+    pub fn agent_preferences(mut self, agent_preferences: impl Into<String>) -> Self {
+        let agent_preferences = agent_preferences.into();
+        self.agent_preferences = if agent_preferences.trim().is_empty() {
+            None
+        } else {
+            Some(agent_preferences)
+        };
         self
     }
 
@@ -801,6 +1156,19 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn signal_store<S>(mut self, signal_store: S) -> Self
+    where
+        S: SignalSink + 'static,
+    {
+        self.signal_store = Some(Box::new(signal_store));
+        self
+    }
+
+    pub fn route_advisories(mut self, advisories: Vec<RouteAdvisory>) -> Self {
+        self.route_advisories = advisories;
+        self
+    }
+
     pub fn iteration_counter(mut self, counter: Arc<AtomicU32>) -> Self {
         self.iteration_counter = Some(counter);
         self
@@ -821,8 +1189,23 @@ impl LoopEngineBuilder {
         self
     }
 
+    pub fn runtime_info(mut self, runtime_info: Arc<RwLock<RuntimeInfo>>) -> Self {
+        self.runtime_info = Some(runtime_info);
+        self
+    }
+
+    pub fn runtime_skill_prompt_revision(mut self, revision: Arc<AtomicU64>) -> Self {
+        self.runtime_skill_prompt_revision = Some(revision);
+        self
+    }
+
     pub fn allow_decompose(mut self, enabled: bool) -> Self {
         self.decompose_enabled = Some(enabled);
+        self
+    }
+
+    pub fn allow_graph_of_thoughts(mut self, enabled: bool) -> Self {
+        self.graph_of_thoughts_enabled = Some(enabled);
         self
     }
 
@@ -846,21 +1229,25 @@ impl LoopEngineBuilder {
             .unwrap_or_else(|| default_session_memory(compaction_config.model_context_limit));
         configure_session_memory(&session_memory, compaction_config.model_context_limit);
 
-        Ok(LoopEngine {
+        let mut engine = LoopEngine {
             budget,
             context,
             tool_executor,
             max_iterations,
             iteration_count: 0,
             synthesis_instruction,
+            agent_preferences: self.agent_preferences,
             memory_context: self.memory_context,
+            execution_context: None,
             session_memory,
             scratchpad_context: self.scratchpad_context,
             signals: SignalCollector::default(),
+            signal_store: self.signal_store,
             cancel_token: self.cancel_token,
             input_channel: self.input_channel,
             user_stop_requested: false,
-            pending_steer: None,
+            active_turn_steer: None,
+            pending_flow_command: None,
             event_bus: self.event_bus,
             execution_visibility: self.execution_visibility,
             compaction_config,
@@ -870,17 +1257,33 @@ impl LoopEngineBuilder {
             compaction_last_iteration: Mutex::new(HashMap::new()),
             budget_low_signaled: false,
             consecutive_tool_turns: 0,
-            consecutive_observation_only_rounds: 0,
+            observation_round_tracker: ObservationRoundTracker::default(),
+            turn_progress_ledger: TurnProgressLedger::default(),
+            recent_signal_cycles: VecDeque::new(),
             last_reasoning_messages: Vec::new(),
+            last_signal_feedback_summary: None,
             tool_retry_tracker: RetryTracker::default(),
+            last_tool_failure_signal_ids: HashMap::with_capacity(8),
+            repeated_tool_failure_tracker: RepeatedToolFailureTracker::default(),
             notify_called_this_cycle: false,
+            final_answer_streamed_this_cycle: false,
+            transcript_turn_phase: None,
             notify_tool_guidance_enabled: false,
             iteration_counter: self.iteration_counter,
             scratchpad_provider: self.scratchpad_provider,
             tool_call_provider_ids: HashMap::new(),
+            pending_tool_result_diagnostics: HashMap::new(),
+            pending_tool_result_signals: HashMap::new(),
             pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
+            final_response_blocked_attempts: 0,
+            final_response_attempted_tool_activity: false,
+            final_response_candidate_truncated: false,
+            preflight_route_plan: None,
+            route_advisories: self.route_advisories,
+            root_turn_contract: None,
+            task_contract: None,
             requested_artifact_target: None,
             pending_artifact_write_target: None,
             last_turn_state_progress: None,
@@ -888,7 +1291,12 @@ impl LoopEngineBuilder {
             last_emitted_public_progress: None,
             error_callback: self.error_callback,
             thinking_config: self.thinking_config,
+            runtime_info: self.runtime_info,
+            runtime_skill_prompt_revision: self.runtime_skill_prompt_revision,
+            cached_runtime_skill_prompt_revision: 0,
+            cached_runtime_skill_prompt_summaries: Vec::new(),
             decompose_enabled: self.decompose_enabled.unwrap_or(true),
+            graph_of_thoughts_enabled: self.graph_of_thoughts_enabled.unwrap_or(false),
             direct_inspection_ownership: DirectInspectionOwnership::DetectFromTurn,
             turn_execution_profile: TurnExecutionProfile::Standard,
             bounded_local_phase: BoundedLocalPhase::Discovery,
@@ -896,7 +1304,32 @@ impl LoopEngineBuilder {
             bounded_local_recovery_focus: Vec::new(),
             bounded_local_terminal_reason: None,
             channel_registry: ChannelRegistry::new(),
+        };
+
+        if engine.runtime_info.is_some() || engine.runtime_skill_prompt_revision.is_some() {
+            engine.refresh_runtime_skill_prompt_summaries();
+        }
+
+        Ok(engine)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionContext {
+    working_dir: String,
+}
+
+impl ExecutionContext {
+    pub fn new(working_dir: impl Into<String>) -> Option<Self> {
+        let working_dir = working_dir.into();
+        let trimmed = working_dir.trim();
+        (!trimmed.is_empty()).then(|| Self {
+            working_dir: trimmed.to_string(),
         })
+    }
+
+    pub fn working_dir(&self) -> &str {
+        &self.working_dir
     }
 }
 
@@ -958,12 +1391,321 @@ struct CycleState {
     tokens: TokenUsage,
 }
 
+#[derive(Debug, Default, Clone)]
+struct ObservationRoundTracker {
+    consecutive_observation_only_rounds: u16,
+    repetitive_rounds: u16,
+    seen_observation_fingerprints: HashSet<String>,
+}
+
+// Keep the cycle-scoped fingerprint set bounded. Once full, new fingerprints
+// degrade to "seen" so extreme fan-out does not retain unbounded state.
+const MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE: usize = 256;
+
+impl ObservationRoundTracker {
+    fn pressure_rounds(&self) -> u16 {
+        self.repetitive_rounds
+    }
+
+    fn record_observation_fingerprint(&mut self, fingerprint: String) -> bool {
+        if self.seen_observation_fingerprints.contains(&fingerprint) {
+            return true;
+        }
+
+        if self.seen_observation_fingerprints.len() >= MAX_OBSERVATION_FINGERPRINTS_PER_CYCLE {
+            return true;
+        }
+
+        self.seen_observation_fingerprints.insert(fingerprint);
+        false
+    }
+}
+
+impl TurnProgressLedger {
+    fn seed_explicit_evidence_slot(&mut self, label: impl Into<String>) -> Option<String> {
+        let label = sanitize_task_contract_label(&label.into());
+        let normalized = normalize_contract_label(&label);
+        if normalized.is_empty() {
+            return None;
+        }
+        let id = format!("evidence:required:{normalized}");
+        self.explicit_evidence_slot_ids.insert(id.clone());
+        self.evidence_slots
+            .entry(id.clone())
+            .or_insert_with(|| ProgressSlot {
+                id: id.clone(),
+                kind: ProgressSlotKind::Evidence,
+                label,
+                normalized_target: Some(normalized),
+                explicit: true,
+                status: ProgressSlotStatus::Open,
+                attempts: 0,
+                satisfied_by: Vec::new(),
+            });
+        Some(id)
+    }
+
+    fn seed_discovered_evidence_slot(&mut self, label: impl Into<String>) -> Option<String> {
+        const MAX_DISCOVERED_EVIDENCE_SLOTS: usize = 96;
+
+        // Labels are normalized into slot IDs so repeated references collapse
+        // into one obligation. The reference extractor strips line suffixes
+        // before calling this, so multiple `Foo.swift:line` hits become one
+        // "read Foo.swift" follow-up instead of a slot per line.
+        let label = sanitize_task_contract_label(&label.into());
+        let normalized = normalize_contract_label(&label);
+        if normalized.is_empty() {
+            return None;
+        }
+        let id = format!("evidence:discovered:{normalized}");
+        if self.evidence_slots.contains_key(&id) {
+            return Some(id);
+        }
+        let discovered_count = self
+            .evidence_slots
+            .values()
+            .filter(|slot| !slot.explicit)
+            .count();
+        if discovered_count >= MAX_DISCOVERED_EVIDENCE_SLOTS {
+            return None;
+        }
+        self.evidence_slots.insert(
+            id.clone(),
+            ProgressSlot {
+                id: id.clone(),
+                kind: ProgressSlotKind::Evidence,
+                label,
+                normalized_target: Some(normalized),
+                explicit: false,
+                status: ProgressSlotStatus::Open,
+                attempts: 0,
+                satisfied_by: Vec::new(),
+            },
+        );
+        Some(id)
+    }
+
+    fn seed_task_contract(&mut self, contract: &TaskContract) {
+        for input in &contract.inputs {
+            self.seed_explicit_evidence_slot(&input.description);
+        }
+    }
+
+    fn has_explicit_evidence_slots(&self) -> bool {
+        !self.explicit_evidence_slot_ids.is_empty()
+    }
+
+    fn has_open_discovered_evidence_slots(&self) -> bool {
+        // Discovered slots are bounded by MAX_DISCOVERED_EVIDENCE_SLOTS, so a
+        // scan keeps the ledger simpler than a counter that must stay in sync
+        // with every status transition.
+        self.evidence_slots
+            .values()
+            .any(|slot| !slot.explicit && slot.status == ProgressSlotStatus::Open)
+    }
+
+    fn open_explicit_evidence_slots(&self) -> Vec<String> {
+        let mut labels = self
+            .explicit_evidence_slot_ids
+            .iter()
+            .filter_map(|id| {
+                self.evidence_slots.get(id).and_then(|slot| {
+                    (slot.status != ProgressSlotStatus::Satisfied).then(|| slot.label.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels
+    }
+
+    fn matching_open_evidence_slot(&self, observation: &str) -> Option<String> {
+        self.evidence_slots
+            .values()
+            .filter(|slot| slot.status != ProgressSlotStatus::Satisfied)
+            .find(|slot| {
+                slot.normalized_target
+                    .as_deref()
+                    .is_some_and(|target| evidence_target_matches_observation(target, observation))
+            })
+            .map(|slot| slot.id.clone())
+    }
+
+    fn slot_is_explicit(&self, slot_id: &str) -> bool {
+        self.explicit_evidence_slot_ids.contains(slot_id)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TurnProgressLedger {
+    evidence_slots: HashMap<String, ProgressSlot>,
+    mutation_slots: HashMap<String, ProgressSlot>,
+    explicit_evidence_slot_ids: HashSet<String>,
+    generic_observation_scope_attempts: HashMap<String, u16>,
+    tool_entries: Vec<ToolProgressEntry>,
+    seen_retryable_failures: HashSet<String>,
+    unproductive_observation_rounds: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressSlot {
+    id: String,
+    kind: ProgressSlotKind,
+    label: String,
+    normalized_target: Option<String>,
+    explicit: bool,
+    status: ProgressSlotStatus,
+    attempts: u16,
+    satisfied_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressSlotKind {
+    Evidence,
+    Mutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressSlotStatus {
+    Open,
+    Satisfied,
+    RetryableFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolProgressEntry {
+    call_id: String,
+    tool_name: String,
+    class: ToolProgressClass,
+    target: Option<String>,
+    advances_slot: Option<String>,
+    outcome: ToolProgressOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolProgressClass {
+    Observation,
+    Mutation,
+}
+
+impl From<ToolProgressClass> for StreamToolProgressClass {
+    fn from(value: ToolProgressClass) -> Self {
+        match value {
+            ToolProgressClass::Observation => Self::Observation,
+            ToolProgressClass::Mutation => Self::Mutation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolProgressOutcome {
+    Advanced,
+    Duplicate,
+    RetryableFailure,
+}
+
+impl From<ToolProgressOutcome> for StreamToolProgressOutcome {
+    fn from(value: ToolProgressOutcome) -> Self {
+        match value {
+            ToolProgressOutcome::Advanced => Self::Advanced,
+            ToolProgressOutcome::Duplicate => Self::Duplicate,
+            ToolProgressOutcome::RetryableFailure => Self::RetryableFailure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailure {
+    key: RepeatedToolFailureKey,
+    summary: String,
+    last_output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureKey {
+    tool_name: String,
+    failure_class: FailureClass,
+    kind: RepeatedToolFailureKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatedToolFailureKind {
+    MalformedArgumentsJson,
+    /// Hash of a normalized non-malformed tool error payload.
+    OutputHash(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureState {
+    failure: RepeatedToolFailure,
+    consecutive_failures: u16,
+    guidance_injected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatedToolFailureEvent {
+    InjectGuidance(RepeatedToolFailureState),
+    Trip(RepeatedToolFailureState),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RepeatedToolFailureTracker {
+    /// Tracks one active failure family at a time. Alternating failure families
+    /// intentionally reset the breaker so it only trips on repeated same-family
+    /// loops rather than conflating broader instability patterns.
+    active: Option<RepeatedToolFailureState>,
+}
+
+impl RepeatedToolFailureTracker {
+    fn observe_action(
+        &mut self,
+        results: &[ToolResult],
+        threshold: u16,
+    ) -> Option<RepeatedToolFailureEvent> {
+        let Some((failure, count)) = repeated_tool_failure_from_results(results) else {
+            self.active = None;
+            return None;
+        };
+
+        let mut state = match self.active.take() {
+            Some(active) if active.failure.key == failure.key => RepeatedToolFailureState {
+                failure,
+                consecutive_failures: active.consecutive_failures.saturating_add(count),
+                guidance_injected: active.guidance_injected,
+            },
+            _ => RepeatedToolFailureState {
+                failure,
+                consecutive_failures: count,
+                guidance_injected: false,
+            },
+        };
+
+        let event = if !state.guidance_injected && state.consecutive_failures >= threshold {
+            state.guidance_injected = true;
+            Some(RepeatedToolFailureEvent::InjectGuidance(state.clone()))
+        } else if state.guidance_injected && state.consecutive_failures > threshold {
+            Some(RepeatedToolFailureEvent::Trip(state.clone()))
+        } else {
+            None
+        };
+
+        self.active = Some(state);
+        event
+    }
+
+    fn clear(&mut self) {
+        self.active = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ToolRoundState {
     all_tool_results: Vec<ToolResult>,
+    latest_tool_results: Vec<ToolResult>,
     current_calls: Vec<ToolCall>,
+    pending_policy_deferred_calls: Vec<ToolCall>,
     continuation_messages: Vec<Message>,
     evidence_messages: Vec<Message>,
+    pending_round_notices: Vec<String>,
     accumulated_text: Vec<String>,
     tokens_used: TokenUsage,
     observation_replan_attempted: bool,
@@ -972,12 +1714,33 @@ struct ToolRoundState {
 }
 
 impl ToolRoundState {
+    #[cfg(test)]
     fn new(calls: &[ToolCall], context_messages: &[Message], initial_text: Option<String>) -> Self {
         Self {
             all_tool_results: Vec::new(),
+            latest_tool_results: Vec::new(),
             current_calls: calls.to_vec(),
+            pending_policy_deferred_calls: Vec::new(),
             continuation_messages: context_messages.to_vec(),
             evidence_messages: Vec::new(),
+            pending_round_notices: Vec::new(),
+            accumulated_text: initial_text.into_iter().collect(),
+            tokens_used: TokenUsage::default(),
+            observation_replan_attempted: false,
+            used_observation_tools: false,
+            used_mutation_tools: false,
+        }
+    }
+
+    fn new_empty_calls(context_messages: &[Message], initial_text: Option<String>) -> Self {
+        Self {
+            all_tool_results: Vec::new(),
+            latest_tool_results: Vec::new(),
+            current_calls: Vec::new(),
+            pending_policy_deferred_calls: Vec::new(),
+            continuation_messages: context_messages.to_vec(),
+            evidence_messages: Vec::new(),
+            pending_round_notices: Vec::new(),
             accumulated_text: initial_text.into_iter().collect(),
             tokens_used: TokenUsage::default(),
             observation_replan_attempted: false,
@@ -994,11 +1757,85 @@ struct FollowUpDecomposeContext {
     accumulated_text: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ContextWindowStats {
+    message_count: usize,
+    token_count: usize,
+    usage_ratio: f32,
+}
+
+impl ContextWindowStats {
+    fn capture(engine: &LoopEngine, messages: &[Message]) -> Self {
+        Self {
+            message_count: messages.len(),
+            token_count: ConversationBudget::estimate_tokens(messages),
+            usage_ratio: engine.conversation_budget.usage_ratio(messages),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ContextOverflowSignalMetadata {
+    scope: &'static str,
+    messages_before: usize,
+    messages_after: usize,
+    messages_removed: usize,
+    tokens_before: usize,
+    tokens_after: usize,
+    tokens_evicted: usize,
+    usage_ratio_before: f32,
+    usage_ratio_after: f32,
+}
+
+#[derive(Serialize)]
+struct TimeoutSignalMetadata<'a> {
+    decision_kind: ControlPlaneDecisionKind,
+    tool: &'a str,
+    tool_call_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<&'static str>,
+    permanent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct TurnStopSignalMetadata<'a> {
+    decision_kind: ControlPlaneDecisionKind,
+    decision: &'static str,
+    failed: bool,
+    result_kind: &'static str,
+    stop_reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iterations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recoverable: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DecomposeToolArguments {
+    #[serde(default)]
     sub_goals: Vec<DecomposeSubGoalArguments>,
     #[serde(default)]
     strategy: Option<AggregationStrategy>,
+    #[serde(default)]
+    reasoning_mode: Option<DecomposeReasoningMode>,
+    #[serde(default)]
+    got_branches: Option<usize>,
+    #[serde(default)]
+    got_criteria: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DecomposeReasoningMode {
+    Standard,
+    GotChain,
+    GotTree,
+    GotGraph,
+    GotConsensus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1026,6 +1863,7 @@ impl From<DecomposeSubGoalArguments> for SubGoal {
 const REASONING_OUTPUT_TOKEN_HEURISTIC: u64 = 192;
 const TOOL_SYNTHESIS_TOKEN_HEURISTIC: u64 = 320;
 const REASONING_MAX_OUTPUT_TOKENS: u32 = 4096;
+const TERMINAL_SYNTHESIS_MAX_OUTPUT_TOKENS: u32 = 8192;
 const REASONING_TEMPERATURE: f32 = 0.2;
 const MAX_CONTINUATION_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_ACTION_COST_CENTS: u64 = 2;
@@ -1043,9 +1881,13 @@ Use tools when you need information not already in the conversation \
 (current time, file contents, directory listings, search results, memory, etc.). \
 When the user's request relates to an available tool's purpose, prefer calling the tool \
 over answering from general knowledge. \
-After using tools, respond with the answer. Never narrate what tools you used, \
-describe the process, or comment on tool output metadata. \
-Never narrate your process, hedge with qualifiers, or reference tool mechanics. \
+While a tool-using turn is still in progress, assistant text immediately before tool calls \
+is live work narration for the UI. Use that channel to give a concise, natural update about \
+what you are checking, comparing, or trying to resolve next. Do not mention raw tool names, \
+JSON, or implementation mechanics in that narration. \
+After using tools, final answers should answer directly. In final answers, never narrate what \
+tools you used, describe the process, or comment on tool output metadata. \
+Do not hedge with qualifiers or reference tool mechanics. \
 Avoid filler openers like \"I notice\", \"I can see that\", \"Based on the results\", \
 \"It appears that\", \"Let me\", or \"I aim to\". Just answer the question. \
 If the user makes a statement (not a question), acknowledge it naturally and briefly. \
@@ -1059,11 +1901,23 @@ Do not burn through your tool retry limit in a single sequential loop \
 ; decompose first, then execute. \
 ";
 
+const TERMINAL_SYNTHESIS_SYSTEM_PROMPT: &str = "You are Fawx in terminal answer mode. \
+Tool execution is closed for this turn. \
+You cannot call tools, request function calls, plan another tool step, or ask the runtime to continue execution. \
+Use only the conversation text and observed tool-result evidence already provided in this request. \
+If the evidence is incomplete, state the limitation directly and answer with the supported findings. \
+Do not mention raw tool names, JSON, function calls, or provider mechanics. \
+Do not write future-looking progress narration such as \"I will check\" or \"next I need to\". \
+Produce the final user-facing answer now.";
+
 const TOOL_CONTINUATION_DIRECTIVE: &str = "\n\nYou are continuing after one or more tool calls. \
 Treat successful tool results as the primary evidence for your next response. \
 If the existing tool results already answer the user's request, answer immediately instead of calling more tools. \
 Only call another tool when the current results are missing critical information, are contradictory, or the user explicitly asked you to refresh/re-check something. \
+If you do call more tools, first write one short live work narration update that states what the prior evidence showed and what specific gap you are closing next. \
 Never repeat an identical successful tool call in the same cycle. Reuse the result you already have and answer from it.";
+
+const TASK_CONTRACT_DECLARATION_DIRECTIVE: &str = "\n\nIf you are about to gather information with tools before you can answer, start that first tool-using response with an internal block exactly like:\nTask plan:\n- <required input 1>\n- <required input 2>\n\nList only the concrete inputs, files, documents, or records you still need. Do not list tools or implementation steps. After the block, request only the tools needed to satisfy those inputs.";
 
 const NOTIFY_TOOL_GUIDANCE: &str = "\n\nYou have a `notify` tool that sends native OS notifications to the user. \
 Use it when you complete a task that took multiple steps, have important results to share, or finish background work the user may not be watching. \
@@ -1081,14 +1935,14 @@ understands what present-you built. Write what you wish past-you had left behind
 const BUDGET_LOW_WRAP_UP_DIRECTIVE: &str = "You are running low on budget. \
 Do not call any tools. Do not decompose. \
 Summarize what you have accomplished and what remains undone. Be concise.";
-const BUDGET_EXHAUSTED_SYNTHESIS_DIRECTIVE: &str = "\n\nYour tool budget is exhausted. Provide a final response summarizing what you've found and accomplished.";
+const TERMINAL_SYNTHESIS_DIRECTIVE: &str = "\n\nTerminal response contract: answer now from the provided evidence only. Do not call tools or request further inspection.";
 const BUDGET_EXHAUSTED_FALLBACK_RESPONSE: &str = "I reached my iteration limit.";
-const INCOMPLETE_FALLBACK_RESPONSE: &str = "I couldn't complete that run.";
 const TOOL_TURN_NUDGE: &str = "You've been working for several steps without responding. Share your progress with the user before continuing.";
 const TOOL_ROUND_PROGRESS_NUDGE: &str = "You've been calling tools for several rounds without providing a response. Share your progress with the user now. If you have enough information to answer, do so immediately instead of calling more tools.";
 const OBSERVATION_ONLY_TOOL_ROUND_NUDGE: &str = "You have spent multiple tool rounds only gathering information. Stop doing more read-only research unless it is absolutely necessary. If you have enough context, switch to implementation-side tools now. Otherwise, respond with what you learned, what remains blocked, and what input you need.";
 const OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE: &str = "Read-only tool calls were blocked after repeated observation-only rounds. Do not request any more read-only tools. Use the remaining mutation/build/install tools now if you have enough context to proceed. If you still cannot proceed, answer with the current findings and the specific blocker.";
 const OBSERVATION_ONLY_CALL_BLOCK_REASON: &str = "read-only inspection is disabled after repeated observation-only rounds; use a mutating/build/install step or answer with current findings";
+const MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER: &str = "arguments could not be parsed as valid JSON";
 const DIRECT_INSPECTION_TASK_DIRECTIVE: &str = "\n\nThis turn is a direct local inspection request. Do not plan. Do not decompose. Use only the provided observation tools to inspect the explicit local path the user named. If the tool results answer the request, answer directly from that evidence. Do not broaden the task into repo research, code modification, testing, command execution, or web work.";
 const DIRECT_INSPECTION_READ_LOCAL_PATH_PHASE_DIRECTIVE: &str = "\n\nDirect inspection focus: read_local_path.\nUse `read_file` to inspect the explicit local path the user requested. Do not call unrelated tools or reopen the task as general research.";
 const BOUNDED_LOCAL_TASK_DIRECTIVE: &str = "\n\nThis turn is a bounded local workspace task. Do not use decompose. Do not reopen broad research. Prefer at most one read-only discovery pass, then move directly to the concrete local edit, write, command, or focused test needed to complete the task.";
@@ -1120,6 +1974,67 @@ fn tool_error_relay_directive(failed_tools: &[(&str, &str)]) -> String {
         .collect();
     format!("{}\n{}", TOOL_ERROR_RELAY_PREFIX, details.join("\n"))
 }
+
+pub(super) fn signal_metadata_value<T: Serialize>(metadata: T) -> serde_json::Value {
+    serde_json::to_value(metadata).expect("signal metadata should serialize")
+}
+
+fn turn_stop_signal_metadata(result: &LoopResult) -> TurnStopSignalMetadata<'_> {
+    match result {
+        LoopResult::Complete { iterations, .. } => TurnStopSignalMetadata {
+            decision_kind: ControlPlaneDecisionKind::TurnStop,
+            decision: "completed",
+            failed: false,
+            result_kind: "complete",
+            stop_reason: "complete",
+            iterations: Some(*iterations),
+            recoverable: None,
+        },
+        LoopResult::BudgetExhausted { iterations, .. } => TurnStopSignalMetadata {
+            decision_kind: ControlPlaneDecisionKind::TurnStop,
+            decision: "failed",
+            failed: true,
+            result_kind: "budget_exhausted",
+            stop_reason: "budget_exhausted",
+            iterations: Some(*iterations),
+            recoverable: None,
+        },
+        LoopResult::Incomplete {
+            reason, iterations, ..
+        } => TurnStopSignalMetadata {
+            decision_kind: ControlPlaneDecisionKind::TurnStop,
+            decision: "failed",
+            failed: true,
+            result_kind: "incomplete",
+            stop_reason: reason.as_str(),
+            iterations: Some(*iterations),
+            recoverable: None,
+        },
+        LoopResult::UserStopped { iterations, .. } => TurnStopSignalMetadata {
+            decision_kind: ControlPlaneDecisionKind::TurnStop,
+            decision: "stopped",
+            failed: false,
+            result_kind: "user_stopped",
+            stop_reason: "user_stopped",
+            iterations: Some(*iterations),
+            recoverable: None,
+        },
+        LoopResult::Error {
+            message,
+            recoverable,
+            ..
+        } => TurnStopSignalMetadata {
+            decision_kind: ControlPlaneDecisionKind::TurnStop,
+            decision: "failed",
+            failed: true,
+            result_kind: "error",
+            stop_reason: message.as_str(),
+            iterations: None,
+            recoverable: Some(*recoverable),
+        },
+    }
+}
+
 /// Maximum time to wait for a best-effort summary during emergency compaction.
 const EMERGENCY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1177,6 +2092,10 @@ impl LoopEngine {
         self.memory_context = normalize_memory_context(context);
     }
 
+    pub fn set_execution_context(&mut self, working_dir: impl Into<String>) {
+        self.execution_context = ExecutionContext::new(working_dir);
+    }
+
     pub fn replace_session_memory(&self, memory: SessionMemory) -> SessionMemory {
         let mut replacement = memory;
         replacement.set_context_limit(self.compaction_config.model_context_limit);
@@ -1194,6 +2113,10 @@ impl LoopEngine {
         }
     }
 
+    pub fn set_route_advisories(&mut self, advisories: Vec<RouteAdvisory>) {
+        self.route_advisories = advisories;
+    }
+
     pub fn set_scratchpad_context(&mut self, context: String) {
         self.scratchpad_context = if context.trim().is_empty() {
             None
@@ -1205,6 +2128,17 @@ impl LoopEngine {
     /// Set the extended thinking configuration for completion requests.
     pub fn set_thinking_config(&mut self, config: Option<fx_llm::ThinkingConfig>) {
         self.thinking_config = config;
+    }
+
+    /// Attach runtime info so request builders can surface loaded skill summaries.
+    pub fn set_runtime_info(&mut self, runtime_info: Arc<RwLock<RuntimeInfo>>) {
+        self.runtime_info = Some(runtime_info);
+        self.refresh_runtime_skill_prompt_summaries();
+    }
+
+    /// Clear the cached prompt summaries after mutating the runtime snapshot.
+    pub fn invalidate_runtime_skill_prompt_cache(&mut self) {
+        self.refresh_runtime_skill_prompt_summaries();
     }
 
     /// Return a reference to the channel registry.
@@ -1249,6 +2183,212 @@ impl LoopEngine {
         }
     }
 
+    fn request_build_context(&mut self) -> RequestBuildContext<'_> {
+        self.sync_runtime_skill_prompt_summaries();
+        let signal_feedback_summary = self.current_signal_feedback_summary();
+        let skill_prompt_summaries = self.runtime_skill_prompt_summaries();
+        RequestBuildContext::new(
+            self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
+            self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
+        )
+        .with_execution_context(self.execution_context.as_ref())
+        .with_agent_preferences(self.agent_preferences.as_deref())
+        .with_skill_prompt_summaries(skill_prompt_summaries)
+        .with_signal_feedback_summary(signal_feedback_summary)
+        .with_prompt_cache_affinity(self.prompt_cache_affinity())
+    }
+
+    fn prompt_cache_affinity(&self) -> Option<PromptCacheAffinity> {
+        let session_id = self.signal_store.as_ref()?.session_id()?;
+        PromptCacheAffinity::new(format!("fawx:{session_id}"))
+    }
+
+    fn current_signal_feedback_summary(&mut self) -> Option<String> {
+        if self.budget.state() == BudgetState::Low {
+            return None;
+        }
+
+        let config = &self.budget.config().signal_feedback;
+        let summary = SignalSummarizer::summarize(
+            &self.signal_feedback_signals(usize::from(config.lookback_cycles)),
+            SignalSummaryContext {
+                budget_state: self.budget.state(),
+                budget_remaining_percent: Some(self.budget.signal_feedback_remaining_percent()),
+                observation_pressure: self.current_observation_pressure(),
+            },
+            config,
+        )?;
+
+        if self.iteration_count > 1
+            && self.last_signal_feedback_summary.as_deref() == Some(summary.as_str())
+        {
+            return None;
+        }
+
+        self.last_signal_feedback_summary = Some(summary.clone());
+        Some(summary)
+    }
+
+    fn signal_feedback_signals(&self, lookback_cycles: usize) -> Vec<Signal> {
+        let current_signals = self.signals.signals();
+        let recent_cycles = self
+            .recent_signal_cycles
+            .iter()
+            .rev()
+            .take(lookback_cycles)
+            .collect::<Vec<_>>();
+        let capacity =
+            current_signals.len() + recent_cycles.iter().map(|cycle| cycle.len()).sum::<usize>();
+        let mut signals = Vec::with_capacity(capacity);
+
+        for cycle in recent_cycles.into_iter().rev() {
+            signals.extend(cycle.iter().cloned());
+        }
+        signals.extend(current_signals.iter().cloned());
+        signals
+    }
+
+    fn current_observation_pressure(&self) -> Option<ObservationPressure> {
+        let termination = self.current_termination_config();
+        let rounds_limit = ToolStrippingAfterNudge::from_config_value(
+            termination.observation_only_round_strip_after_nudge,
+        )
+        .pressure_limit(termination.observation_only_round_nudge_after)?;
+
+        (rounds_limit > 0).then_some(ObservationPressure {
+            rounds_used: self.observation_round_tracker.pressure_rounds(),
+            rounds_limit,
+        })
+    }
+
+    fn record_signal_feedback_cycle(&mut self, signals: &[Signal]) {
+        let lookback_cycles = usize::from(self.budget.config().signal_feedback.lookback_cycles);
+        if lookback_cycles == 0 {
+            self.recent_signal_cycles.clear();
+            return;
+        }
+        if signals.is_empty() {
+            return;
+        }
+
+        self.recent_signal_cycles.push_back(signals.to_vec());
+        while self.recent_signal_cycles.len() > lookback_cycles {
+            self.recent_signal_cycles.pop_front();
+        }
+    }
+
+    fn sync_runtime_skill_prompt_summaries(&mut self) {
+        if let Some(revision) = &self.runtime_skill_prompt_revision {
+            let current = revision.load(Ordering::Acquire);
+            if current != self.cached_runtime_skill_prompt_revision {
+                self.refresh_runtime_skill_prompt_summaries();
+            }
+        }
+    }
+
+    fn runtime_skill_prompt_summaries(&self) -> &[SkillPromptSummary] {
+        self.cached_runtime_skill_prompt_summaries.as_slice()
+    }
+
+    fn refresh_runtime_skill_prompt_summaries(&mut self) {
+        self.cached_runtime_skill_prompt_summaries = self.collect_runtime_skill_prompt_summaries();
+        self.cached_runtime_skill_prompt_revision = self
+            .runtime_skill_prompt_revision
+            .as_ref()
+            .map(|revision| revision.load(Ordering::Acquire))
+            .unwrap_or(0);
+    }
+
+    fn collect_runtime_skill_prompt_summaries(&self) -> Vec<SkillPromptSummary> {
+        let Some(runtime_info) = &self.runtime_info else {
+            return Vec::new();
+        };
+
+        let info = match runtime_info.read() {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                return Vec::new();
+            }
+        };
+
+        info.skills
+            .iter()
+            .filter_map(|skill| {
+                let description = skill.description.as_deref()?.trim();
+                if description.is_empty() || skill.name.trim().is_empty() {
+                    return None;
+                }
+                Some(SkillPromptSummary::new(
+                    skill.name.clone(),
+                    description.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn collect_runtime_routing_tools(&self) -> Vec<ToolRoutingSummary> {
+        let Some(runtime_info) = &self.runtime_info else {
+            return Vec::new();
+        };
+
+        let info = match runtime_info.read() {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(error = %error, "runtime info lock poisoned");
+                return Vec::new();
+            }
+        };
+
+        info.skills
+            .iter()
+            .flat_map(|skill| skill.routing_tools.clone())
+            .collect()
+    }
+
+    fn apply_preflight_route_tool_surface(
+        &self,
+        tools: Vec<ToolDefinition>,
+    ) -> Vec<ToolDefinition> {
+        let Some(route_plan) = &self.preflight_route_plan else {
+            return tools;
+        };
+        let active_route = route_plan.current_route();
+        let allowed: HashSet<&str> = active_route.tool_names.iter().map(String::as_str).collect();
+        let mut tool_map = tools
+            .into_iter()
+            .filter(|tool| allowed.contains(tool.name.as_str()))
+            .map(|tool| (tool.name.clone(), tool))
+            .collect::<HashMap<_, _>>();
+
+        active_route
+            .tool_names
+            .iter()
+            .filter_map(|tool_name| tool_map.remove(tool_name))
+            .collect()
+    }
+
+    fn consume_preflight_route_plan(&mut self, reason: &str) {
+        let Some(route_plan) = self.preflight_route_plan.take() else {
+            return;
+        };
+        let active_route = route_plan.current_route().clone();
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "consumed preflight route plan",
+            serde_json::json!({
+                "decision_kind": ControlPlaneDecisionKind::PreflightRoute,
+                "decision": "consumed",
+                "reason": reason,
+                "resource": &route_plan.resource,
+                "active_route": active_route,
+            }),
+        );
+    }
+
     pub fn synthesis_instruction(&self) -> &str {
         &self.synthesis_instruction
     }
@@ -1272,20 +2412,95 @@ impl LoopEngine {
         kind: SignalKind,
         message: impl Into<String>,
         metadata: serde_json::Value,
-    ) {
-        self.signals.emit(Signal {
+    ) -> u64 {
+        self.emit_structured_signal(Signal::new(
             step,
             kind,
-            message: message.into(),
+            message,
             metadata,
-            timestamp_ms: current_time_ms(),
-        });
+            current_time_ms(),
+        ))
+    }
+
+    #[must_use = "capture the assigned signal ID when you need causal links; discard it explicitly otherwise"]
+    fn emit_structured_signal(&mut self, signal: Signal) -> u64 {
+        self.signals.emit(signal)
+    }
+
+    fn remember_tool_failure_signal(&mut self, call: &ToolCall, signal_id: u64) {
+        self.last_tool_failure_signal_ids
+            .insert(ToolCallKey::from_call(call), signal_id);
+    }
+
+    fn clear_tool_failure_signal(&mut self, call: &ToolCall) {
+        self.last_tool_failure_signal_ids
+            .remove(&ToolCallKey::from_call(call));
+    }
+
+    fn cause_id_for_tool_call(&self, call: &ToolCall) -> Option<u64> {
+        self.last_tool_failure_signal_ids
+            .get(&ToolCallKey::from_call(call))
+            .copied()
     }
 
     fn finalize_result(&mut self, result: LoopResult) -> LoopResult {
+        self.emit_turn_stop_signal(&result);
         self.emit_cache_stats_signal();
         let signals = self.signals.drain_all();
+        self.persist_cycle_signals(&signals);
+        self.record_signal_feedback_cycle(&signals);
         attach_signals(result, signals)
+    }
+
+    fn finalize_error_result(&mut self, error: &LoopError) {
+        self.emit_signal(
+            loop_step_for_error_stage(&error.stage),
+            SignalKind::Blocked,
+            "loop error",
+            serde_json::json!({
+                "stage": error.stage,
+                "reason": error.reason,
+                "recoverable": error.recoverable,
+            }),
+        );
+        self.emit_turn_stop_signal(&LoopResult::Error {
+            message: error.reason.clone(),
+            recoverable: error.recoverable,
+            signals: Vec::new(),
+        });
+        self.emit_cache_stats_signal();
+        let signals = self.signals.drain_all();
+        self.persist_cycle_signals(&signals);
+        self.record_signal_feedback_cycle(&signals);
+    }
+
+    fn emit_turn_stop_signal(&mut self, result: &LoopResult) {
+        self.emit_signal(
+            LoopStep::Synthesize,
+            SignalKind::Trace,
+            "loop turn terminal status",
+            signal_metadata_value(turn_stop_signal_metadata(result)),
+        );
+    }
+
+    fn persist_cycle_signals(&self, signals: &[Signal]) {
+        let Some(store) = self.signal_store.as_ref() else {
+            return;
+        };
+        if signals.is_empty() {
+            return;
+        }
+
+        let session_id = store.session_id().unwrap_or("unknown");
+
+        if let Err(error) = store.append(signals).and_then(|()| store.flush()) {
+            tracing::warn!(
+                error = %error,
+                signal_count = signals.len(),
+                session_id,
+                "signal store append failed; continuing without persistent signal history"
+            );
+        }
     }
 
     // Emit a user-visible error through the out-of-band error callback.
@@ -1351,9 +2566,13 @@ impl LoopEngine {
         stream_callback: Option<StreamCallback>,
     ) -> Result<LoopResult, LoopError> {
         let mut engine = ErrorCallbackGuard::install(self, stream_callback.clone());
-        engine
+        let result = engine
             .run_cycle_streaming_inner(perception, llm, stream_callback.as_ref())
-            .await
+            .await;
+        if let Err(error) = &result {
+            engine.finalize_error_result(error);
+        }
+        result
     }
 
     async fn run_cycle_streaming_inner(
@@ -1378,14 +2597,14 @@ impl LoopEngine {
             return Ok(self.finish_streaming_result(result, stream));
         }
 
-        stream.phase(Phase::Perceive);
+        self.emit_loop_phase(stream, Phase::Perceive);
         let mut processed = self.perceive(&perception).await?;
         let reason_cost = self.estimate_reasoning_cost(&processed);
         if let Some(result) = self.budget_terminal(reason_cost, None) {
             return Ok(self.finish_streaming_result(result, stream));
         }
 
-        stream.phase(Phase::Reason);
+        self.emit_loop_phase(stream, Phase::Reason);
         let response = self.reason(&processed, llm, stream).await?;
         self.record_reasoning_cost(reason_cost, &mut state);
 
@@ -1395,12 +2614,18 @@ impl LoopEngine {
         }
 
         loop {
-            stream.phase(Phase::Act);
-            let action = self
+            self.emit_loop_phase(stream, Phase::Act);
+            let mut action = self
                 .act(&decision, llm, &processed.context_window, stream)
                 .await?;
 
             let action_partial = action_partial_response(&action);
+
+            if let Some(result) =
+                self.apply_repeated_tool_failure_policy(&mut action, action_partial.as_deref())
+            {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
 
             state.tokens.accumulate(action.tokens_used);
             self.update_tool_turns(&action);
@@ -1412,11 +2637,15 @@ impl LoopEngine {
             self.emit_action_observations(&action);
 
             let recorded_action_cost = self.recorded_action_cost(&action);
-            if let Some(result) = self.budget_terminal(
-                recorded_action_cost.unwrap_or_default(),
-                action_partial.clone(),
-            ) {
-                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            let action_commits_final_response = action_commits_final_response(&action);
+            let action_is_terminal = action_is_terminal(&action);
+            if !action_is_terminal && !action_commits_final_response {
+                if let Some(result) = self.budget_terminal(
+                    recorded_action_cost.unwrap_or_default(),
+                    action_partial.clone(),
+                ) {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
             }
             if let Some(action_cost) = recorded_action_cost {
                 self.budget.record(&action_cost);
@@ -1428,10 +2657,15 @@ impl LoopEngine {
                         terminal,
                         processed.context_window.last(),
                     );
-                    return Ok(self.finish_streaming_result(
-                        self.loop_result_from_action_terminal(terminal, state.tokens),
-                        stream,
-                    ));
+                    match self.guard_root_turn_terminal_completion(terminal) {
+                        ActionNextStep::Finish(terminal) => {
+                            return Ok(self.finish_streaming_result(
+                                self.loop_result_from_action_terminal(terminal, state.tokens),
+                                stream,
+                            ));
+                        }
+                        ActionNextStep::Continue(continuation) => continuation,
+                    }
                 }
                 ActionNextStep::Continue(continuation) => continuation,
             };
@@ -1455,21 +2689,15 @@ impl LoopEngine {
             }
 
             self.apply_pending_turn_commitment(&continuation, &action.tool_results);
+            let mut continuation_context = processed.context_window.clone();
+            append_continuation_context(&mut continuation_context, &continuation);
 
             // Tools were used. Check max before incrementing so the
             // reported iteration count is accurate (not inflated by 1).
             if self.iteration_count >= self.max_iterations {
-                // Safety cap reached while the action still required follow-up.
-                // Treat this as an incomplete terminal state rather than
-                // inferring completion from any partial text.
-                let result = LoopResult::Incomplete {
-                    partial_response: action_partial.clone(),
-                    reason: "iteration limit reached before a usable final response was produced"
-                        .to_string(),
-                    iterations: self.iteration_count,
-                    signals: Vec::new(),
-                };
-                return Ok(self.finish_streaming_result(result, stream));
+                return Ok(self
+                    .finish_iteration_limit(llm, &continuation_context, state.tokens, stream)
+                    .await);
             }
             self.iteration_count += 1;
 
@@ -1486,21 +2714,28 @@ impl LoopEngine {
             // every tool call/result message, because act_with_tools may
             // have run multiple inner rounds with different call IDs that
             // don't map 1:1 to the original Decision::UseTools calls.
-            append_continuation_context(&mut processed.context_window, &continuation);
+            processed.context_window = continuation_context;
 
             let reason_cost = self.estimate_reasoning_cost(&processed);
-            if let Some(result) = self.budget_terminal(reason_cost, action_partial.clone()) {
-                return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+            let final_response_budget_reserve = self.active_finalize_response().is_some();
+            if !final_response_budget_reserve {
+                if let Some(result) = self.budget_terminal(reason_cost, action_partial.clone()) {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
             }
 
             // No re-perceive needed; context_window was updated in-place above.
-            stream.phase(Phase::Reason);
+            self.emit_loop_phase(stream, Phase::Reason);
             let response = self.reason(&processed, llm, stream).await?;
             self.record_reasoning_cost(reason_cost, &mut state);
 
             decision = self.decide(&response).await?;
-            if let Some(result) = self.budget_terminal(self.estimate_action_cost(&decision), None) {
-                return Ok(self.finish_streaming_result(result, stream));
+            if !final_response_budget_reserve {
+                if let Some(result) =
+                    self.budget_terminal(self.estimate_action_cost(&decision), None)
+                {
+                    return Ok(self.finish_streaming_result(result, stream));
+                }
             }
 
             // Loop back to act with new decision
@@ -1522,10 +2757,37 @@ impl LoopEngine {
             } => {
                 let synthesized = if self.budget.config().termination.synthesize_on_exhaustion {
                     let reasoning_messages = std::mem::take(&mut self.last_reasoning_messages);
-                    self.forced_synthesis_turn(llm, &reasoning_messages).await
+                    self.forced_synthesis_turn(llm, &reasoning_messages, stream)
+                        .await
                 } else {
                     None
                 };
+                if let Some(response) = synthesized.as_deref() {
+                    if let Some(block) = self.root_turn_completion_block_for_response(response) {
+                        let reason = Self::root_turn_incomplete_reason(&block);
+                        let partial_response =
+                            Self::root_turn_external_action_incomplete_response(&block);
+                        self.emit_signal(
+                            LoopStep::Synthesize,
+                            SignalKind::Friction,
+                            "forced synthesis did not satisfy root turn completion contract",
+                            serde_json::json!({
+                                "missing_response_sections": &block.missing_response_sections,
+                                "pending_artifact_paths": &block.pending_artifact_paths,
+                                "pending_external_actions": &block.pending_external_actions,
+                            }),
+                        );
+                        return self.finish_streaming_result(
+                            LoopResult::Incomplete {
+                                partial_response,
+                                reason,
+                                iterations,
+                                signals,
+                            },
+                            stream,
+                        );
+                    }
+                }
                 LoopResult::BudgetExhausted {
                     partial_response: Some(Self::resolve_budget_exhausted_response(
                         synthesized,
@@ -1540,14 +2802,138 @@ impl LoopEngine {
         self.finish_streaming_result(result, stream)
     }
 
+    async fn finish_iteration_limit(
+        &mut self,
+        llm: &dyn LlmProvider,
+        synthesis_context: &[Message],
+        tokens_used: TokenUsage,
+        stream: CycleStream<'_>,
+    ) -> LoopResult {
+        let reason = "iteration limit reached before a usable final response was produced";
+        let synthesized = self
+            .forced_synthesis_turn(llm, synthesis_context, stream)
+            .await;
+        let result = if let Some(response) = synthesized.filter(|text| !text.trim().is_empty()) {
+            if let Some(block) = self.root_turn_completion_block_for_response(&response) {
+                let reason = Self::root_turn_incomplete_reason(&block);
+                let partial_response = Self::root_turn_external_action_incomplete_response(&block);
+                self.emit_signal(
+                    LoopStep::Synthesize,
+                    SignalKind::Friction,
+                    "forced synthesis did not satisfy root turn completion contract",
+                    serde_json::json!({
+                        "missing_response_sections": &block.missing_response_sections,
+                        "pending_artifact_paths": &block.pending_artifact_paths,
+                        "pending_external_actions": &block.pending_external_actions,
+                    }),
+                );
+                LoopResult::Incomplete {
+                    partial_response,
+                    reason,
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                }
+            } else {
+                LoopResult::Complete {
+                    response,
+                    iterations: self.iteration_count,
+                    tokens_used,
+                    signals: Vec::new(),
+                }
+            }
+        } else {
+            LoopResult::Incomplete {
+                partial_response: None,
+                reason: reason.to_string(),
+                iterations: self.iteration_count,
+                signals: Vec::new(),
+            }
+        };
+
+        self.finish_streaming_result(result, stream)
+    }
+
+    fn emit_loop_phase(&mut self, stream: CycleStream<'_>, phase: Phase) {
+        match phase {
+            Phase::Perceive => {
+                self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::CollectingWork)
+            }
+            Phase::Synthesize => {
+                self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Summarizing)
+            }
+            Phase::Reason | Phase::Act => {}
+        }
+        stream.phase(phase);
+    }
+
     fn finish_streaming_result(
         &mut self,
         result: LoopResult,
         stream: CycleStream<'_>,
     ) -> LoopResult {
         self.maybe_emit_completion_notification(&result, stream);
+        if let Some((category, message, recoverable)) = result.stream_terminal_error() {
+            stream.emit_error(category, message, recoverable);
+        }
+        self.emit_completed_summary_if_available(stream);
+        if let Some(response) = result.stream_final_answer_response() {
+            self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Finalizing);
+            self.emit_terminal_final_answer_if_needed(stream, &response);
+        }
+        // `Completed` is the terminal transcript boundary, emitted from the
+        // shared finish path so every outcome (complete, incomplete, or
+        // cancelled) gives clients one last phase marker before `Done`.
+        self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Completed);
         stream.done_result(&result);
         self.finalize_result(result)
+    }
+
+    fn emit_transcript_phase_boundary(
+        &mut self,
+        stream: CycleStream<'_>,
+        phase: TranscriptTurnPhase,
+    ) {
+        if self.transcript_turn_phase == Some(phase) {
+            return;
+        }
+
+        if self
+            .transcript_turn_phase
+            .is_some_and(|current_phase| phase < current_phase)
+        {
+            tracing::debug!(
+                current = ?self.transcript_turn_phase,
+                requested = ?phase,
+                "ignoring transcript phase boundary backtrack"
+            );
+            return;
+        }
+
+        self.transcript_turn_phase = Some(phase);
+        stream.phase_boundary(phase);
+    }
+
+    fn emit_completed_summary_if_available(&mut self, stream: CycleStream<'_>) {
+        let Some(summary) =
+            completed_work_summary_from_progress_entries(&self.turn_progress_ledger.tool_entries)
+        else {
+            return;
+        };
+        self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Summarizing);
+        stream.completed_summary(&summary);
+    }
+
+    pub(super) fn mark_final_answer_streamed(&mut self) {
+        self.final_answer_streamed_this_cycle = true;
+    }
+
+    fn emit_terminal_final_answer_if_needed(&mut self, stream: CycleStream<'_>, response: &str) {
+        if self.final_answer_streamed_this_cycle || response.trim().is_empty() {
+            return;
+        }
+
+        stream.final_answer(response);
+        self.final_answer_streamed_this_cycle = true;
     }
 
     fn apply_decomposition_terminal_fallback(
@@ -1608,14 +2994,17 @@ impl LoopEngine {
         );
     }
 
-    /// Drain the input channel and return the highest-priority flow command.
+    /// Drain the input channel into typed pending state.
     ///
-    /// Priority ordering: `Abort` > `Stop` > `Wait/Resume` > `StatusQuery` > `Steer`.
-    /// `StatusQuery` publishes an internal status message and does not alter loop flow.
-    /// `Steer` stores the latest steer text for the next perceive step.
-    fn check_user_input(&mut self) -> Option<LoopCommand> {
-        let channel = self.input_channel.as_mut()?;
-        let mut highest: Option<LoopCommand> = None;
+    /// Flow commands are preserved for the next cancellation/control check while
+    /// steering is latched independently so every model boundary can apply the
+    /// latest user guidance for the rest of the current turn without swallowing
+    /// Stop/Abort/Wait/Resume commands.
+    fn drain_user_input_to_state(&mut self) {
+        let Some(channel) = self.input_channel.as_mut() else {
+            return;
+        };
+        let mut highest = self.pending_flow_command.take();
         let mut status_requested = false;
         let mut latest_steer: Option<String> = None;
 
@@ -1627,14 +3016,42 @@ impl LoopEngine {
             }
         }
 
-        if let Some(steer) = latest_steer {
-            self.pending_steer = Some(steer);
+        if let Some(steer) = latest_steer.and_then(normalize_turn_steer) {
+            self.active_turn_steer = Some(steer);
         }
+        self.pending_flow_command = highest;
         if status_requested {
             self.publish_system_status();
         }
+    }
 
-        highest
+    /// Drain the input channel and return the highest-priority flow command.
+    ///
+    /// Priority ordering: `Abort` > `Stop` > `Wait/Resume` > `StatusQuery` > `Steer`.
+    /// `StatusQuery` publishes an internal status message and does not alter loop flow.
+    /// `Steer` stores the latest steer text for the current turn's model boundaries.
+    fn check_user_input(&mut self) -> Option<LoopCommand> {
+        self.drain_user_input_to_state();
+        self.pending_flow_command.take()
+    }
+
+    fn apply_turn_steer_to_request(
+        &mut self,
+        request: &mut CompletionRequest,
+        context: StreamingRequestContext,
+    ) {
+        self.drain_user_input_to_state();
+        let Some(steer) = self.active_turn_steer.as_deref() else {
+            return;
+        };
+
+        let directive = turn_steering_guidance_message(steer);
+        tracing::info!(
+            stage = context.stage(),
+            steer_chars = steer.chars().count(),
+            "applying current-turn steering guidance to model request"
+        );
+        request.messages.push(Message::user(directive));
     }
 
     fn publish_system_status(&self) {
@@ -1698,18 +3115,33 @@ impl LoopEngine {
         self.budget.reset(current_time_ms());
         self.signals.clear();
         self.user_stop_requested = false;
-        self.pending_steer = None;
+        self.active_turn_steer = None;
+        self.pending_flow_command = None;
         self.budget_low_signaled = false;
         self.consecutive_tool_turns = 0;
-        self.consecutive_observation_only_rounds = 0;
+        self.observation_round_tracker = ObservationRoundTracker::default();
+        self.turn_progress_ledger = TurnProgressLedger::default();
+        self.last_signal_feedback_summary = None;
         self.last_reasoning_messages.clear();
         self.tool_retry_tracker.clear();
+        self.last_tool_failure_signal_ids.clear();
+        self.repeated_tool_failure_tracker.clear();
         self.notify_called_this_cycle = false;
+        self.final_answer_streamed_this_cycle = false;
+        self.transcript_turn_phase = None;
         self.notify_tool_guidance_enabled = false;
         self.tool_call_provider_ids.clear();
+        self.pending_tool_result_diagnostics.clear();
+        self.pending_tool_result_signals.clear();
         self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
+        self.final_response_blocked_attempts = 0;
+        self.final_response_attempted_tool_activity = false;
+        self.final_response_candidate_truncated = false;
+        self.preflight_route_plan = None;
+        self.root_turn_contract = None;
+        self.task_contract = None;
         self.requested_artifact_target = None;
         self.pending_artifact_write_target = None;
         self.last_turn_state_progress = None;
@@ -1734,6 +3166,69 @@ impl LoopEngine {
         }
     }
 
+    fn apply_repeated_tool_failure_policy(
+        &mut self,
+        action: &mut ActionResult,
+        action_partial: Option<&str>,
+    ) -> Option<LoopResult> {
+        if let ActionNextStep::Finish(terminal) = &action.next_step {
+            if matches!(terminal, ActionTerminal::Complete { .. }) {
+                self.repeated_tool_failure_tracker.clear();
+            }
+            return None;
+        }
+
+        let threshold = self.repeated_failure_streak_limit();
+        let event = self
+            .repeated_tool_failure_tracker
+            .observe_action(&action.tool_results, threshold)?;
+
+        match event {
+            RepeatedToolFailureEvent::InjectGuidance(state) => {
+                let directive = render_repeated_tool_failure_directive(&state);
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Friction,
+                    format!(
+                        "injecting repeated failure guidance for '{}'",
+                        state.failure.key.tool_name
+                    ),
+                    serde_json::json!({
+                        "tool": state.failure.key.tool_name.as_str(),
+                        "consecutive_failures": state.consecutive_failures,
+                        "failure_summary": state.failure.summary.as_str(),
+                    }),
+                );
+                if let ActionNextStep::Continue(continuation) = &mut action.next_step {
+                    append_continuation_system_message(continuation, directive);
+                }
+                None
+            }
+            RepeatedToolFailureEvent::Trip(state) => {
+                let reason = repeated_tool_failure_terminal_reason(&state);
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    &reason,
+                    serde_json::json!({
+                        "tool": state.failure.key.tool_name.as_str(),
+                        "consecutive_failures": state.consecutive_failures,
+                        "failure_summary": state.failure.summary.as_str(),
+                    }),
+                );
+                Some(LoopResult::Incomplete {
+                    partial_response: repeated_tool_failure_partial_response(
+                        action_partial,
+                        &state,
+                    ),
+                    reason,
+                    iterations: self.iteration_count,
+                    signals: Vec::new(),
+                })
+            }
+        }
+    }
+
     fn recorded_action_cost(&self, action: &ActionResult) -> Option<ActionCost> {
         (!action.has_tool_activity()).then(|| self.action_cost_from_result(action))
     }
@@ -1754,6 +3249,7 @@ impl LoopEngine {
         }
         match self.pending_tool_scope.as_ref() {
             None | Some(ContinuationToolScope::Full) => tools,
+            Some(ContinuationToolScope::NoTools) => Vec::new(),
             Some(ContinuationToolScope::MutationOnly) => tools
                 .into_iter()
                 .filter(|tool| {
@@ -1804,6 +3300,20 @@ impl LoopEngine {
         self.pending_tool_scope = next_scope;
         self.pending_artifact_write_target = next_artifact_target;
 
+        let previous_finalize = matches!(
+            previous_commitment,
+            Some(TurnCommitment::FinalizeResponse(_))
+        );
+        let current_finalize = matches!(
+            self.pending_turn_commitment,
+            Some(TurnCommitment::FinalizeResponse(_))
+        );
+        if current_finalize != previous_finalize {
+            self.final_response_blocked_attempts = 0;
+            self.final_response_attempted_tool_activity = false;
+            self.final_response_candidate_truncated = false;
+        }
+
         if artifact_completed {
             self.emit_signal(
                 LoopStep::Act,
@@ -1841,6 +3351,9 @@ impl LoopEngine {
                     ContinuationToolScope::Full => serde_json::json!({
                         "mode": "full",
                     }),
+                    ContinuationToolScope::NoTools => serde_json::json!({
+                        "mode": "no_tools",
+                    }),
                     ContinuationToolScope::MutationOnly => serde_json::json!({
                         "mode": "mutation_only",
                     }),
@@ -1860,6 +3373,9 @@ impl LoopEngine {
             let scope_metadata = match scope {
                 ContinuationToolScope::Full => serde_json::json!({
                     "mode": "full",
+                }),
+                ContinuationToolScope::NoTools => serde_json::json!({
+                    "mode": "no_tools",
                 }),
                 ContinuationToolScope::MutationOnly => serde_json::json!({
                     "mode": "mutation_only",
@@ -1900,8 +3416,403 @@ impl LoopEngine {
         }
     }
 
+    fn record_root_turn_contract_progress(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let typed_completed_actions = completed_external_actions_from_diagnostics(
+            results,
+            &self.pending_tool_result_diagnostics,
+        );
+        let Some(contract) = self.root_turn_contract.as_mut() else {
+            return;
+        };
+
+        let mut satisfied_paths = Vec::new();
+        let mut satisfied_external_actions = Vec::new();
+        for deliverable in &mut contract.deliverables {
+            match deliverable {
+                RootTurnDeliverable::ArtifactWrite { path, satisfied } => {
+                    if *satisfied || !artifact_write_completed(path, results) {
+                        continue;
+                    }
+                    *satisfied = true;
+                    satisfied_paths.push(path.clone());
+                }
+                RootTurnDeliverable::ExternalAction {
+                    kind,
+                    label,
+                    satisfied,
+                } => {
+                    if *satisfied
+                        || !external_action_completed(
+                            *kind,
+                            calls,
+                            results,
+                            &typed_completed_actions,
+                        )
+                    {
+                        continue;
+                    }
+                    *satisfied = true;
+                    satisfied_external_actions.push(label.clone());
+                }
+                RootTurnDeliverable::ResponseSection { .. } => {}
+            }
+        }
+
+        if !satisfied_paths.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "root turn artifact deliverable satisfied",
+                serde_json::json!({ "paths": satisfied_paths }),
+            );
+        }
+        if !satisfied_external_actions.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "root turn external action deliverable satisfied",
+                serde_json::json!({ "actions": satisfied_external_actions }),
+            );
+        }
+    }
+
+    fn record_task_contract_progress(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        let Some((satisfied_inputs, input_count, transitioned)) = ({
+            let Some(contract) = self.task_contract.as_mut() else {
+                return;
+            };
+            if contract.phase != TaskPhase::Gathering {
+                return;
+            }
+
+            let observations = task_contract_observations(&*self.tool_executor, calls, results);
+            let mut satisfied_inputs = Vec::new();
+            for input in &mut contract.inputs {
+                if input.satisfied
+                    || !observations
+                        .iter()
+                        .any(|observation| task_contract_matches_observation(input, observation))
+                {
+                    continue;
+                }
+                input.satisfied = true;
+                satisfied_inputs.push(input.description.clone());
+            }
+
+            let transitioned = contract.inputs.iter().all(|input| input.satisfied);
+            if transitioned {
+                contract.phase = TaskPhase::Synthesizing;
+            }
+
+            Some((satisfied_inputs, contract.inputs.len(), transitioned))
+        }) else {
+            return;
+        };
+
+        if !satisfied_inputs.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "task contract input satisfied",
+                serde_json::json!({ "inputs": satisfied_inputs }),
+            );
+        }
+
+        if transitioned {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "task contract gathering complete; entering synthesizing phase",
+                serde_json::json!({
+                    "input_count": input_count,
+                }),
+            );
+        }
+    }
+
+    fn mark_task_contract_complete(&mut self) {
+        let should_emit = match self.task_contract.as_mut() {
+            Some(contract) if contract.phase != TaskPhase::Complete => {
+                contract.phase = TaskPhase::Complete;
+                true
+            }
+            _ => false,
+        };
+        if !should_emit {
+            return;
+        }
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Success,
+            "task contract completed",
+            serde_json::json!({}),
+        );
+    }
+
+    fn finish_root_turn_terminal_response(&mut self, response: String) -> ActionNextStep {
+        self.mark_task_contract_complete();
+        ActionNextStep::Finish(ActionTerminal::Complete { response })
+    }
+
+    fn guard_root_turn_terminal_completion(&mut self, terminal: ActionTerminal) -> ActionNextStep {
+        let ActionTerminal::Complete { response } = terminal else {
+            return ActionNextStep::Finish(terminal);
+        };
+        if response.trim().is_empty() {
+            let raw_response_chars = response.chars().count();
+            let raw_response_preview = response.chars().take(160).collect::<String>();
+            if self.active_finalize_response().is_some() {
+                self.final_response_attempted_tool_activity = false;
+                self.final_response_candidate_truncated = false;
+            }
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "empty terminal response rejected",
+                serde_json::json!({
+                    "reason": "model returned no visible assistant response",
+                    "raw_response_chars": raw_response_chars,
+                    "raw_response_preview": raw_response_preview,
+                }),
+            );
+            return ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response: None,
+                reason: "model returned no visible assistant response".to_string(),
+            });
+        }
+        if self.active_finalize_response().is_some() {
+            let attempted_tool_activity =
+                std::mem::take(&mut self.final_response_attempted_tool_activity);
+            let response_truncated = std::mem::take(&mut self.final_response_candidate_truncated);
+            match TurnControlPlane::validate_final_response(FinalResponseValidationFacts {
+                attempted_tool_activity,
+                response_truncated,
+                response_text: Some(&response),
+            }) {
+                FinalResponseValidationOutcome::Accept => {}
+                FinalResponseValidationOutcome::Retry(violation) => {
+                    return self.block_finalize_response_completion(Some(response), violation);
+                }
+            }
+        }
+        let retry_limit = self.root_turn_completion_retry_limit();
+
+        let Some(contract) = self.root_turn_contract.as_mut() else {
+            return self.finish_root_turn_terminal_response(response);
+        };
+        let Some(block) = root_turn_completion_block(contract, &response) else {
+            return self.finish_root_turn_terminal_response(response);
+        };
+        contract.blocked_terminal_attempts = contract.blocked_terminal_attempts.saturating_add(1);
+        let blocked_attempts = contract.blocked_terminal_attempts;
+        let retries_remaining = retry_limit.saturating_sub(blocked_attempts);
+
+        if blocked_attempts >= retry_limit {
+            let reason = Self::root_turn_incomplete_reason(&block);
+            let partial_response = Self::root_turn_external_action_incomplete_response(&block);
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "root turn completion retry cap reached; ending incomplete",
+                serde_json::json!({
+                    "blocked_attempts": blocked_attempts,
+                    "retry_limit": retry_limit,
+                    "missing_response_sections": &block.missing_response_sections,
+                    "pending_artifact_paths": &block.pending_artifact_paths,
+                    "pending_external_actions": &block.pending_external_actions,
+                }),
+            );
+            return ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response,
+                reason,
+            });
+        }
+
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "blocked terminal completion until root turn deliverables are satisfied",
+            serde_json::json!({
+                "blocked_attempts": blocked_attempts,
+                "retry_limit": retry_limit,
+                "retries_remaining": retries_remaining,
+                "missing_response_sections": &block.missing_response_sections,
+                "pending_artifact_paths": &block.pending_artifact_paths,
+                "pending_external_actions": &block.pending_external_actions,
+            }),
+        );
+
+        let mut context_messages = vec![Message::assistant(response.clone())];
+        context_messages.push(Message::system(render_root_turn_retry_directive(
+            &block,
+            retries_remaining,
+        )));
+        let mut continuation =
+            ActionContinuation::new(Some(response), None).with_context_messages(context_messages);
+        if let Some(path) = block.pending_artifact_paths.first().cloned() {
+            let tool_scope = ContinuationToolScope::Only(vec!["write_file".to_string()]);
+            continuation = continuation
+                .with_tool_scope(tool_scope.clone())
+                .with_artifact_write_target(path.clone())
+                .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                    ProceedUnderConstraints {
+                        goal: format!("Write the pending root-turn artifact deliverable: {path}"),
+                        success_target: Some(format!(
+                            "Use write_file to create or update {path}, then continue to any remaining response deliverables."
+                        )),
+                        unsupported_items: block
+                            .missing_response_sections
+                            .iter()
+                            .map(|label| {
+                                format!("Response section still pending after artifact write: {label}")
+                            })
+                            .collect(),
+                        assumptions: Vec::new(),
+                        allowed_tools: Some(tool_scope),
+                    },
+                ));
+        } else if let Some(action) = block.pending_external_actions.first().cloned() {
+            let tool_scope = ContinuationToolScope::Only(vec!["run_command".to_string()]);
+            continuation = continuation
+                .with_tool_scope(tool_scope.clone())
+                .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                    ProceedUnderConstraints {
+                        goal: format!("Complete the pending root-turn external action: {action}"),
+                        success_target: Some(format!(
+                            "Use run_command to complete this external action, then continue to any remaining response deliverables: {action}."
+                        )),
+                        unsupported_items: block
+                            .missing_response_sections
+                            .iter()
+                            .map(|label| {
+                                format!("Response section still pending after external action: {label}")
+                            })
+                            .collect(),
+                        assumptions: Vec::new(),
+                        allowed_tools: Some(tool_scope),
+                    },
+                ));
+        } else {
+            continuation = continuation.with_turn_commitment(final_response_turn_commitment(
+                "required root-turn response sections were missing from the prior response",
+                "Produce one consolidated final response that satisfies all remaining response sections.",
+            ));
+        }
+        ActionNextStep::Continue(continuation)
+    }
+
+    fn active_finalize_response(&self) -> Option<&crate::act::FinalizeResponse> {
+        match self.pending_turn_commitment.as_ref() {
+            Some(TurnCommitment::FinalizeResponse(commitment)) => Some(commitment),
+            _ => None,
+        }
+    }
+
+    fn finalize_response_retry_limit(&self) -> u8 {
+        self.root_turn_completion_retry_limit().max(1)
+    }
+
+    fn block_finalize_response_completion(
+        &mut self,
+        prior_response: Option<String>,
+        violation: FinalResponseViolation,
+    ) -> ActionNextStep {
+        let retry_limit = self.finalize_response_retry_limit();
+        self.final_response_blocked_attempts =
+            self.final_response_blocked_attempts.saturating_add(1);
+        let blocked_attempts = self.final_response_blocked_attempts;
+        let retries_remaining = retry_limit.saturating_sub(blocked_attempts);
+        let success_target = self
+            .active_finalize_response()
+            .map(|commitment| commitment.success_target.clone())
+            .unwrap_or_else(|| "Produce one consolidated final answer.".to_string());
+        let violation_label = final_response_violation_label(violation);
+
+        if violation == FinalResponseViolation::ProgressOnlyResponse {
+            tracing::info!(
+                blocked_attempts,
+                retry_limit,
+                "progress-only final-response heuristic matched"
+            );
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Trace,
+                "progress-only final-response heuristic matched",
+                serde_json::json!({
+                    "detector": "looks_like_progress_only_final_response",
+                    "blocked_attempts": blocked_attempts,
+                    "retry_limit": retry_limit,
+                    "success_target": success_target,
+                }),
+            );
+        }
+
+        if blocked_attempts >= retry_limit {
+            let partial_response =
+                final_response_retry_cap_partial_response(prior_response.as_deref(), violation);
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "final-response protocol retry cap reached; ending incomplete",
+                serde_json::json!({
+                    "violation": violation_label,
+                    "blocked_attempts": blocked_attempts,
+                    "retry_limit": retry_limit,
+                    "success_target": success_target,
+                }),
+            );
+            return ActionNextStep::Finish(ActionTerminal::Incomplete {
+                partial_response: Some(partial_response),
+                reason: format!(
+                    "final response stayed non-terminal after {blocked_attempts} attempt(s): {violation_label}"
+                ),
+            });
+        }
+
+        self.emit_signal(
+            LoopStep::Act,
+            SignalKind::Blocked,
+            "final-response protocol violation; retrying final answer",
+            serde_json::json!({
+                "violation": violation_label,
+                "blocked_attempts": blocked_attempts,
+                "retry_limit": retry_limit,
+                "retries_remaining": retries_remaining,
+                "success_target": success_target,
+            }),
+        );
+
+        let mut context_messages = Vec::new();
+        if let Some(response) = prior_response.as_ref() {
+            context_messages.push(Message::assistant(response.clone()));
+        }
+        context_messages.push(Message::system(render_finalize_response_retry_directive(
+            violation,
+            retries_remaining,
+            &success_target,
+        )));
+
+        ActionNextStep::Continue(
+            ActionContinuation::new(None, None)
+                .with_context_messages(context_messages)
+                .with_tool_scope(ContinuationToolScope::NoTools)
+                .with_turn_commitment(final_response_turn_commitment(
+                    format!("final-response protocol violation: {violation_label}"),
+                    &success_target,
+                )),
+        )
+    }
+
+    fn task_contract_blocks_tools(&self) -> bool {
+        self.task_contract
+            .as_ref()
+            .is_some_and(|contract| contract.phase != TaskPhase::Gathering)
+    }
+
     fn current_reasoning_tool_definitions(&self, should_strip_tools: bool) -> Vec<ToolDefinition> {
-        let base = if should_strip_tools {
+        let base = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else if should_strip_tools {
             let limited_tools = self.progress_limited_tool_definitions();
             tracing::info!(
                 turns = self.consecutive_tool_turns,
@@ -1915,7 +3826,8 @@ impl LoopEngine {
 
         let scoped = self.apply_pending_tool_scope(base);
         let phased = self.apply_turn_execution_profile_tool_surface(scoped);
-        self.apply_pending_artifact_gate(phased)
+        let routed = self.apply_preflight_route_tool_surface(phased);
+        self.apply_pending_artifact_gate(routed)
     }
 
     fn pending_turn_commitment_directive(&self) -> Option<String> {
@@ -1924,12 +3836,60 @@ impl LoopEngine {
             .map(render_turn_commitment_directive)
     }
 
+    fn root_turn_contract_directive(&self) -> Option<String> {
+        self.root_turn_contract
+            .as_ref()
+            .map(render_root_turn_contract_directive)
+    }
+
+    fn task_contract_state_directive(&self) -> Option<String> {
+        let mut sections = Vec::new();
+        if let Some(contract) = self.task_contract.as_ref() {
+            sections.push(render_task_contract_state_directive(contract));
+        }
+        if self.turn_progress_ledger.has_explicit_evidence_slots()
+            || self
+                .turn_progress_ledger
+                .has_open_discovered_evidence_slots()
+        {
+            sections.push(render_turn_progress_ledger_directive(
+                &self.turn_progress_ledger,
+            ));
+        }
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
+    }
+
+    fn task_contract_declaration_directive(
+        &self,
+        user_message: &str,
+        tools_available: bool,
+    ) -> Option<&'static str> {
+        if tools_available
+            && self.task_contract.is_none()
+            && should_request_task_contract_declaration(user_message)
+        {
+            return Some(TASK_CONTRACT_DECLARATION_DIRECTIVE.trim_start_matches('\n'));
+        }
+        None
+    }
+
     fn pending_artifact_write_directive(&self) -> Option<String> {
         self.pending_artifact_write_target.as_ref().map(|path| {
             format!(
                 "Immediate next action: write the requested artifact to {path} using write_file. Do not do more observation, search, or shell inspection before attempting this write unless the write itself is blocked."
             )
         })
+    }
+
+    fn root_turn_completion_retry_limit(&self) -> u8 {
+        self.current_termination_config()
+            .root_turn_completion_retry_limit
+    }
+
+    fn repeated_failure_streak_limit(&self) -> u16 {
+        self.current_termination_config()
+            .max_repeated_failure_streak
+            .max(1)
     }
 
     fn current_termination_config(&self) -> Cow<'_, TerminationConfig> {
@@ -1999,22 +3959,26 @@ impl LoopEngine {
 
     /// Make one final LLM call with tools stripped to synthesize findings.
     async fn forced_synthesis_turn(
-        &self,
+        &mut self,
         llm: &dyn LlmProvider,
         messages: &[Message],
+        stream: CycleStream<'_>,
     ) -> Option<String> {
         if !self.budget.config().termination.synthesize_on_exhaustion {
             tracing::debug!("skipping forced synthesis: synthesize_on_exhaustion disabled");
             return None;
         }
 
-        let request = build_forced_synthesis_request(ForcedSynthesisRequestParams::new(
+        let mut request = build_forced_synthesis_request(ForcedSynthesisRequestParams::new(
             messages,
             llm.model_name(),
             self.memory_context.as_deref(),
             self.scratchpad_context.as_deref(),
+            self.execution_context.as_ref(),
+            self.agent_preferences.as_deref(),
             self.notify_tool_guidance_enabled,
         ));
+        request.cache_affinity = self.prompt_cache_affinity();
 
         let remaining_wall_ms = self
             .budget
@@ -2032,17 +3996,41 @@ impl LoopEngine {
         }
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
-        match tokio::time::timeout(timeout, llm.complete(request)).await {
+        let request_messages = request.messages.clone();
+        let text_visibility = if self.root_turn_contract.is_some() {
+            // Forced synthesis is a recovery path. If the root turn declared a
+            // completion contract, this text is speculative until the kernel
+            // validates the required sections, so do not publish it early.
+            TextStreamVisibility::Hidden
+        } else {
+            TextStreamVisibility::Public
+        };
+        let synthesis = async {
+            let response = self
+                .request_completion(
+                    llm,
+                    request,
+                    StreamingRequestContext::new(
+                        LoopStep::Synthesize,
+                        StreamPhase::Synthesize,
+                        text_visibility,
+                    ),
+                    stream,
+                )
+                .await?;
+            self.continue_truncated_response(
+                response,
+                &request_messages,
+                llm,
+                LoopStep::Synthesize,
+                stream,
+            )
+            .await
+        };
+
+        match tokio::time::timeout(timeout, synthesis).await {
             Ok(Ok(response)) => {
-                let text: String = response
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
+                let text = response_text_segment(&response).unwrap_or_default();
                 if text.trim().is_empty() {
                     None
                 } else {
@@ -2050,7 +4038,7 @@ impl LoopEngine {
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("forced synthesis turn failed: {e}");
+                tracing::warn!("forced synthesis turn failed: {e:?}");
                 None
             }
             Err(_elapsed) => {
@@ -2069,13 +4057,63 @@ impl LoopEngine {
             .unwrap_or_else(|| BUDGET_EXHAUSTED_FALLBACK_RESPONSE.to_string())
     }
 
+    fn root_turn_incomplete_reason(block: &RootTurnCompletionBlock) -> String {
+        let mut reason =
+            String::from("required root-turn deliverables were still missing at turn end");
+        if !block.missing_response_sections.is_empty() {
+            reason.push_str("; missing response sections: ");
+            reason.push_str(&block.missing_response_sections.join(", "));
+        }
+        if !block.pending_artifact_paths.is_empty() {
+            reason.push_str("; pending artifact writes: ");
+            reason.push_str(&block.pending_artifact_paths.join(", "));
+        }
+        if !block.pending_external_actions.is_empty() {
+            reason.push_str("; pending external actions: ");
+            reason.push_str(&block.pending_external_actions.join(", "));
+        }
+        reason
+    }
+
+    fn root_turn_external_action_incomplete_response(
+        block: &RootTurnCompletionBlock,
+    ) -> Option<String> {
+        if block.pending_external_actions.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "I could not complete this turn because required external action(s) were still pending: {}. I stopped here rather than claiming the task was finished.",
+            block.pending_external_actions.join(", ")
+        ))
+    }
+
+    fn root_turn_completion_block_for_response(
+        &self,
+        response: &str,
+    ) -> Option<RootTurnCompletionBlock> {
+        self.root_turn_contract
+            .as_ref()
+            .and_then(|contract| root_turn_completion_block(contract, response))
+    }
+
     /// Perceive step.
     async fn perceive(
         &mut self,
         snapshot: &PerceptionSnapshot,
     ) -> Result<ProcessedPerception, LoopError> {
+        self.drain_user_input_to_state();
         let mut snapshot_with_steer = snapshot.clone();
-        snapshot_with_steer.steer_context = self.pending_steer.take();
+        if let Some(live_steer) = self.active_turn_steer.clone() {
+            snapshot_with_steer.steer_context = Some(live_steer);
+        } else if let Some(snapshot_steer) = snapshot_with_steer
+            .steer_context
+            .take()
+            .and_then(normalize_turn_steer)
+        {
+            self.active_turn_steer = Some(snapshot_steer.clone());
+            snapshot_with_steer.steer_context = Some(snapshot_steer);
+        }
 
         let user_message = extract_user_message(&snapshot_with_steer)?;
         self.emit_signal(
@@ -2095,6 +4133,7 @@ impl LoopEngine {
             context_window.insert(insert_pos, memory_message);
         }
 
+        let before_context_window = ContextWindowStats::capture(self, &context_window);
         let compacted_context = {
             let compaction = self.compaction();
             compaction
@@ -2106,6 +4145,11 @@ impl LoopEngine {
                 .await?
         };
         if let Cow::Owned(messages) = compacted_context {
+            self.emit_context_overflow_signal(
+                CompactionScope::Perceive,
+                before_context_window,
+                &messages,
+            );
             context_window = messages;
         }
         self.compaction()
@@ -2148,14 +4192,27 @@ impl LoopEngine {
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
         };
+        let available_tools = self.tool_executor.tool_definitions();
+        let seeded_evidence = self.seed_turn_progress_from_user_message(&user_message);
+        if !seeded_evidence.is_empty() {
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Trace,
+                "seeded explicit turn evidence slots",
+                serde_json::json!({
+                    "slots": seeded_evidence,
+                }),
+            );
+        }
         self.turn_execution_profile = detect_turn_execution_profile_for_ownership(
             &user_message,
-            &self.tool_executor.tool_definitions(),
+            &available_tools,
             self.direct_inspection_ownership,
         );
         self.bounded_local_phase = BoundedLocalPhase::Discovery;
         self.bounded_local_recovery_used = false;
         self.bounded_local_recovery_focus.clear();
+        self.preflight_route_plan = None;
         match &self.turn_execution_profile {
             TurnExecutionProfile::BoundedLocal => {
                 self.emit_signal(
@@ -2190,12 +4247,167 @@ impl LoopEngine {
                     }),
                 );
             }
+            TurnExecutionProfile::DeterministicLocal(plan) => {
+                self.emit_signal(
+                    LoopStep::Perceive,
+                    SignalKind::Trace,
+                    "selected deterministic local execution profile",
+                    serde_json::json!({
+                        "profile": "deterministic_local",
+                        "intent": plan.signal_metadata(),
+                    }),
+                );
+            }
             TurnExecutionProfile::Standard => {}
         }
+        if matches!(self.turn_execution_profile, TurnExecutionProfile::Standard) {
+            if let Some(resource) = detect_route_resource(&user_message) {
+                let runtime_routing_tools = self.collect_runtime_routing_tools();
+                if let Some(route_plan) = build_route_plan(
+                    &resource,
+                    &available_tools,
+                    &runtime_routing_tools,
+                    &self.route_advisories,
+                ) {
+                    self.emit_signal(
+                        LoopStep::Perceive,
+                        SignalKind::Trace,
+                        "planned preflight external resource route",
+                        serde_json::json!({
+                            "decision_kind": ControlPlaneDecisionKind::PreflightRoute,
+                            "decision": "planned",
+                            "resource": &route_plan.resource,
+                            "primary_route": &route_plan.primary_route,
+                            "fallback_routes": &route_plan.fallback_routes,
+                            "requires_probe": route_plan.requires_probe,
+                        }),
+                    );
+                    self.preflight_route_plan = Some(route_plan);
+                } else {
+                    let available_tool_names = available_tools
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>();
+                    let resource_kind = resource.kind();
+                    let mut typed_route_tools = Vec::new();
+                    let mut ready_typed_route_tools = Vec::new();
+                    let mut unready_typed_route_tools = Vec::new();
+                    for summary in runtime_routing_tools
+                        .iter()
+                        .filter(|summary| summary.metadata.resource_kinds.contains(&resource_kind))
+                    {
+                        typed_route_tools.push(summary.tool_name.clone());
+                        if summary.readiness.available && summary.readiness.ready {
+                            ready_typed_route_tools.push(summary.tool_name.clone());
+                        } else {
+                            unready_typed_route_tools.push(serde_json::json!({
+                                "tool_name": &summary.tool_name,
+                                "readiness_reason": &summary.readiness.readiness_reason,
+                            }));
+                        }
+                    }
+                    let degraded_plan =
+                        build_degraded_public_web_fallback_plan(&resource, &available_tools);
+                    let fallback_mode = if degraded_plan.is_some() {
+                        "public_web"
+                    } else {
+                        "unconstrained"
+                    };
+                    self.emit_signal(
+                        LoopStep::Perceive,
+                        SignalKind::Trace,
+                        "resource-bearing request has no ready typed preflight route",
+                        serde_json::json!({
+                            "decision_kind": ControlPlaneDecisionKind::PreflightRoute,
+                            "decision": "no_ready_typed_route",
+                            "resource": &resource,
+                            "available_tools": available_tool_names,
+                            "routing_tool_count": runtime_routing_tools.len(),
+                            "typed_route_tools": typed_route_tools,
+                            "ready_typed_route_tools": ready_typed_route_tools,
+                            "unready_typed_route_tools": unready_typed_route_tools,
+                            "fallback_mode": fallback_mode,
+                            "fallback_route": degraded_plan.as_ref().map(|plan| &plan.primary_route),
+                        }),
+                    );
+                    self.preflight_route_plan = degraded_plan;
+                }
+            }
+        }
         self.requested_artifact_target = extract_requested_write_target(&user_message);
+        let root_turn_contract = extract_root_turn_contract(&user_message);
+        self.root_turn_contract = root_turn_contract.contract;
+        if root_turn_contract.deliverable_block_count > 1 {
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Friction,
+                "multiple Deliverables blocks detected; using the first block only",
+                serde_json::json!({
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                }),
+            );
+        }
+        if let Some(contract) = &self.root_turn_contract {
+            let response_sections = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ResponseSection { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::ArtifactWrite { .. } => None,
+                    RootTurnDeliverable::ExternalAction { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let artifact_paths = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ArtifactWrite { path, .. } => Some(path.clone()),
+                    RootTurnDeliverable::ResponseSection { .. } => None,
+                    RootTurnDeliverable::ExternalAction { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let external_actions = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::ExternalAction { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::ResponseSection { .. }
+                    | RootTurnDeliverable::ArtifactWrite { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            tracing::info!(
+                deliverable_block_count = root_turn_contract.deliverable_block_count,
+                response_sections = ?response_sections,
+                artifact_paths = ?artifact_paths,
+                external_actions = ?external_actions,
+                "extracted root turn completion contract"
+            );
+            self.emit_signal(
+                LoopStep::Perceive,
+                SignalKind::Trace,
+                "extracted root turn completion contract",
+                serde_json::json!({
+                    "deliverable_block_count": root_turn_contract.deliverable_block_count,
+                    "response_sections": response_sections,
+                    "artifact_paths": artifact_paths,
+                    "external_actions": external_actions,
+                }),
+            );
+        }
         self.last_reasoning_messages = build_reasoning_messages(&processed);
 
         Ok(processed)
+    }
+
+    fn seed_turn_progress_from_user_message(&mut self, user_message: &str) -> Vec<String> {
+        extract_user_evidence_references(user_message)
+            .into_iter()
+            .filter_map(|reference| {
+                self.turn_progress_ledger
+                    .seed_explicit_evidence_slot(reference.clone())
+                    .map(|_| reference)
+            })
+            .collect()
     }
 
     /// Reason step.
@@ -2206,6 +4418,9 @@ impl LoopEngine {
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         self.maybe_publish_reason_progress(stream);
+        if let TurnExecutionProfile::DeterministicLocal(plan) = &self.turn_execution_profile {
+            return Ok(plan.completion_response());
+        }
         if let TurnExecutionProfile::DirectUtility(profile) = &self.turn_execution_profile {
             let direct_tools = self.current_reasoning_tool_definitions(false);
             return Ok(direct_utility_completion_response(
@@ -2214,24 +4429,22 @@ impl LoopEngine {
                 &direct_tools,
             ));
         }
+        if self.active_finalize_response().is_some() {
+            return self.reason_final_response(perception, llm, stream).await;
+        }
         let termination = self.current_termination_config();
         let tc = termination.as_ref();
         let should_strip_tools = tc.nudge_after_tool_turns > 0
-            && self.consecutive_tool_turns
-                >= tc
-                    .nudge_after_tool_turns
-                    .saturating_add(tc.strip_tools_after_nudge);
+            && ToolStrippingAfterNudge::from_config_value(tc.strip_tools_after_nudge).should_strip(
+                tc.nudge_after_tool_turns,
+                u32::from(self.consecutive_tool_turns),
+            );
         let tools = self.current_reasoning_tool_definitions(should_strip_tools);
         let mut request = build_reasoning_request(ReasoningRequestParams::new(
             perception,
             llm.model_name(),
             ToolRequestConfig::new(tools, self.reasoning_decompose_enabled()),
-            RequestBuildContext::new(
-                self.memory_context.as_deref(),
-                self.scratchpad_context.as_deref(),
-                self.thinking_config.clone(),
-                self.notify_tool_guidance_enabled,
-            ),
+            self.request_build_context(),
         ));
         if let Some(directive) = self.pending_turn_commitment_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
@@ -2239,10 +4452,31 @@ impl LoopEngine {
                 system_prompt.push_str(&directive);
             }
         }
+        if let Some(directive) = self.root_turn_contract_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nRoot turn completion contract:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
         if let Some(directive) = self.pending_artifact_write_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str("\n\nArtifact gate:\n");
                 system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_declaration_directive(
+            &perception.user_message,
+            !request.tools.is_empty(),
+        ) {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle declaration:\n");
+                system_prompt.push_str(directive);
             }
         }
         if let Some(directive) = self.turn_execution_profile_directive() {
@@ -2257,10 +4491,11 @@ impl LoopEngine {
                 llm,
                 request,
                 StreamingRequestContext::new(
-                    "reason",
+                    LoopStep::Reason,
                     StreamPhase::Reason,
-                    TextStreamVisibility::Public,
-                ),
+                    TextStreamVisibility::Preview,
+                )
+                .with_preview_final_commit(self.root_turn_contract.is_none()),
                 stream,
             )
             .await?;
@@ -2271,6 +4506,89 @@ impl LoopEngine {
                 &reasoning_messages,
                 llm,
                 LoopStep::Reason,
+                stream,
+            )
+            .await?;
+        let latency_ms = current_time_ms().saturating_sub(started);
+        let usage = response.usage;
+        self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
+        Ok(response)
+    }
+
+    async fn reason_final_response(
+        &mut self,
+        perception: &ProcessedPerception,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut request = build_forced_synthesis_request(ForcedSynthesisRequestParams::new(
+            &perception.context_window,
+            llm.model_name(),
+            self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
+            self.execution_context.as_ref(),
+            self.agent_preferences.as_deref(),
+            self.notify_tool_guidance_enabled,
+        ));
+        request.cache_affinity = self.prompt_cache_affinity();
+
+        if let Some(directive) = self.pending_turn_commitment_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTurn commitment:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.root_turn_contract_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nRoot turn completion contract:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.pending_artifact_write_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nArtifact gate:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.turn_execution_profile_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
+
+        self.emit_signal(
+            LoopStep::Synthesize,
+            SignalKind::Trace,
+            "final response synthesis request",
+            serde_json::json!({"tool_count": request.tools.len()}),
+        );
+
+        let request_messages = request.messages.clone();
+        let started = current_time_ms();
+        let response = self
+            .request_completion(
+                llm,
+                request,
+                StreamingRequestContext::new(
+                    LoopStep::Synthesize,
+                    StreamPhase::Synthesize,
+                    TextStreamVisibility::Hidden,
+                ),
+                stream,
+            )
+            .await?;
+        let response = self
+            .continue_truncated_response(
+                response,
+                &request_messages,
+                llm,
+                LoopStep::Synthesize,
                 stream,
             )
             .await?;
@@ -2302,21 +4620,55 @@ impl LoopEngine {
 
     fn text_stream_visibility_for_step(step: LoopStep) -> TextStreamVisibility {
         match step {
-            LoopStep::Reason => TextStreamVisibility::Public,
+            LoopStep::Reason => TextStreamVisibility::Preview,
             LoopStep::Act => TextStreamVisibility::Hidden,
-            _ => TextStreamVisibility::Public,
+            LoopStep::Perceive | LoopStep::Decide | LoopStep::Synthesize => {
+                TextStreamVisibility::Public
+            }
         }
     }
 
-    fn ensure_continuation_budget(
-        &self,
-        continuation_messages: &[Message],
-        step: LoopStep,
-    ) -> Result<(), LoopError> {
+    fn continuation_budget_exhausted(&self, continuation_messages: &[Message]) -> bool {
         let cost = continuation_budget_cost_estimate(continuation_messages);
-        self.budget
-            .check_at(current_time_ms(), &cost)
-            .map_err(|_| loop_error(step_stage(step), "continuation budget exhausted", true))
+        self.budget.check_at(current_time_ms(), &cost).is_err()
+    }
+
+    fn terminal_finalization_continuation_reserve_applies(&self, step: LoopStep) -> bool {
+        step == LoopStep::Synthesize
+            && self.active_finalize_response().is_some()
+            && !self.budget.wall_time_exceeded(current_time_ms())
+    }
+
+    fn emit_terminal_finalization_continuation_reserve_signal(
+        &mut self,
+        step: LoopStep,
+        attempt: u32,
+    ) {
+        self.emit_signal(
+            step,
+            SignalKind::Trace,
+            "terminal final response continuation using reserved budget",
+            serde_json::json!({
+                "decision_kind": ControlPlaneDecisionKind::BudgetGuardrail,
+                "decision": "allowed",
+                "reason": "terminal_finalization_reserve",
+                "attempt": attempt,
+            }),
+        );
+    }
+
+    fn emit_continuation_budget_exhausted_signal(&mut self, step: LoopStep, attempt: u32) {
+        self.emit_signal(
+            step,
+            SignalKind::Blocked,
+            "continuation budget exhausted",
+            serde_json::json!({
+                "decision_kind": ControlPlaneDecisionKind::BudgetGuardrail,
+                "decision": "blocked",
+                "reason": "continuation_budget_exhausted",
+                "attempt": attempt,
+            }),
+        );
     }
 
     fn record_continuation_budget(
@@ -2335,24 +4687,30 @@ impl LoopEngine {
         step: LoopStep,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        self.ensure_continuation_budget(continuation_messages, step)?;
-        let continuation_tools =
-            self.apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+        let continuation_tools = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else {
+            let tools = self
+                .apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+            let scoped = self.apply_pending_tool_scope(tools);
+            self.apply_preflight_route_tool_surface(scoped)
+        };
         let mut request =
             build_truncation_continuation_request(TruncationContinuationRequestParams::new(
                 llm.model_name(),
                 continuation_messages,
                 ToolRequestConfig::new(continuation_tools, self.effective_decompose_enabled()),
-                RequestBuildContext::new(
-                    self.memory_context.as_deref(),
-                    self.scratchpad_context.as_deref(),
-                    self.thinking_config.clone(),
-                    self.notify_tool_guidance_enabled,
-                ),
+                self.request_build_context(),
                 step,
             ));
         if let Some(directive) = self.turn_execution_profile_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.task_contract_state_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nTask lifecycle contract:\n");
                 system_prompt.push_str(&directive);
             }
         }
@@ -2362,7 +4720,7 @@ impl LoopEngine {
                 llm,
                 request,
                 StreamingRequestContext::new(
-                    step_stage(step),
+                    step,
                     stream_phase_for_step(step),
                     Self::text_stream_visibility_for_step(step),
                 ),
@@ -2388,8 +4746,17 @@ impl LoopEngine {
         while is_truncated(combined.stop_reason.as_deref()) && attempts < MAX_CONTINUATION_ATTEMPTS
         {
             attempts = attempts.saturating_add(1);
-            self.emit_continuation_trace(step, attempts);
             let continuation_messages = build_continuation_messages(base_messages, &full_text);
+            if self.continuation_budget_exhausted(&continuation_messages) {
+                if self.terminal_finalization_continuation_reserve_applies(step) {
+                    self.emit_terminal_finalization_continuation_reserve_signal(step, attempts);
+                } else {
+                    self.emit_continuation_budget_exhausted_signal(step, attempts);
+                    combined.stop_reason = Some("continuation_budget_exhausted".to_string());
+                    break;
+                }
+            }
+            self.emit_continuation_trace(step, attempts);
             let continued = self
                 .request_truncated_continuation(llm, &continuation_messages, step, stream)
                 .await?;
@@ -2401,7 +4768,15 @@ impl LoopEngine {
 
     fn capture_tool_response_state(&mut self, response: &CompletionResponse) {
         self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
-        self.pending_tool_response_text = response_text_segment(response);
+        let extracted = extract_task_contract_from_response(response);
+        if self.task_contract.is_none() {
+            if let Some(contract) = extracted.contract {
+                self.turn_progress_ledger.seed_task_contract(&contract);
+                self.task_contract = Some(contract);
+            }
+        }
+        self.pending_tool_response_text =
+            tool_response_final_text(response, extracted.visible_text);
     }
 
     fn clear_tool_response_state(&mut self) {
@@ -2415,11 +4790,47 @@ impl LoopEngine {
         response: &CompletionResponse,
     ) {
         self.tool_call_provider_ids = extract_tool_use_provider_ids(&response.content);
-        push_response_segment(&mut state.accumulated_text, response_text_segment(response));
+        let extracted = extract_task_contract_from_response(response);
+        if self.task_contract.is_none() {
+            if let Some(contract) = extracted.contract {
+                self.turn_progress_ledger.seed_task_contract(&contract);
+                self.task_contract = Some(contract);
+            }
+        }
+        push_response_segment(
+            &mut state.accumulated_text,
+            tool_response_final_text(response, extracted.visible_text),
+        );
     }
 
     /// Decide step.
     async fn decide(&mut self, response: &CompletionResponse) -> Result<Decision, LoopError> {
+        if self.active_finalize_response().is_some() {
+            let raw = extract_response_text(response);
+            let text = normalize_response_text(&extract_readable_text(&raw));
+            self.final_response_candidate_truncated =
+                final_response_stop_reason_is_nonterminal(response.stop_reason.as_deref());
+            if !response.tool_calls.is_empty() {
+                self.final_response_attempted_tool_activity = true;
+                self.emit_signal(
+                    LoopStep::Decide,
+                    SignalKind::Blocked,
+                    "dropping tool calls from final response",
+                    serde_json::json!({"tool_call_count": response.tool_calls.len()}),
+                );
+                self.clear_tool_response_state();
+                let decision = Decision::Respond(text);
+                self.emit_decision_signals(&decision);
+                return Ok(decision);
+            }
+            if !text.trim().is_empty() {
+                self.clear_tool_response_state();
+                let decision = Decision::Respond(text);
+                self.emit_decision_signals(&decision);
+                return Ok(decision);
+            }
+        }
+
         // Decompose takes priority over all other tool calls in the same response.
         // Other tool calls are intentionally discarded — the sub-goals will re-invoke tools as needed.
         if let Some(decompose_call) = find_decompose_tool_call(&response.tool_calls) {
@@ -2458,7 +4869,10 @@ impl LoopEngine {
                     serde_json::json!({"dropped_count": response.tool_calls.len() - 1}),
                 );
             }
-            let plan = parse_decomposition_plan(&decompose_call.arguments)?;
+            let plan = parse_decomposition_plan(
+                &decompose_call.arguments,
+                self.graph_of_thoughts_enabled,
+            )?;
             let decision = Decision::Decompose(plan);
             self.emit_decision_signals(&decision);
             return Ok(decision);
@@ -2487,6 +4901,12 @@ impl LoopEngine {
         context_messages: &[Message],
         stream: CycleStream<'_>,
     ) -> Result<ActionResult, LoopError> {
+        if self.active_finalize_response().is_some()
+            && matches!(decision, Decision::UseTools(_) | Decision::Decompose(_))
+        {
+            return Ok(self.finalize_response_tool_activity_action_result(decision));
+        }
+
         match decision {
             // Note: Clarify and Defer are not produced by decide() in the current
             // loop engine flow, but are kept for external callers (Decision is pub).
@@ -2513,7 +4933,25 @@ impl LoopEngine {
         }
     }
 
-    /// Evaluate decompose gates in order: batch detection → complexity floor → cost gate.
+    fn finalize_response_tool_activity_action_result(
+        &mut self,
+        decision: &Decision,
+    ) -> ActionResult {
+        let next_step = self.block_finalize_response_completion(
+            None,
+            FinalResponseViolation::ToolActivityAttempted,
+        );
+        ActionResult {
+            decision: decision.clone(),
+            tool_results: Vec::new(),
+            response_text: String::new(),
+            tokens_used: TokenUsage::default(),
+            next_step,
+        }
+    }
+
+    /// Evaluate decompose gates in order:
+    /// batch detection → complexity floor → cost gate → child budget floor.
     ///
     /// Returns `Some(Ok(..))` if a gate fires (short-circuits decomposition),
     /// `Some(Err(..))` on execution error, or `None` to proceed with normal decomposition.
@@ -2524,34 +4962,59 @@ impl LoopEngine {
         llm: &dyn LlmProvider,
         context_messages: &[Message],
     ) -> Option<Result<ActionResult, LoopError>> {
-        if self.is_batch_plan(plan) {
-            if let Some(calls) = self.batch_to_tool_calls(plan) {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Trace,
-                    "decompose_batch_detected",
-                    serde_json::json!({
-                        "sub_goal_count": plan.sub_goals.len(),
-                        "common_tool": &plan.sub_goals[0].required_tools[0],
-                    }),
-                );
-                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+        if plan.reasoning_mode.is_standard() {
+            if self.is_batch_plan(plan) {
+                if let Some(calls) = self.batch_to_tool_calls(plan) {
+                    self.emit_signal(
+                        LoopStep::Act,
+                        SignalKind::Trace,
+                        "decompose_batch_detected",
+                        serde_json::json!({
+                            "sub_goal_count": plan.sub_goals.len(),
+                            "common_tool": &plan.sub_goals[0].required_tools[0],
+                        }),
+                    );
+                    return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+                }
+            }
+
+            if self.is_trivial_plan(plan) {
+                if let Some(calls) = self.batch_to_tool_calls(plan) {
+                    self.emit_signal(
+                        LoopStep::Act,
+                        SignalKind::Trace,
+                        "decompose_complexity_floor",
+                        serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
+                    );
+                    return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
+                }
             }
         }
 
-        if self.is_trivial_plan(plan) {
-            if let Some(calls) = self.batch_to_tool_calls(plan) {
-                self.emit_signal(
-                    LoopStep::Act,
-                    SignalKind::Trace,
-                    "decompose_complexity_floor",
-                    serde_json::json!({ "sub_goal_count": plan.sub_goals.len() }),
-                );
-                return Some(self.route_as_tool_calls(calls, llm, context_messages).await);
-            }
+        if let Some(gated) = self.evaluate_cost_gate(plan, decision) {
+            return Some(gated);
         }
 
-        self.evaluate_cost_gate(plan, decision)
+        if self.budget.state() != BudgetState::Low
+            && self.all_sub_goals_below_decomposition_budget_floor(plan)
+        {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Blocked,
+                "decompose_budget_floor_gate",
+                serde_json::json!({
+                    "decision_kind": ControlPlaneDecisionKind::BudgetGuardrail,
+                    "decision": "blocked",
+                    "reason": "all_sub_goals_below_budget_floor",
+                }),
+            );
+            return Some(
+                self.execute_decomposition(decision, plan, llm, context_messages)
+                    .await,
+            );
+        }
+
+        None
     }
 
     /// Convert plan sub-goals to tool calls and route through `act_with_tools`.
@@ -2718,19 +5181,12 @@ impl LoopEngine {
     }
 
     fn roll_up_sub_goal_signals(&mut self, signals: &[Signal]) {
-        for signal in signals {
-            self.signals.emit(signal.clone());
-        }
+        self.signals.import_signals(signals);
     }
 
     fn emit_reason_trace_and_perf(&mut self, latency_ms: u64, usage: Option<&fx_llm::Usage>) {
         let metadata = usage
-            .map(|u| {
-                serde_json::json!({
-                    "input_tokens": u.input_tokens,
-                    "output_tokens": u.output_tokens,
-                })
-            })
+            .map(usage_trace_metadata)
             .unwrap_or_else(|| serde_json::json!({"usage": "unavailable"}));
         self.emit_signal(
             LoopStep::Reason,
@@ -2743,6 +5199,35 @@ impl LoopEngine {
             SignalKind::Performance,
             "LLM latency",
             serde_json::json!({"latency_ms": latency_ms}),
+        );
+    }
+
+    fn emit_context_overflow_signal(
+        &mut self,
+        scope: CompactionScope,
+        before: ContextWindowStats,
+        after_messages: &[Message],
+    ) {
+        let after = ContextWindowStats::capture(self, after_messages);
+        if after.message_count >= before.message_count && after.token_count >= before.token_count {
+            return;
+        }
+
+        self.emit_signal(
+            scope.loop_step(),
+            SignalKind::ContextOverflow,
+            "conversation context compacted",
+            signal_metadata_value(ContextOverflowSignalMetadata {
+                scope: scope.as_str(),
+                messages_before: before.message_count,
+                messages_after: after.message_count,
+                messages_removed: before.message_count.saturating_sub(after.message_count),
+                tokens_before: before.token_count,
+                tokens_after: after.token_count,
+                tokens_evicted: before.token_count.saturating_sub(after.token_count),
+                usage_ratio_before: before.usage_ratio,
+                usage_ratio_after: after.usage_ratio,
+            }),
         );
     }
 
@@ -2759,8 +5244,12 @@ impl LoopEngine {
             "follow_up_calls": response.tool_calls.len(),
         });
         if let Some(usage) = response.usage {
-            metadata["input_tokens"] = serde_json::json!(usage.input_tokens);
-            metadata["output_tokens"] = serde_json::json!(usage.output_tokens);
+            let usage_metadata = usage_trace_metadata(&usage);
+            if let Some(object) = usage_metadata.as_object() {
+                for (key, value) in object {
+                    metadata[key] = value.clone();
+                }
+            }
         } else {
             metadata["usage"] = serde_json::json!("unavailable");
         }
@@ -2815,9 +5304,10 @@ impl LoopEngine {
 
     fn emit_action_signals(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
         for result in results {
-            let classification = calls
+            let call = calls
                 .iter()
-                .find(|call| call.id == result.tool_call_id)
+                .find(|candidate| candidate.id == result.tool_call_id);
+            let classification = call
                 .map(|call| self.tool_executor.classify_call(call))
                 .unwrap_or_else(
                     || match self.tool_executor.cacheability(&result.tool_name) {
@@ -2839,16 +5329,114 @@ impl LoopEngine {
             } else {
                 result.output.clone()
             };
-            self.emit_signal(
+            let mut metadata = serde_json::json!({
+                "success": result.success,
+                "output": truncated_output,
+                "failure_class": result.failure_classification().map(|class| class.as_str()),
+                "permanent": result
+                    .failure_classification()
+                    .is_some_and(FailureClass::is_permanent),
+                "classification": SignalToolClassification::from(classification),
+            });
+            let diagnostics = self
+                .pending_tool_result_diagnostics
+                .remove(&result.tool_call_id);
+            if !result.success {
+                metadata["decision_kind"] =
+                    serde_json::json!(ControlPlaneDecisionKind::ToolFailure);
+                metadata["decision"] = serde_json::json!("failed");
+                metadata["tool"] = serde_json::json!(result.tool_name);
+                metadata["tool_call_id"] = serde_json::json!(result.tool_call_id);
+                if let Some(diagnostics) = diagnostics.as_ref() {
+                    metadata["diagnostics"] = diagnostics.as_metadata_value();
+                }
+            }
+            let timeout_duration_ms = self
+                .tool_executor
+                .concurrency_policy()
+                .timeout_per_call
+                .and_then(|timeout| u64::try_from(timeout.as_millis()).ok());
+            let elapsed_ms = diagnostics
+                .as_ref()
+                .and_then(ToolExecutionDiagnostics::duration_ms);
+            let timed_out = result.is_timeout()
+                || diagnostics
+                    .as_ref()
+                    .is_some_and(ToolExecutionDiagnostics::timed_out);
+            let mut signal = Signal::new(
                 LoopStep::Act,
                 kind,
                 format!("tool {}", result.tool_name),
-                serde_json::json!({
-                    "success": result.success,
-                    "output": truncated_output,
-                    "classification": tool_call_classification_label(classification),
-                }),
+                metadata,
+                current_time_ms(),
             );
+            if let Some(duration_ms) = elapsed_ms {
+                signal = signal.with_duration_ms(duration_ms);
+            }
+            let signal_id = self.emit_structured_signal(signal);
+            if timed_out {
+                let mut timeout_signal = Signal::new(
+                    LoopStep::Act,
+                    SignalKind::Timeout,
+                    format!("tool '{}' timed out", result.tool_name),
+                    signal_metadata_value(TimeoutSignalMetadata {
+                        decision_kind: ControlPlaneDecisionKind::ToolFailure,
+                        tool: &result.tool_name,
+                        tool_call_id: &result.tool_call_id,
+                        failure_class: result.failure_classification().map(FailureClass::as_str),
+                        permanent: result
+                            .failure_classification()
+                            .is_some_and(FailureClass::is_permanent),
+                        timeout_ms: timeout_duration_ms,
+                        elapsed_ms,
+                    }),
+                    current_time_ms(),
+                )
+                .with_cause_id(signal_id);
+                if let Some(duration_ms) = elapsed_ms {
+                    timeout_signal = timeout_signal.with_duration_ms(duration_ms);
+                }
+                let _ = self.emit_structured_signal(timeout_signal);
+            }
+            if let Some(call) = call {
+                if result.success {
+                    self.clear_tool_failure_signal(call);
+                } else {
+                    self.remember_tool_failure_signal(call, signal_id);
+                }
+            }
+            if let Some(signals) = self
+                .pending_tool_result_signals
+                .remove(&result.tool_call_id)
+            {
+                for signal in signals {
+                    let signal = if signal.cause_id.is_some() {
+                        signal
+                    } else {
+                        signal.with_cause_id(signal_id)
+                    };
+                    let _ = self.emit_structured_signal(signal);
+                }
+            }
+        }
+    }
+
+    fn capture_tool_execution_diagnostics(&mut self, results: &[ToolResult]) {
+        for result in results {
+            if let Some(diagnostics) = self
+                .tool_executor
+                .take_execution_diagnostics(&result.tool_call_id)
+            {
+                self.pending_tool_result_diagnostics
+                    .insert(result.tool_call_id.clone(), diagnostics);
+            }
+            if let Some(signals) = self
+                .tool_executor
+                .take_emitted_signals(&result.tool_call_id)
+            {
+                self.pending_tool_result_signals
+                    .insert(result.tool_call_id.clone(), signals);
+            }
         }
     }
 
@@ -2966,10 +5554,7 @@ impl LoopEngine {
         decision: &Decision,
         state: ToolRoundState,
     ) -> ActionResult {
-        let partial_response = stitched_response_text(
-            &state.accumulated_text,
-            summarize_tool_progress(&state.all_tool_results),
-        );
+        let partial_response = summarize_tool_progress(&state.all_tool_results);
         self.cancelled_tool_action(
             decision,
             state.all_tool_results,
@@ -3010,7 +5595,8 @@ impl LoopEngine {
             );
         }
 
-        let plan = parse_decomposition_plan(&decompose_call.arguments)?;
+        let plan =
+            parse_decomposition_plan(&decompose_call.arguments, self.graph_of_thoughts_enabled)?;
         let decision = Decision::Decompose(plan.clone());
         self.emit_decision_signals(&decision);
 
@@ -3132,13 +5718,6 @@ impl LoopEngine {
             depth: 0,
             parent_context: None,
         }
-    }
-}
-
-fn tool_call_classification_label(classification: ToolCallClassification) -> &'static str {
-    match classification {
-        ToolCallClassification::Observation => "observation",
-        ToolCallClassification::Mutation => "mutation",
     }
 }
 
@@ -3288,14 +5867,6 @@ fn build_continuation_messages(base_messages: &[Message], full_text: &str) -> Ve
     continuation_messages
 }
 
-fn step_stage(step: LoopStep) -> &'static str {
-    match step {
-        LoopStep::Reason => "reason",
-        LoopStep::Act => "act",
-        _ => "act",
-    }
-}
-
 fn stream_phase_for_step(step: LoopStep) -> StreamPhase {
     match step {
         LoopStep::Reason => StreamPhase::Reason,
@@ -3387,12 +5958,34 @@ fn merge_usage(left: Option<Usage>, right: Option<Usage>) -> Option<Usage> {
 
     let left_in = left.as_ref().map(|u| u.input_tokens).unwrap_or(0);
     let left_out = left.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+    let left_cached = left.as_ref().map(|u| u.cached_input_tokens).unwrap_or(0);
+    let left_cache_creation = left
+        .as_ref()
+        .map(|u| u.cache_creation_input_tokens)
+        .unwrap_or(0);
     let right_in = right.as_ref().map(|u| u.input_tokens).unwrap_or(0);
     let right_out = right.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+    let right_cached = right.as_ref().map(|u| u.cached_input_tokens).unwrap_or(0);
+    let right_cache_creation = right
+        .as_ref()
+        .map(|u| u.cache_creation_input_tokens)
+        .unwrap_or(0);
 
     Some(Usage {
         input_tokens: left_in.saturating_add(right_in),
         output_tokens: left_out.saturating_add(right_out),
+        cached_input_tokens: left_cached.saturating_add(right_cached),
+        cache_creation_input_tokens: left_cache_creation.saturating_add(right_cache_creation),
+    })
+}
+
+fn usage_trace_metadata(usage: &Usage) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "total_tokens": usage.input_tokens.saturating_add(usage.output_tokens),
     })
 }
 
@@ -3429,10 +6022,7 @@ fn response_usage_or_estimate(
     context_messages: &[Message],
 ) -> TokenUsage {
     if let Some(usage) = response.usage {
-        return TokenUsage {
-            input_tokens: u64::from(usage.input_tokens),
-            output_tokens: u64::from(usage.output_tokens),
-        };
+        return TokenUsage::from_llm_usage(usage);
     }
 
     let prompt_estimate: u64 = context_messages
@@ -3450,6 +6040,7 @@ fn response_usage_or_estimate(
     TokenUsage {
         input_tokens: prompt_estimate,
         output_tokens: estimate_tokens(&text),
+        ..Default::default()
     }
 }
 
@@ -3457,6 +6048,7 @@ fn reasoning_token_usage(total_tokens: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: total_tokens.saturating_mul(3) / 5,
         output_tokens: total_tokens.saturating_mul(2) / 5,
+        ..Default::default()
     }
 }
 
@@ -3513,7 +6105,979 @@ fn extract_requested_write_target(user_message: &str) -> Option<String> {
             return Some(cleaned.to_string());
         }
     }
+
+    for (start, _) in lower.match_indices(" to ") {
+        let prefix_context = lower[..start].trim_end();
+        if !prefix_context_contains_recent_write_verb(prefix_context) {
+            continue;
+        }
+        let raw = user_message[start + 4..].split_whitespace().next()?;
+        let cleaned = raw
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '>' | ',' | ';'))
+            .trim_end_matches('.')
+            .trim();
+        if looks_like_artifact_path(cleaned) {
+            return Some(cleaned.to_string());
+        }
+    }
     None
+}
+
+// Keep the fallback matcher precise: only recent standalone write verbs should
+// activate it, so substring hits like "unsafe" and distant earlier verbs do
+// not accidentally create an artifact gate.
+fn prefix_context_contains_recent_write_verb(prefix_context: &str) -> bool {
+    const VERBS: [&str; 4] = ["write", "save", "append", "create"];
+    prefix_context
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .rev()
+        .take(8)
+        .any(|token| VERBS.contains(&token))
+}
+
+fn extract_requested_external_actions(user_message: &str) -> Vec<RootTurnExternalActionKind> {
+    let mut actions = Vec::new();
+    if requests_github_pr_comment(user_message) {
+        actions.push(RootTurnExternalActionKind::GitHubPrComment);
+    }
+    if requests_github_issue_comment(user_message) {
+        actions.push(RootTurnExternalActionKind::GitHubIssueComment);
+    }
+    if requests_github_pr_review(user_message) {
+        actions.push(RootTurnExternalActionKind::GitHubPrReview);
+    }
+    if requests_git_push(user_message) {
+        actions.push(RootTurnExternalActionKind::GitPush);
+    }
+    actions
+}
+
+fn requests_github_pr_comment(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not post")
+        || normalized.contains("don t post")
+        || normalized.contains("without posting")
+    {
+        return false;
+    }
+
+    let has_comment = normalized.contains(" comment") || normalized.contains("comment ");
+    let has_posting_verb = ["post", "submit", "publish", "add", "leave"]
+        .iter()
+        .any(|verb| normalized.split_whitespace().any(|token| token == *verb));
+    let has_pr_target = normalized.split_whitespace().any(|token| token == "pr")
+        || normalized.contains("pull request");
+
+    has_comment && has_posting_verb && has_pr_target
+}
+
+fn requests_github_issue_comment(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not post")
+        || normalized.contains("don t post")
+        || normalized.contains("without posting")
+    {
+        return false;
+    }
+
+    let has_comment = normalized.contains(" comment") || normalized.contains("comment ");
+    let has_posting_verb = ["post", "submit", "publish", "add", "leave"]
+        .iter()
+        .any(|verb| normalized.split_whitespace().any(|token| token == *verb));
+    let has_issue_target = normalized.split_whitespace().any(|token| token == "issue")
+        || normalized.contains("github issue");
+    let has_pr_target = normalized.split_whitespace().any(|token| token == "pr")
+        || normalized.contains("pull request");
+
+    has_comment && has_posting_verb && has_issue_target && !has_pr_target
+}
+
+fn requests_github_pr_review(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not approve")
+        || normalized.contains("don t approve")
+        || normalized.contains("without approving")
+        || normalized.contains("without review")
+    {
+        return false;
+    }
+
+    let has_pr_target = normalized.split_whitespace().any(|token| token == "pr")
+        || normalized.contains("pull request");
+    let asks_for_review_submission = normalized.contains("approve")
+        || normalized.contains("approval")
+        || normalized.contains("request changes")
+        || normalized.contains("submit review")
+        || normalized.contains("post review")
+        || normalized.contains("leave review");
+
+    has_pr_target && asks_for_review_submission
+}
+
+fn requests_git_push(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not push")
+        || normalized.contains("don t push")
+        || normalized.contains("without pushing")
+    {
+        return false;
+    }
+
+    normalized.split_whitespace().any(|token| token == "push")
+        && (normalized.contains(" git")
+            || normalized.contains(" branch")
+            || normalized.contains(" remote")
+            || normalized.contains(" commit")
+            || normalized.contains(" pr"))
+}
+
+fn external_action_label(kind: RootTurnExternalActionKind) -> &'static str {
+    match kind {
+        RootTurnExternalActionKind::GitHubPrComment => "Post a comment on the GitHub pull request",
+        RootTurnExternalActionKind::GitHubIssueComment => "Post a comment on the GitHub issue",
+        RootTurnExternalActionKind::GitHubPrReview => "Submit the GitHub pull request review",
+        RootTurnExternalActionKind::GitPush => "Push changes to the git remote",
+    }
+}
+
+fn external_action_completed(
+    kind: RootTurnExternalActionKind,
+    calls: &[ToolCall],
+    results: &[ToolResult],
+    typed_completed_actions: &HashSet<RootTurnExternalActionKind>,
+) -> bool {
+    if typed_completed_actions.contains(&kind) {
+        return true;
+    }
+
+    match kind {
+        RootTurnExternalActionKind::GitHubPrComment => {
+            github_pr_comment_completed_by_legacy_shell_inference(calls, results)
+        }
+        RootTurnExternalActionKind::GitHubIssueComment => false,
+        RootTurnExternalActionKind::GitHubPrReview => false,
+        RootTurnExternalActionKind::GitPush => false,
+    }
+}
+
+fn completed_external_actions_from_diagnostics(
+    results: &[ToolResult],
+    diagnostics: &HashMap<String, ToolExecutionDiagnostics>,
+) -> HashSet<RootTurnExternalActionKind> {
+    let mut completed = HashSet::new();
+    // Typed evidence only satisfies an external-action deliverable when the
+    // producing tool result succeeded. A parsed `git push` command from a
+    // rejected/failed shell result is useful diagnostic metadata, but it must
+    // not close the user-visible contract.
+    for result in results.iter().filter(|result| result.success) {
+        let Some(diagnostics) = diagnostics.get(&result.tool_call_id) else {
+            continue;
+        };
+        for evidence in diagnostics.external_actions() {
+            let kind = match evidence.kind {
+                ExternalActionKind::GithubPrComment => RootTurnExternalActionKind::GitHubPrComment,
+                ExternalActionKind::GithubIssueComment => {
+                    RootTurnExternalActionKind::GitHubIssueComment
+                }
+                ExternalActionKind::GithubPrReview => RootTurnExternalActionKind::GitHubPrReview,
+                ExternalActionKind::GitPush => RootTurnExternalActionKind::GitPush,
+            };
+            completed.insert(kind);
+        }
+    }
+    completed
+}
+
+fn github_pr_comment_completed_by_legacy_shell_inference(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results).any(|(call, result)| {
+        call.name == "github_pr_comment"
+            || (call.name == "run_command"
+                && run_command_posts_github_pr_comment(&call.arguments, &result.output))
+    })
+}
+
+fn successful_call_evidence<'a>(
+    calls: &'a [ToolCall],
+    results: &'a [ToolResult],
+) -> impl Iterator<Item = (&'a ToolCall, &'a ToolResult)> {
+    calls.iter().filter_map(|call| {
+        results
+            .iter()
+            .find(|result| result.success && result.tool_call_id == call.id)
+            .map(|result| (call, result))
+    })
+}
+
+fn run_command_posts_github_pr_comment(arguments: &serde_json::Value, output: &str) -> bool {
+    !crate::act::external_actions_from_run_command_arguments(arguments, output).is_empty()
+}
+
+#[cfg(test)]
+fn command_posts_github_pr_comment(command: &str) -> bool {
+    command_posts_github_pr_comment_with_output(command, "")
+}
+
+#[cfg(test)]
+fn command_posts_github_pr_comment_with_output(command: &str, output: &str) -> bool {
+    !crate::act::external_actions_from_run_command(command, output).is_empty()
+}
+
+fn extract_task_contract_from_response(response: &CompletionResponse) -> TaskContractExtraction {
+    let raw = extract_response_text(response);
+    let readable = extract_readable_text(&raw);
+    extract_task_contract_from_text(&readable)
+}
+
+fn tool_response_final_text(
+    response: &CompletionResponse,
+    visible_text: Option<String>,
+) -> Option<String> {
+    // Text emitted in the same model response as tool calls is a live narration
+    // channel for clients. It may explain what the agent is checking next, but
+    // it is not final answer content and must not be stitched into terminal
+    // responses or partial-response fallbacks.
+    response
+        .tool_calls
+        .is_empty()
+        .then_some(visible_text)
+        .flatten()
+}
+
+fn extract_task_contract_from_text(text: &str) -> TaskContractExtraction {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header_index) = lines
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case("task plan:"))
+    else {
+        return TaskContractExtraction {
+            contract: None,
+            visible_text: meaningful_response_text(text),
+        };
+    };
+
+    let mut descriptions = Vec::new();
+    let mut end_index = header_index + 1;
+    while end_index < lines.len() {
+        let trimmed = lines[end_index].trim();
+        if trimmed.is_empty() {
+            end_index += 1;
+            if !descriptions.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let Some(item) = parse_list_item(trimmed) else {
+            break;
+        };
+        let description = sanitize_task_contract_label(item);
+        if !description.is_empty() {
+            descriptions.push(description);
+        }
+        end_index += 1;
+    }
+
+    if descriptions.is_empty() {
+        return TaskContractExtraction {
+            contract: None,
+            visible_text: meaningful_response_text(text),
+        };
+    }
+
+    let mut visible_lines = Vec::new();
+    visible_lines.extend_from_slice(&lines[..header_index]);
+    visible_lines.extend_from_slice(&lines[end_index..]);
+    let visible_text = meaningful_response_text(&visible_lines.join("\n"));
+
+    TaskContractExtraction {
+        contract: Some(TaskContract {
+            inputs: descriptions
+                .into_iter()
+                .map(|description| InputRequirement {
+                    normalized_description: normalize_contract_label(&description),
+                    description,
+                    satisfied: false,
+                })
+                .collect(),
+            phase: TaskPhase::Gathering,
+        }),
+        visible_text,
+    }
+}
+
+fn extract_root_turn_contract(user_message: &str) -> RootTurnContractExtraction {
+    let deliverable_parse = extract_deliverable_response_sections(user_message);
+    let response_labels = deliverable_parse.labels;
+    let mut deliverables = response_labels
+        .into_iter()
+        .map(|label| RootTurnDeliverable::ResponseSection {
+            normalized_label: normalize_contract_label(&label),
+            label,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(path) = extract_requested_write_target(user_message) {
+        if !deliverables.iter().any(|deliverable| {
+            matches!(
+                deliverable,
+                RootTurnDeliverable::ArtifactWrite {
+                    path: existing,
+                    ..
+                } if existing == &path
+            )
+        }) {
+            deliverables.push(RootTurnDeliverable::ArtifactWrite {
+                path,
+                satisfied: false,
+            });
+        }
+    }
+
+    for action in extract_requested_external_actions(user_message) {
+        if !deliverables.iter().any(|deliverable| {
+            matches!(
+                deliverable,
+                RootTurnDeliverable::ExternalAction { kind, .. } if *kind == action
+            )
+        }) {
+            deliverables.push(RootTurnDeliverable::ExternalAction {
+                kind: action,
+                label: external_action_label(action).to_string(),
+                satisfied: false,
+            });
+        }
+    }
+
+    RootTurnContractExtraction {
+        contract: (!deliverables.is_empty()).then_some(RootTurnContract {
+            deliverables,
+            blocked_terminal_attempts: 0,
+        }),
+        deliverable_block_count: deliverable_parse.block_count,
+    }
+}
+
+// Only the first explicit `Deliverables:` block becomes the root-turn contract.
+// Later blocks are ignored so the kernel has a single deterministic checklist.
+fn extract_deliverable_response_sections(user_message: &str) -> DeliverableSectionParse {
+    let mut lines = user_message.lines().peekable();
+    let mut first_labels = None;
+    let mut block_count = 0;
+    while let Some(line) = lines.next() {
+        if !line.trim().eq_ignore_ascii_case("deliverables:") {
+            continue;
+        }
+
+        block_count += 1;
+        let items = parse_deliverables_block(&mut lines);
+        if first_labels.is_none() {
+            first_labels = Some(items);
+        }
+    }
+    DeliverableSectionParse {
+        labels: first_labels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| sanitize_deliverable_label(&item))
+            .filter(|label| !label.is_empty())
+            .collect(),
+        block_count,
+    }
+}
+
+fn parse_deliverables_block<'a, I>(lines: &mut std::iter::Peekable<I>) -> Vec<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut items = Vec::new();
+    while let Some(next_line) = lines.peek() {
+        let trimmed = next_line.trim();
+        if trimmed.is_empty() {
+            lines.next();
+            if !items.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let Some(item) = parse_list_item(trimmed) else {
+            break;
+        };
+        items.push(item.to_string());
+        lines.next();
+    }
+    items
+}
+
+fn parse_list_item(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim());
+        }
+    }
+
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let suffix = trimmed[digit_count..].chars().next()?;
+    if !matches!(suffix, '.' | ')') {
+        return None;
+    }
+    Some(trimmed[digit_count + suffix.len_utf8()..].trim())
+}
+
+fn sanitize_deliverable_label(item: &str) -> String {
+    item.trim()
+        .trim_matches(|c: char| matches!(c, '*' | '_' | '`'))
+        .trim_end_matches(':')
+        .trim()
+        .to_string()
+}
+
+fn sanitize_task_contract_label(item: &str) -> String {
+    let trimmed = sanitize_deliverable_label(item);
+    for prefix in ["[ ]", "[x]", "[X]"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    trimmed
+}
+
+fn normalize_contract_label(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// Only ask for an internal task plan when the user has already named multiple
+// concrete inputs. That keeps one-off tool turns out of unnecessary planning
+// loops while preserving the structural contract for real context gathering.
+fn should_request_task_contract_declaration(user_message: &str) -> bool {
+    let mut references = HashSet::new();
+    let tokens: Vec<&str> = user_message.split_whitespace().collect();
+
+    for window in tokens.windows(2) {
+        let [keyword, number] = window else {
+            continue;
+        };
+        if normalize_contract_label(keyword) != "issue" {
+            continue;
+        }
+        let cleaned = trim_task_contract_reference_token(number);
+        if !cleaned.is_empty() && cleaned.chars().all(|ch| ch.is_ascii_digit()) {
+            references.insert(format!("issue-{cleaned}"));
+        }
+    }
+
+    for token in tokens {
+        let cleaned = trim_task_contract_reference_token(token);
+        if looks_like_task_contract_reference(cleaned) {
+            references.insert(cleaned.to_ascii_lowercase());
+        }
+    }
+
+    references.len() >= 2
+}
+
+fn extract_user_evidence_references(user_message: &str) -> Vec<String> {
+    let tokens = user_message.split_whitespace().collect::<Vec<_>>();
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+
+    for index in 0..tokens.len() {
+        let token = trim_task_contract_reference_token(tokens[index]);
+        let normalized = normalize_contract_label(token);
+        let next = tokens
+            .get(index + 1)
+            .map(|token| trim_task_contract_reference_token(token));
+        let next_next = tokens
+            .get(index + 2)
+            .map(|token| trim_task_contract_reference_token(token));
+
+        if matches!(normalized.as_str(), "pr" | "pull request") {
+            if let Some(value) = next.and_then(normalize_numeric_reference) {
+                push_unique_evidence_reference(&mut references, &mut seen, format!("pr {value}"));
+            }
+        } else if normalized == "pull" {
+            let next_keyword = next.map(normalize_contract_label);
+            if next_keyword.as_deref() == Some("request") {
+                if let Some(value) = next_next.and_then(normalize_numeric_reference) {
+                    push_unique_evidence_reference(
+                        &mut references,
+                        &mut seen,
+                        format!("pr {value}"),
+                    );
+                }
+            }
+        } else if matches!(normalized.as_str(), "issue" | "issues") {
+            if let Some(value) = next.and_then(normalize_numeric_reference) {
+                push_unique_evidence_reference(
+                    &mut references,
+                    &mut seen,
+                    format!("issue {value}"),
+                );
+            }
+        }
+    }
+
+    for token in tokens {
+        let cleaned = trim_task_contract_reference_token(token);
+        if cleaned.contains("://") {
+            push_unique_evidence_reference(&mut references, &mut seen, cleaned.to_string());
+            continue;
+        }
+        if let Some(value) = cleaned
+            .strip_prefix('#')
+            .and_then(normalize_numeric_reference)
+        {
+            push_unique_evidence_reference(&mut references, &mut seen, format!("#{value}"));
+            continue;
+        }
+        if looks_like_task_contract_reference(cleaned) {
+            push_unique_evidence_reference(&mut references, &mut seen, cleaned.to_string());
+        }
+    }
+
+    references
+}
+
+fn normalize_numeric_reference(token: &str) -> Option<String> {
+    let cleaned = trim_task_contract_reference_token(token)
+        .trim_start_matches('#')
+        .trim();
+    (!cleaned.is_empty() && cleaned.chars().all(|ch| ch.is_ascii_digit()))
+        .then(|| cleaned.to_string())
+}
+
+fn push_unique_evidence_reference(
+    references: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    reference: String,
+) {
+    let normalized = normalize_contract_label(&reference);
+    if normalized.is_empty() || !seen.insert(normalized) {
+        return;
+    }
+    references.push(reference);
+}
+
+fn trim_task_contract_reference_token(token: &str) -> &str {
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches('.')
+}
+
+fn looks_like_task_contract_reference(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if let Some(number) = token.strip_prefix('#') {
+        return !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit());
+    }
+    if token.contains('/') {
+        return true;
+    }
+    let Some((stem, extension)) = token.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && extension.len() >= 2
+        && stem.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn task_contract_observations(
+    executor: &dyn ToolExecutor,
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> Vec<String> {
+    let mut observations = Vec::new();
+    let call_map: HashMap<&str, &ToolCall> =
+        calls.iter().map(|call| (call.id.as_str(), call)).collect();
+
+    for result in results.iter().filter(|result| result.success) {
+        let Some(call) = call_map.get(result.tool_call_id.as_str()) else {
+            continue;
+        };
+        if executor.classify_call(call) != ToolCallClassification::Observation {
+            continue;
+        }
+
+        let normalized_observation =
+            normalize_contract_label(&format!("{} {}", call.name, call.arguments));
+        if !normalized_observation.is_empty() {
+            observations.push(normalized_observation);
+        }
+    }
+
+    observations
+}
+
+fn task_contract_matches_observation(input: &InputRequirement, observation: &str) -> bool {
+    evidence_target_matches_observation(&input.normalized_description, observation)
+}
+
+fn evidence_target_matches_observation(target: &str, observation: &str) -> bool {
+    if target.is_empty() || observation.is_empty() {
+        return false;
+    }
+    if observation.contains(target) {
+        return true;
+    }
+
+    let observation_tokens: HashSet<&str> = observation.split_whitespace().collect();
+    target
+        .split_whitespace()
+        .all(|token| observation_tokens.contains(token))
+}
+
+fn extract_progress_evidence_references(text: &str) -> Vec<String> {
+    const MAX_PROGRESS_EVIDENCE_REFERENCES: usize = 48;
+
+    // This parser is intentionally simple because the call site scopes it to
+    // reference-discovery outputs (`search_text`, grep/rg/find, diffs). Do not
+    // run it over arbitrary command output; prose and code can contain path-like
+    // strings that should not become follow-up obligations.
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        for token in line.split_whitespace() {
+            let Some(reference) = sanitize_progress_evidence_reference_token(token) else {
+                continue;
+            };
+            push_unique_evidence_reference(&mut references, &mut seen, reference);
+            if references.len() >= MAX_PROGRESS_EVIDENCE_REFERENCES {
+                return references;
+            }
+        }
+    }
+    references
+}
+
+fn sanitize_progress_evidence_reference_token(token: &str) -> Option<String> {
+    let mut cleaned = token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':'
+            )
+        })
+        .trim_start_matches('+')
+        .trim_start_matches('-')
+        .trim();
+    cleaned = cleaned
+        .strip_prefix("a/")
+        .or_else(|| cleaned.strip_prefix("b/"))
+        .unwrap_or(cleaned);
+    cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+    cleaned = strip_progress_reference_line_suffix(cleaned);
+
+    if cleaned.len() < 3 || !looks_like_task_contract_reference(cleaned) {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+fn strip_progress_reference_line_suffix(reference: &str) -> &str {
+    if reference.contains("://") {
+        return reference;
+    }
+
+    for (colon_index, _) in reference.match_indices(':') {
+        let prefix = &reference[..colon_index];
+        let line_segment = reference[colon_index + 1..]
+            .split(':')
+            .next()
+            .unwrap_or_default();
+
+        if !line_segment.is_empty()
+            && line_segment.chars().all(|ch| ch.is_ascii_digit())
+            && looks_like_task_contract_reference(prefix)
+        {
+            return prefix;
+        }
+    }
+
+    reference
+}
+
+fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
+    let mut directive =
+        String::from("Do not finish this turn until the root-turn deliverables are satisfied.\n");
+
+    let response_sections = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ResponseSection { label, .. } => Some(label.as_str()),
+            RootTurnDeliverable::ArtifactWrite { .. } => None,
+            RootTurnDeliverable::ExternalAction { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if !response_sections.is_empty() {
+        directive.push_str(
+            "Produce one consolidated final response with these explicit section headings:\n",
+        );
+        for label in response_sections {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
+
+    let pending_artifacts = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ArtifactWrite { path, satisfied } if !satisfied => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !pending_artifacts.is_empty() {
+        directive.push_str("Do not finish until these artifacts are written:\n");
+        for path in pending_artifacts {
+            directive.push_str("- ");
+            directive.push_str(path);
+            directive.push('\n');
+        }
+    }
+
+    let pending_external_actions = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ExternalAction {
+                label, satisfied, ..
+            } if !satisfied => Some(label.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !pending_external_actions.is_empty() {
+        directive.push_str("Do not finish until these external actions are completed:\n");
+        for action in pending_external_actions {
+            directive.push_str("- ");
+            directive.push_str(action);
+            directive.push('\n');
+        }
+    }
+
+    directive.push_str(
+        "If a deliverable is still missing, continue the turn instead of stopping at a progress-only update.",
+    );
+    directive.trim_end().to_string()
+}
+
+fn render_task_contract_state_directive(contract: &TaskContract) -> String {
+    let mut directive = match contract.phase {
+        TaskPhase::Gathering => String::from(
+            "You are operating under a declared task-input contract.\nPhase: gathering.\nOnly call tools needed to satisfy the remaining unchecked inputs. Do not broaden the search beyond this list unless a listed input is impossible to obtain.\n",
+        ),
+        TaskPhase::Synthesizing => String::from(
+            "You are operating under a declared task-input contract.\nPhase: synthesizing.\nAll declared inputs are satisfied. Do not call more tools. Answer directly from the gathered evidence.\n",
+        ),
+        TaskPhase::Complete => String::from(
+            "You are operating under a declared task-input contract.\nPhase: complete.\nDo not reopen tool gathering.\n",
+        ),
+    };
+
+    directive.push_str("Declared inputs:\n");
+    for input in &contract.inputs {
+        directive.push_str(if input.satisfied { "- [x] " } else { "- [ ] " });
+        directive.push_str(&input.description);
+        directive.push('\n');
+    }
+
+    directive.trim_end().to_string()
+}
+
+fn render_turn_progress_ledger_directive(ledger: &TurnProgressLedger) -> String {
+    let mut directive = String::from("You are operating under a turn evidence contract.\n");
+    let mut explicit_slots = ledger
+        .explicit_evidence_slot_ids
+        .iter()
+        .filter_map(|id| ledger.evidence_slots.get(id))
+        .collect::<Vec<_>>();
+    explicit_slots.sort_by(|left, right| left.label.cmp(&right.label));
+    if !explicit_slots.is_empty() {
+        directive.push_str("Required evidence slots:\n");
+        for slot in explicit_slots {
+            directive.push_str(if slot.status == ProgressSlotStatus::Satisfied {
+                "- [x] "
+            } else {
+                "- [ ] "
+            });
+            directive.push_str(&slot.label);
+            directive.push('\n');
+        }
+    }
+
+    let open_explicit = ledger.open_explicit_evidence_slots();
+    if ledger.has_explicit_evidence_slots() && open_explicit.is_empty() {
+        directive.push_str(
+            "All required evidence slots are satisfied. Do not broaden into unrelated read-only research; answer directly unless a later successful tool result discovered a concrete follow-up path that must be inspected.\n",
+        );
+    } else if !open_explicit.is_empty() {
+        directive.push_str(
+            "Only call read-only tools that can satisfy unchecked required evidence slots or inspect concrete evidence discovered by prior successful tools. Do not answer until unchecked required evidence is satisfied or explicitly impossible.\n",
+        );
+    } else {
+        directive.push_str(
+            "Successful search/listing results have discovered concrete follow-up evidence pointers. Treat those pointers as leads, not complete evidence.\n",
+        );
+    }
+
+    let mut discovered_slots = ledger
+        .evidence_slots
+        .values()
+        .filter(|slot| !slot.explicit && slot.status == ProgressSlotStatus::Open)
+        .map(|slot| slot.label.as_str())
+        .collect::<Vec<_>>();
+    discovered_slots.sort();
+    discovered_slots.truncate(12);
+    if !discovered_slots.is_empty() {
+        directive.push_str("Discovered follow-up evidence:\n");
+        for label in discovered_slots {
+            directive.push_str("- [ ] ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+        directive.push_str(
+            "Inspect the most relevant discovered paths directly with read_file before answering; do not treat file:line search hits as full code evidence.\n",
+        );
+    }
+
+    directive.trim_end().to_string()
+}
+
+fn root_turn_completion_block(
+    contract: &RootTurnContract,
+    response: &str,
+) -> Option<RootTurnCompletionBlock> {
+    let missing_response_sections = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ResponseSection {
+                label,
+                normalized_label,
+            } if !response_satisfies_required_section(response, normalized_label) => {
+                Some(label.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let pending_artifact_paths = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ArtifactWrite { path, satisfied } if !satisfied => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let pending_external_actions = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::ExternalAction {
+                label, satisfied, ..
+            } if !satisfied => Some(label.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if missing_response_sections.is_empty()
+        && pending_artifact_paths.is_empty()
+        && pending_external_actions.is_empty()
+    {
+        None
+    } else {
+        Some(RootTurnCompletionBlock {
+            missing_response_sections,
+            pending_artifact_paths,
+            pending_external_actions,
+        })
+    }
+}
+
+// Heading matching is intentionally lenient: exact normalized matches pass, and
+// a required label may also be satisfied by a longer heading that starts with
+// the same words, such as `Plan for Phase 2` for the deliverable `Plan`.
+fn response_satisfies_required_section(response: &str, required_label: &str) -> bool {
+    response.lines().any(|line| {
+        let normalized = normalize_contract_label(
+            line.trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_matches(|c: char| matches!(c, '*' | '_' | '`'))
+                .trim_end_matches(':')
+                .trim(),
+        );
+        normalized == required_label
+            || normalized
+                .strip_prefix(required_label)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+fn render_root_turn_retry_directive(
+    block: &RootTurnCompletionBlock,
+    retries_remaining: u8,
+) -> String {
+    let mut directive = String::from(
+        "The previous response is not terminal yet because required root-turn deliverables are still missing.\n",
+    );
+    if !block.missing_response_sections.is_empty() {
+        directive.push_str("Missing response sections:\n");
+        for label in &block.missing_response_sections {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
+    if !block.pending_artifact_paths.is_empty() {
+        directive.push_str("Pending artifact writes:\n");
+        for path in &block.pending_artifact_paths {
+            directive.push_str("- ");
+            directive.push_str(path);
+            directive.push('\n');
+        }
+    }
+    if !block.pending_external_actions.is_empty() {
+        directive.push_str("Pending external actions:\n");
+        for action in &block.pending_external_actions {
+            directive.push_str("- ");
+            directive.push_str(action);
+            directive.push('\n');
+        }
+    }
+    directive.push_str(&format!(
+        "Continue the same turn and produce one consolidated final response that satisfies all remaining deliverables. Remaining contract retries before the kernel falls back to the current response: {retries_remaining}.",
+    ));
+    directive.trim_end().to_string()
 }
 
 fn looks_like_artifact_path(path: &str) -> bool {
@@ -3600,6 +7164,87 @@ fn normalize_response_text(text: &str) -> String {
     text.trim().to_string()
 }
 
+fn final_response_violation_label(violation: FinalResponseViolation) -> &'static str {
+    match violation {
+        FinalResponseViolation::ToolActivityAttempted => "tool activity attempted",
+        FinalResponseViolation::TruncatedResponse => "truncated response",
+        FinalResponseViolation::EmptyResponse => "empty response",
+        FinalResponseViolation::ProgressOnlyResponse => "progress-only response",
+    }
+}
+
+fn final_response_retry_cap_partial_response(
+    prior_response: Option<&str>,
+    violation: FinalResponseViolation,
+) -> String {
+    if violation != FinalResponseViolation::TruncatedResponse {
+        if let Some(response) = prior_response
+            .map(normalize_response_text)
+            .filter(|text| !text.trim().is_empty())
+            .filter(|text| {
+                matches!(
+                    TurnControlPlane::validate_final_response(FinalResponseValidationFacts {
+                        attempted_tool_activity: false,
+                        response_truncated: false,
+                        response_text: Some(text),
+                    }),
+                    FinalResponseValidationOutcome::Accept
+                )
+            })
+            .filter(|text| !looks_like_tool_request_text(text))
+        {
+            return response;
+        }
+    }
+
+    let violation_label = final_response_violation_label(violation);
+    format!(
+        "I could not produce a clean final answer because the final-response phase ended with {violation_label}. The turn is stopped here to avoid another tool loop. Please retry from this thread; the tool output gathered so far is preserved."
+    )
+}
+
+fn looks_like_tool_request_text(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    normalized.starts_with("tool request:")
+        || normalized.starts_with("tool call:")
+        || normalized.starts_with("function call:")
+}
+
+fn render_finalize_response_retry_directive(
+    violation: FinalResponseViolation,
+    retries_remaining: u8,
+    success_target: &str,
+) -> String {
+    let violation_guidance = match violation {
+        FinalResponseViolation::ToolActivityAttempted => {
+            "The previous final-response attempt tried to use tools. Tools are not available in this phase."
+        }
+        FinalResponseViolation::TruncatedResponse => {
+            "The previous final-response attempt was cut off before it reached a terminal answer."
+        }
+        FinalResponseViolation::EmptyResponse => {
+            "The previous final-response attempt was empty."
+        }
+        FinalResponseViolation::ProgressOnlyResponse => {
+            "The previous final-response attempt described future work instead of answering."
+        }
+    };
+
+    format!(
+        "{violation_guidance}\n\
+         Final-response phase is terminal and final-only: do not call tools, do not plan more inspection, and do not say you need to read or check more before answering.\n\
+         Success target: {success_target}\n\
+         Retries remaining before the kernel ends this turn incomplete: {retries_remaining}."
+    )
+}
+
+fn final_response_stop_reason_is_nonterminal(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|reason| {
+        let normalized = reason.trim().to_ascii_lowercase();
+        normalized == "continuation_budget_exhausted" || is_truncated(Some(normalized.as_str()))
+    })
+}
+
 fn meaningful_response_text(text: &str) -> Option<String> {
     let normalized = normalize_response_text(text);
     (!normalized.is_empty()).then_some(normalized)
@@ -3667,6 +7312,163 @@ fn prepend_accumulated_text_to_action(
     action
 }
 
+fn repeated_tool_failure_from_results(
+    results: &[ToolResult],
+) -> Option<(RepeatedToolFailure, u16)> {
+    if results.is_empty() || results.iter().any(|result| result.success) {
+        return None;
+    }
+
+    let mut failed = results.iter().filter(|result| !result.success);
+    let mut failure = classify_repeated_tool_failure(failed.next()?);
+    let mut count = 1u16;
+
+    for result in failed {
+        let next = classify_repeated_tool_failure(result);
+        if next.key != failure.key {
+            return None;
+        }
+        failure.summary = next.summary;
+        failure.last_output = next.last_output;
+        count = count.saturating_add(1);
+    }
+
+    Some((failure, count))
+}
+
+fn classify_repeated_tool_failure(result: &ToolResult) -> RepeatedToolFailure {
+    let key = RepeatedToolFailureKey {
+        tool_name: result.tool_name.clone(),
+        failure_class: result
+            .failure_classification()
+            .unwrap_or(FailureClass::Unknown),
+        kind: repeated_tool_failure_kind(&result.output),
+    };
+    let summary = repeated_tool_failure_summary(&key.kind, &result.output);
+    RepeatedToolFailure {
+        key,
+        summary,
+        last_output: truncate_prompt_text(result.output.trim(), 240),
+    }
+}
+
+fn repeated_tool_failure_kind(output: &str) -> RepeatedToolFailureKind {
+    if output.contains(MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER) {
+        RepeatedToolFailureKind::MalformedArgumentsJson
+    } else {
+        RepeatedToolFailureKind::OutputHash(hash_tool_failure_output(output))
+    }
+}
+
+fn repeated_tool_failure_summary(kind: &RepeatedToolFailureKind, output: &str) -> String {
+    match kind {
+        RepeatedToolFailureKind::MalformedArgumentsJson => {
+            MALFORMED_TOOL_ARGUMENTS_ERROR_MARKER.to_string()
+        }
+        RepeatedToolFailureKind::OutputHash(_) => truncate_prompt_text(output.trim(), 160),
+    }
+}
+
+fn hash_tool_failure_output(text: &str) -> u64 {
+    let normalized = normalize_tool_failure_output(text);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn normalize_tool_failure_output(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_space = false;
+    let mut previous_was_digit = false;
+
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+            previous_was_digit = false;
+            continue;
+        }
+
+        previous_was_space = false;
+        if ch.is_ascii_digit() {
+            if !previous_was_digit {
+                normalized.push('0');
+            }
+            previous_was_digit = true;
+            continue;
+        }
+
+        previous_was_digit = false;
+        normalized.push(ch);
+    }
+
+    normalized
+}
+
+fn repeated_tool_failure_guidance(state: &RepeatedToolFailureState) -> String {
+    match (
+        state.failure.key.tool_name.as_str(),
+        &state.failure.key.kind,
+    ) {
+        ("write_file", RepeatedToolFailureKind::MalformedArgumentsJson) => "Use an alternative approach: write smaller chunks, simplify the content so the arguments stay valid JSON, or switch to `run_command` with a heredoc if that is safer.".to_string(),
+        (_, RepeatedToolFailureKind::MalformedArgumentsJson) => "Retry only if you can produce valid JSON arguments. Otherwise use a different tool shape or answer with the blocker instead of repeating the malformed call.".to_string(),
+        ("run_command", _) => "Stop repeating the same command. Change the command shape, inspect the repo/files directly, or explain the blocker to the user.".to_string(),
+        _ => "Do not repeat the same failing call. Try a different tool or narrower approach, or answer with what is blocked.".to_string(),
+    }
+}
+
+fn render_repeated_tool_failure_directive(state: &RepeatedToolFailureState) -> String {
+    format!(
+        "Repeated tool failure circuit breaker: `{tool}` has failed {count} consecutive times with the same failure: {summary}. {guidance} If the same failure happens again, stop using tools and answer the user with what you attempted and why it failed.",
+        tool = state.failure.key.tool_name,
+        count = state.consecutive_failures,
+        summary = state.failure.summary,
+        guidance = repeated_tool_failure_guidance(state),
+    )
+}
+
+fn repeated_tool_failure_terminal_reason(state: &RepeatedToolFailureState) -> String {
+    format!(
+        "repeated tool failure circuit breaker tripped after {count} consecutive `{tool}` failures ({summary})",
+        count = state.consecutive_failures,
+        tool = state.failure.key.tool_name,
+        summary = state.failure.summary,
+    )
+}
+
+fn repeated_tool_failure_partial_response(
+    action_partial: Option<&str>,
+    state: &RepeatedToolFailureState,
+) -> Option<String> {
+    let note = format!(
+        "I stopped early because `{tool}` failed {count} consecutive times with the same error: {summary}. Last error: {last_error}",
+        tool = state.failure.key.tool_name,
+        count = state.consecutive_failures,
+        summary = state.failure.summary,
+        last_error = state.failure.last_output,
+    );
+
+    let mut segments = Vec::new();
+    push_response_segment(
+        &mut segments,
+        action_partial.and_then(meaningful_response_text),
+    );
+    stitched_response_text(&segments, Some(note))
+}
+
+fn append_continuation_system_message(continuation: &mut ActionContinuation, message: String) {
+    if continuation.context_messages.is_empty() {
+        if let Some(context_message) = continuation.context_message.take() {
+            continuation
+                .context_messages
+                .push(Message::assistant(context_message));
+        }
+    }
+    continuation.context_messages.push(Message::system(message));
+}
+
 fn append_continuation_context(
     context_window: &mut Vec<Message>,
     continuation: &ActionContinuation,
@@ -3681,6 +7483,24 @@ fn append_continuation_context(
     }
 }
 
+fn continuation_commits_final_response(continuation: &ActionContinuation) -> bool {
+    matches!(
+        continuation.turn_commitment.as_ref(),
+        Some(TurnCommitment::FinalizeResponse(_))
+    )
+}
+
+fn action_commits_final_response(action: &ActionResult) -> bool {
+    matches!(
+        &action.next_step,
+        ActionNextStep::Continue(continuation) if continuation_commits_final_response(continuation)
+    )
+}
+
+fn action_is_terminal(action: &ActionResult) -> bool {
+    matches!(action.next_step, ActionNextStep::Finish(_))
+}
+
 fn action_partial_response(action: &ActionResult) -> Option<String> {
     match &action.next_step {
         ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
@@ -3691,42 +7511,93 @@ fn action_partial_response(action: &ActionResult) -> Option<String> {
             partial_response, ..
         }) => meaningful_response_text(&action.response_text).or_else(|| {
             partial_response
-                .as_ref()
-                .and_then(|text| meaningful_response_text(text))
+                .as_deref()
+                .and_then(meaningful_response_text)
         }),
         ActionNextStep::Continue(continuation) => continuation
             .partial_response
-            .as_ref()
-            .and_then(|text| meaningful_response_text(text)),
+            .as_deref()
+            .and_then(meaningful_response_text),
     }
 }
 
 fn summarize_tool_progress(results: &[ToolResult]) -> Option<String> {
-    let successes: Vec<_> = results.iter().filter(|result| result.success).collect();
-    let failures: Vec<_> = results.iter().filter(|result| !result.success).collect();
+    // User-visible partial responses should explain blockers only. Successful
+    // tool work belongs to typed activity events, not fallback assistant prose.
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|result| !result.success && !is_policy_deferred_tool_result(result))
+        .collect();
 
-    if successes.is_empty() && failures.is_empty() {
+    if failures.is_empty() {
         return None;
     }
 
     let mut parts = Vec::new();
-    if !successes.is_empty() {
-        let names = successes
-            .iter()
-            .map(|result| result.tool_name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("completed tool work: {names}"));
-    }
-    if !failures.is_empty() {
-        let latest = failures.last().expect("failures is non-empty");
-        parts.push(format!(
-            "latest blocker: {}",
-            truncate_prompt_text(&latest.output, 160)
-        ));
-    }
+    let latest = failures.last().expect("failures is non-empty");
+    parts.push(format!(
+        "latest blocker: {}",
+        truncate_prompt_text(&latest.output, 160)
+    ));
 
     Some(parts.join(". "))
+}
+
+fn completed_work_summary_from_progress_entries(entries: &[ToolProgressEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut by_kind = BTreeMap::<(&'static str, &'static str), usize>::new();
+    let mut failed = 0usize;
+    let mut duplicate = 0usize;
+    for entry in entries {
+        *by_kind
+            .entry(completed_work_tool_kind_labels(&entry.tool_name))
+            .or_default() += 1;
+        match entry.outcome {
+            ToolProgressOutcome::RetryableFailure => failed = failed.saturating_add(1),
+            ToolProgressOutcome::Duplicate => duplicate = duplicate.saturating_add(1),
+            ToolProgressOutcome::Advanced => {}
+        }
+    }
+
+    let mut pieces = by_kind
+        .into_iter()
+        .map(|((singular, plural), count)| {
+            let label = if count == 1 { singular } else { plural };
+            format!("{count} {label}")
+        })
+        .collect::<Vec<_>>();
+    if failed > 0 {
+        pieces.push(format!("{failed} failed"));
+    }
+    if duplicate > 0 {
+        pieces.push(format!("{duplicate} repeated"));
+    }
+    Some(format!("Worked this turn: {}.", pieces.join(", ")))
+}
+
+fn completed_work_tool_kind_labels(name: &str) -> (&'static str, &'static str) {
+    let normalized = name.to_ascii_lowercase();
+    if normalized.contains("command") || normalized.contains("shell") {
+        ("command", "commands")
+    } else if normalized.contains("search") || normalized == "rg" || normalized == "grep" {
+        ("search", "searches")
+    } else if normalized.contains("edit")
+        || normalized.contains("write")
+        || normalized.contains("patch")
+    {
+        ("edit", "edits")
+    } else if normalized.contains("read") || normalized.contains("file") || normalized == "ls" {
+        ("file read", "file reads")
+    } else {
+        ("tool", "tools")
+    }
+}
+
+fn is_policy_deferred_tool_result(result: &ToolResult) -> bool {
+    !result.success && matches!(result.failure_class, Some(FailureClass::PolicyDeferred))
 }
 
 pub(super) fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopError {
@@ -3734,6 +7605,17 @@ pub(super) fn loop_error(stage: &str, reason: &str, recoverable: bool) -> LoopEr
         stage: stage.to_string(),
         reason: reason.to_string(),
         recoverable,
+    }
+}
+
+fn loop_step_for_error_stage(stage: &str) -> LoopStep {
+    match stage {
+        "perceive" => LoopStep::Perceive,
+        "reason" => LoopStep::Reason,
+        "decide" => LoopStep::Decide,
+        "act" => LoopStep::Act,
+        "synthesize" => LoopStep::Synthesize,
+        _ => LoopStep::Synthesize,
     }
 }
 

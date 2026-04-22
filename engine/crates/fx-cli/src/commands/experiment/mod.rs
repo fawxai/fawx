@@ -229,7 +229,8 @@ fn build_subagent_runner(
     let auth_manager = crate::startup::load_auth_manager()?;
     let config = crate::startup::load_config()?;
     let improvement_provider = crate::startup::build_improvement_provider(&auth_manager, &config);
-    let subagent_router = crate::startup::build_router(&auth_manager)?;
+    let data_dir = crate::startup::configured_data_dir(&crate::startup::fawx_data_dir(), &config);
+    let subagent_router = crate::startup::build_router_for_data_dir(&auth_manager, &data_dir)?;
     let locked_router = Arc::new(std::sync::RwLock::new(subagent_router));
     let factory = crate::headless::HeadlessSubagentFactory::new(
         crate::headless::HeadlessSubagentFactoryDeps {
@@ -418,7 +419,8 @@ fn build_active_router(
     auth_manager: &AuthManager,
     config: &FawxConfig,
 ) -> anyhow::Result<(Arc<ModelRouter>, String)> {
-    let mut router = crate::startup::build_router(auth_manager)?;
+    let data_dir = crate::startup::configured_data_dir(&crate::startup::fawx_data_dir(), config);
+    let mut router = crate::startup::build_router_for_data_dir(auth_manager, &data_dir)?;
     let model = crate::headless::resolve_active_model(&router, config)?;
     router
         .set_active(&model)

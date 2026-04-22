@@ -1,8 +1,12 @@
 use super::*;
+use crate::{loop_input_channel, LoopInputSender};
 use async_trait::async_trait;
 use fx_core::error::LlmError as CoreLlmError;
 use fx_core::types::{InputSource, ScreenState, UserInput};
-use fx_llm::{CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition};
+use fx_llm::{
+    CompletionRequest, CompletionResponse, ContentBlock, Message, MessageRole, ProviderError,
+    ToolCall, ToolDefinition,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -24,6 +28,7 @@ impl ToolExecutor for StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -54,6 +59,7 @@ impl ToolExecutor for FailingToolExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "path escapes working directory".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -93,6 +99,7 @@ impl ToolExecutor for CacheAwareToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -115,15 +122,82 @@ impl ToolExecutor for CacheAwareToolExecutor {
 }
 
 #[derive(Debug)]
+struct RecordingRunCommandExecutor {
+    executed: Arc<Mutex<Vec<ToolCall>>>,
+}
+
+impl RecordingRunCommandExecutor {
+    fn new(executed: Arc<Mutex<Vec<ToolCall>>>) -> Self {
+        Self { executed }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for RecordingRunCommandExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        self.executed
+            .lock()
+            .expect("executed lock")
+            .extend_from_slice(calls);
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: format!("executed {}", call.arguments),
+                failure_class: None,
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "run_command".to_string(),
+            description: "Execute a shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }]
+    }
+}
+
+#[derive(Debug)]
 struct SequentialMockLlm {
     responses: Mutex<VecDeque<CompletionResponse>>,
+    requests: Mutex<Vec<CompletionRequest>>,
+    steer_on_call: Option<(usize, LoopInputSender, String)>,
 }
 
 impl SequentialMockLlm {
     fn new(responses: Vec<CompletionResponse>) -> Self {
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
+            requests: Mutex::new(Vec::new()),
+            steer_on_call: None,
         }
+    }
+
+    fn with_steer_on_call(
+        mut self,
+        call_number: usize,
+        sender: LoopInputSender,
+        text: impl Into<String>,
+    ) -> Self {
+        self.steer_on_call = Some((call_number, sender, text.into()));
+        self
+    }
+
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.requests.lock().expect("requests lock").clone()
     }
 }
 
@@ -147,7 +221,22 @@ impl LlmProvider for SequentialMockLlm {
         "mock"
     }
 
-    async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
+        let call_number = {
+            let mut requests = self.requests.lock().expect("requests lock");
+            requests.push(request);
+            requests.len()
+        };
+        if let Some((target_call, sender, text)) = &self.steer_on_call {
+            if call_number == *target_call {
+                sender
+                    .send(LoopCommand::Steer(text.clone()))
+                    .expect("send steer");
+            }
+        }
         self.responses
             .lock()
             .expect("lock")
@@ -181,6 +270,21 @@ fn failing_tool_engine() -> LoopEngine {
         .context(ContextCompactor::new(2048, 256))
         .max_iterations(3)
         .tool_executor(Arc::new(FailingToolExecutor))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build")
+}
+
+fn run_command_engine(executed: Arc<Mutex<Vec<ToolCall>>>) -> LoopEngine {
+    LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(3)
+        .tool_executor(Arc::new(RecordingRunCommandExecutor::new(executed)))
         .synthesis_instruction("Summarize tool output".to_string())
         .build()
         .expect("test engine build")
@@ -341,12 +445,19 @@ impl LlmProvider for StreamingCaptureLlm {
         "stream-capture"
     }
 
-    async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, ProviderError> {
         let mut calls = self.complete_calls.lock().expect("lock");
         *calls = calls.saturating_add(1);
-        Err(ProviderError::Provider(
-            "complete should not be called".to_string(),
-        ))
+        if let Some(max_tokens) = request.max_tokens {
+            self.streamed_max_tokens
+                .lock()
+                .expect("lock")
+                .push(max_tokens);
+        }
+        Ok(text_response(&self.output, Some("stop"), None))
     }
 }
 
@@ -440,7 +551,7 @@ async fn run_cycle_completes_with_direct_tool_call() {
 }
 
 #[tokio::test]
-async fn act_preserves_mixed_text_in_partial_response() {
+async fn act_treats_mixed_text_with_tool_calls_as_transient_narration() {
     let mut engine = test_engine();
     let response = mixed_tool_response(
         "Initial findings",
@@ -461,37 +572,19 @@ async fn act_preserves_mixed_text_in_partial_response() {
         .await
         .expect("act");
 
-    assert_eq!(action.response_text, "Initial findings\n\nFinal answer");
+    assert_eq!(action.response_text, "Final answer");
     match action.next_step {
-        ActionNextStep::Continue(ActionContinuation {
-            partial_response,
-            context_message,
-            context_messages,
-            ..
-        }) => {
-            assert_eq!(
-                partial_response.as_deref(),
-                Some("Initial findings\n\nFinal answer")
-            );
-            assert_eq!(context_message, None);
-            assert!(context_messages.iter().any(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::ToolResult { content, .. }
-                            if content == &serde_json::json!("ok")
-                    )
-                })
-            }));
+        ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+            assert_eq!(response, "Final answer");
         }
-        other => panic!("expected continuation, got {other:?}"),
+        other => panic!("expected complete answer after tool continuation, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn run_cycle_preserves_mixed_text_in_final_output() {
+async fn run_cycle_excludes_transient_narration_from_final_output() {
     let mut engine = test_engine();
-    let expected = "Initial findings\n\nFinal answer";
+    let expected = "Final answer";
     let llm = SequentialMockLlm::new(vec![
         mixed_tool_response(
             "Initial findings",
@@ -513,9 +606,70 @@ async fn run_cycle_preserves_mixed_text_in_final_output() {
 }
 
 #[tokio::test]
-async fn mixed_text_with_tool_calls_preserves_text_fragments() {
+async fn mid_turn_steering_persists_as_latest_user_guidance_for_turn() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(4)
+        .tool_executor(Arc::new(RecordingRunCommandExecutor::new(Arc::clone(
+            &executed,
+        ))))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let (sender, channel) = loop_input_channel();
+    engine.set_input_channel(channel);
+    let steer_text = "focus the final answer on transcript reducer tests";
+    let llm = SequentialMockLlm::new(vec![
+        mixed_tool_response(
+            "Initial findings",
+            "call-1",
+            "run_command",
+            serde_json::json!({"command":"true"}),
+        ),
+        mixed_tool_response(
+            "Continuing after steering",
+            "call-2",
+            "run_command",
+            serde_json::json!({"command":"echo second"}),
+        ),
+        text_response("Final answer", None, None),
+    ])
+    .with_steer_on_call(1, sender, steer_text);
+
+    let _ = engine
+        .run_cycle(test_snapshot("read the file"), &llm)
+        .await
+        .expect("run_cycle");
+
+    let requests = llm.requests();
+    assert!(
+        requests.len() >= 3,
+        "expected initial reason plus multiple follow-up model boundaries"
+    );
+    for request in requests.iter().skip(1) {
+        let last_message = request.messages.last().expect("steering guidance message");
+        assert_eq!(last_message.role, MessageRole::User);
+        let guidance = message_to_text(last_message);
+        assert!(
+            guidance.contains(&format!(
+                "Mid-turn user steering guidance (current turn only; do not treat this as a new queued task): {steer_text}"
+            )),
+            "mid-turn steering must be the latest user guidance at every later model boundary; prompt was:\n{}",
+            completion_request_to_prompt(request)
+        );
+    }
+}
+
+#[tokio::test]
+async fn mixed_text_with_tool_calls_keeps_only_terminal_response_fragments() {
     let mut engine = test_engine();
-    let expected = "First note\n\nSecond note\n\nFinal answer";
+    let expected = "Final answer";
     let llm = SequentialMockLlm::new(vec![
         mixed_tool_response(
             "First note",
@@ -572,16 +726,28 @@ async fn empty_current_round_does_not_continue_from_accumulated_text() {
         "empty rounds should not become response text via accumulated fragments"
     );
     match action.next_step {
-        ActionNextStep::Finish(ActionTerminal::Incomplete {
+        ActionNextStep::Continue(ActionContinuation {
             partial_response,
-            reason,
+            context_message,
+            context_messages,
+            ..
         }) => {
-            assert!(reason.contains("did not produce a usable final response"));
-            assert!(partial_response
-                .as_deref()
-                .is_some_and(|text| text.contains("Initial findings")));
+            assert_eq!(partial_response, None);
+            assert_eq!(context_message, None);
+            assert!(context_messages.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.content.iter().any(|block| {
+                        matches!(block, ContentBlock::ToolResult { content, .. } if content == &serde_json::json!("ok"))
+                    })
+            }));
+            assert!(context_messages.iter().any(|message| {
+                message.role == MessageRole::System
+                    && message.content.iter().any(|block| {
+                        matches!(block, ContentBlock::Text { text } if text.contains("committed observed tool evidence back to root synthesis"))
+                    })
+            }));
         }
-        other => panic!("expected terminal incomplete action, got {other:?}"),
+        other => panic!("expected root synthesis continuation, got {other:?}"),
     }
     assert_eq!(llm.requests().len(), 1);
 }
@@ -599,9 +765,7 @@ async fn standard_turn_with_mixed_text_terminates_normally() {
                 serde_json::json!({"path":"README.md"}),
             )),
             Ok(text_response("", None, None)),
-            Err(ProviderError::Provider(
-                "unexpected continuation after an empty tool round".to_string(),
-            )),
+            Ok(text_response("Done from committed evidence", None, None)),
         ],
         String::new(),
     );
@@ -611,20 +775,10 @@ async fn standard_turn_with_mixed_text_terminates_normally() {
         .await
         .expect("run_cycle");
 
-    match result {
-        LoopResult::Incomplete {
-            partial_response,
-            iterations,
-            ..
-        } => {
-            assert_eq!(iterations, 1);
-            assert!(partial_response
-                .as_deref()
-                .is_some_and(|text| text.contains("I am reading the README first.")));
-        }
-        other => panic!("expected incomplete termination, got {other:?}"),
-    }
-    assert_eq!(llm.requests().len(), 2);
+    let (response, iterations, _) = expect_complete(result);
+    assert_eq!(iterations, 2);
+    assert_eq!(response, "Done from committed evidence");
+    assert_eq!(llm.requests().len(), 3);
 }
 
 #[tokio::test]
@@ -651,9 +805,9 @@ async fn run_cycle_whitespace_only_mixed_text_is_unchanged() {
 }
 
 #[tokio::test]
-async fn run_cycle_preserves_multiple_text_blocks_in_mixed_response() {
+async fn run_cycle_excludes_multiple_transient_text_blocks_in_mixed_response() {
     let mut engine = test_engine();
-    let expected = "First block\nSecond block\n\nFinal answer";
+    let expected = "Final answer";
     let llm = SequentialMockLlm::new(vec![
         mixed_tool_response_with_content(
             vec![
@@ -669,7 +823,6 @@ async fn run_cycle_preserves_multiple_text_blocks_in_mixed_response() {
             serde_json::json!({"path":"README.md"}),
         ),
         text_response("Final answer", None, None),
-        text_response(expected, None, None),
     ]);
 
     let result = engine
@@ -764,12 +917,9 @@ async fn run_cycle_completes_after_tool_fails_with_synthesis() {
             iterations,
             ..
         } => {
-            // Tool failure synthesis now becomes internal continuation
-            // context, and the next root reasoning pass owns the final
-            // user-visible response.
             assert_eq!(
-                iterations, 2,
-                "expected root continuation after tool synthesis"
+                iterations, 1,
+                "tool continuation answer should complete without an extra root detour"
             );
             assert_eq!(
                 response,
@@ -816,10 +966,22 @@ async fn run_cycle_returns_budget_exhausted() {
         .await
         .expect("run_cycle");
 
-    assert!(
-        matches!(result, LoopResult::BudgetExhausted { .. }),
-        "expected LoopResult::BudgetExhausted, got: {result:?}"
-    );
+    match result {
+        LoopResult::BudgetExhausted { signals, .. } => {
+            let stop = signals
+                .iter()
+                .find(|signal| {
+                    signal.kind == SignalKind::Trace
+                        && signal.metadata["decision_kind"] == "turn_stop"
+                })
+                .expect("turn stop signal");
+            assert_eq!(stop.metadata["decision"], "failed");
+            assert_eq!(stop.metadata["failed"], true);
+            assert_eq!(stop.metadata["result_kind"], "budget_exhausted");
+            assert_eq!(stop.metadata["stop_reason"], "budget_exhausted");
+        }
+        other => panic!("expected LoopResult::BudgetExhausted, got: {other:?}"),
+    }
 }
 
 #[test]
@@ -894,6 +1056,7 @@ async fn run_cycle_emits_signals() {
         usage: Some(fx_llm::Usage {
             input_tokens: 8,
             output_tokens: 4,
+            ..Default::default()
         }),
         stop_reason: None,
     }]);
@@ -932,6 +1095,43 @@ async fn run_cycle_emits_signals() {
             .any(|s| s.step == LoopStep::Act && s.kind == SignalKind::Observation),
         "clean text response should not emit observation signals"
     );
+}
+
+#[tokio::test]
+async fn run_cycle_emits_cost_signal_when_usage_is_available() {
+    let mut engine = test_engine();
+    let llm = SequentialMockLlm::new(vec![text_response(
+        "hello",
+        None,
+        Some(fx_llm::Usage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cached_input_tokens: 3,
+            cache_creation_input_tokens: 2,
+        }),
+    )]);
+
+    let result = engine
+        .run_cycle(test_snapshot("hello"), &llm)
+        .await
+        .expect("run_cycle");
+    let (_, _, signals) = expect_complete(result);
+
+    let cost = signals
+        .iter()
+        .find(|signal| signal.step == LoopStep::Reason && signal.kind == SignalKind::Cost)
+        .expect("cost signal");
+
+    assert_eq!(cost.metadata["stage"], "reason");
+    assert_eq!(cost.metadata["model"], "mock");
+    assert_eq!(cost.metadata["input_tokens"], serde_json::json!(8));
+    assert_eq!(cost.metadata["output_tokens"], serde_json::json!(4));
+    assert_eq!(cost.metadata["cached_input_tokens"], serde_json::json!(3));
+    assert_eq!(
+        cost.metadata["cache_creation_input_tokens"],
+        serde_json::json!(2)
+    );
+    assert_eq!(cost.metadata["total_tokens"], serde_json::json!(12));
 }
 
 #[tokio::test]
@@ -1061,6 +1261,7 @@ async fn signals_include_decision_on_tool_call() {
             usage: Some(fx_llm::Usage {
                 input_tokens: 10,
                 output_tokens: 2,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         },
@@ -1115,6 +1316,7 @@ async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
             usage: Some(fx_llm::Usage {
                 input_tokens: 10,
                 output_tokens: 2,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         },
@@ -1128,6 +1330,7 @@ async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
             usage: Some(fx_llm::Usage {
                 input_tokens: 6,
                 output_tokens: 3,
+                ..Default::default()
             }),
             stop_reason: Some("tool_use".to_string()),
         },
@@ -1139,6 +1342,7 @@ async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
             usage: Some(fx_llm::Usage {
                 input_tokens: 5,
                 output_tokens: 4,
+                ..Default::default()
             }),
             stop_reason: None,
         },
@@ -1222,29 +1426,66 @@ async fn empty_tool_continuation_emits_empty_text_trace() {
         .await
         .expect("run_cycle");
 
-    let (partial_response, reason, signals) = match result {
-        LoopResult::Incomplete {
-            partial_response,
-            reason,
-            signals,
-            ..
-        } => (partial_response, reason, signals),
-        other => panic!("expected LoopResult::Incomplete, got: {other:?}"),
-    };
-
+    let (response, iterations, signals) = expect_complete(result);
+    assert_eq!(response, "done");
     assert_eq!(
-        partial_response.as_deref(),
-        Some("completed tool work: read_file")
-    );
-    assert_eq!(
-        reason,
-        "tool continuation did not produce a usable final response"
+        iterations, 2,
+        "empty tool continuations should commit evidence and return to root synthesis"
     );
     assert!(signals.iter().any(|signal| {
         signal.step == LoopStep::Act
             && signal.kind == SignalKind::Trace
             && signal.message == "tool continuation returned empty text"
     }));
+    assert!(signals.iter().any(|signal| {
+        signal.step == LoopStep::Act
+            && signal.kind == SignalKind::Trace
+            && signal.message == "empty tool continuation committed evidence to root synthesis"
+            && signal.metadata["decision"] == "continue_root_synthesis"
+            && signal.metadata["pending_tool_count"] == 0
+    }));
+}
+
+#[tokio::test]
+async fn valid_tool_transaction_continues_beyond_outer_iteration_cap() {
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(1)
+        .tool_executor(Arc::new(StubToolExecutor))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+
+    let llm = SequentialMockLlm::new(vec![
+        tool_call_response(
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"README.md"}),
+        ),
+        tool_call_response(
+            "call-2",
+            "read_file",
+            serde_json::json!({"path":"Cargo.toml"}),
+        ),
+        text_response("final from committed evidence", None, None),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("inspect the repo"), &llm)
+        .await
+        .expect("run_cycle");
+
+    match result {
+        LoopResult::Complete { response, .. } => {
+            assert_eq!(response, "final from committed evidence");
+        }
+        other => panic!("expected LoopResult::Complete, got: {other:?}"),
+    };
 }
 
 #[test]
@@ -1269,27 +1510,17 @@ fn is_truncated_handles_none_and_unknown() {
 #[test]
 fn merge_usage_combines_token_counts() {
     let merged = merge_usage(
-        Some(fx_llm::Usage {
-            input_tokens: 100,
-            output_tokens: 25,
-        }),
-        Some(fx_llm::Usage {
-            input_tokens: 30,
-            output_tokens: 10,
-        }),
+        Some(fx_llm::Usage::with_prompt_cache(100, 25, 70, 5)),
+        Some(fx_llm::Usage::with_prompt_cache(30, 10, 20, 3)),
     )
     .expect("usage should merge");
     assert_eq!(merged.input_tokens, 130);
     assert_eq!(merged.output_tokens, 35);
+    assert_eq!(merged.cached_input_tokens, 90);
+    assert_eq!(merged.cache_creation_input_tokens, 8);
 
-    let right_only = merge_usage(
-        None,
-        Some(fx_llm::Usage {
-            input_tokens: 7,
-            output_tokens: 3,
-        }),
-    )
-    .expect("right usage should be preserved");
+    let right_only =
+        merge_usage(None, Some(fx_llm::Usage::new(7, 3))).expect("right usage should be preserved");
     assert_eq!(right_only.input_tokens, 7);
     assert_eq!(right_only.output_tokens, 3);
 
@@ -1361,6 +1592,7 @@ async fn continue_truncated_response_stitches_text() {
         Some(fx_llm::Usage {
             input_tokens: 10,
             output_tokens: 4,
+            ..Default::default()
         }),
     );
     let llm = SequentialMockLlm::new(vec![text_response(
@@ -1369,6 +1601,7 @@ async fn continue_truncated_response_stitches_text() {
         Some(fx_llm::Usage {
             input_tokens: 3,
             output_tokens: 2,
+            ..Default::default()
         }),
     )]);
 
@@ -1477,7 +1710,7 @@ async fn tool_continuation_auto_continues_truncated_response() {
         .expect("run_cycle should succeed");
     let (response, iterations, _) = expect_complete(result);
 
-    assert_eq!(iterations, 2);
+    assert_eq!(iterations, 1);
     assert_eq!(response, "Tool answer part two");
 }
 
@@ -1606,6 +1839,95 @@ async fn continuation_calls_record_budget() {
     assert_eq!(continuation_calls, baseline_calls.saturating_add(1));
 }
 
+#[tokio::test]
+async fn raw_markup_tool_call_is_normalized_into_one_real_execution() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = run_command_engine(Arc::clone(&executed));
+    let llm = SequentialMockLlm::new(vec![
+        text_response(
+            "<tool_call>run_command<arg_key>command</arg_key><arg_value>git status --short</arg_value></tool_call>",
+            None,
+            None,
+        ),
+        text_response("done", None, None),
+        text_response("done", Some("stop"), None),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("inspect git status"), &llm)
+        .await
+        .expect("run_cycle should succeed");
+
+    let (response, _, signals) = expect_complete(result);
+    let executed = executed.lock().expect("executed lock").clone();
+
+    assert_eq!(response, "done");
+    assert_eq!(
+        executed.len(),
+        1,
+        "normalized markup should execute exactly once"
+    );
+    assert_eq!(executed[0].name, "run_command");
+    assert_eq!(
+        executed[0].arguments,
+        serde_json::json!({"command": "git status --short"})
+    );
+    assert!(
+        signals.iter().any(|signal| {
+            signal.kind == SignalKind::Trace
+                && signal.message == "normalized malformed tool-call markup"
+                && signal.metadata["outcome"] == "normalized"
+                && signal.metadata["decision_kind"] == "tool_call_normalization"
+                && signal.metadata["decision"] == "normalized"
+        }),
+        "normalization success should be visible in trace signals"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_raw_markup_fails_closed_without_continuation_churn() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = run_command_engine(Arc::clone(&executed));
+    let llm = SequentialMockLlm::new(vec![
+        text_response(
+            "I should inspect git first.\n<tool_call>run_command<arg_key>command</arg_key><arg_value>git status</arg_value></tool_call>",
+            None,
+            None,
+        ),
+        text_response("this should not be consumed", Some("stop"), None),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("inspect git status"), &llm)
+        .await
+        .expect("run_cycle should succeed");
+
+    let (response, iterations, signals) = expect_complete(result);
+
+    assert!(
+        response.contains("malformed tool-call markup"),
+        "ambiguous markup should surface a clear bounded failure: {response}"
+    );
+    assert_eq!(iterations, 1, "ambiguous markup should stop in one turn");
+    assert!(
+        executed.lock().expect("executed lock").is_empty(),
+        "ambiguous markup must fail closed instead of executing tools"
+    );
+    assert_eq!(
+        llm.responses.lock().expect("lock").len(),
+        1,
+        "no continuation request should be issued after rejection"
+    );
+    assert!(
+        signals.iter().any(|signal| {
+            signal.kind == SignalKind::Trace
+                && signal.message == "rejected malformed tool-call markup"
+                && signal.metadata["reason"] == "ambiguous_text"
+        }),
+        "rejection should be visible in trace signals"
+    );
+}
+
 #[test]
 fn raised_max_tokens_constants_are_applied() {
     assert_eq!(REASONING_MAX_OUTPUT_TOKENS, 4096);
@@ -1639,14 +1961,27 @@ fn raised_max_tokens_constants_are_applied() {
         ToolRequestConfig::new(vec![], true),
         RequestBuildContext::new(None, None, None, false),
     ));
+    let terminal_request = build_forced_synthesis_request(ForcedSynthesisRequestParams::new(
+        &perception.context_window,
+        "mock",
+        None,
+        None,
+        None,
+        None,
+        false,
+    ));
 
     assert_eq!(reasoning_request.max_tokens, Some(4096));
     assert_eq!(continuation_request.max_tokens, Some(4096));
+    assert_eq!(
+        terminal_request.max_tokens,
+        Some(TERMINAL_SYNTHESIS_MAX_OUTPUT_TOKENS)
+    );
 }
 
 #[tokio::test]
-async fn tool_synthesis_uses_raised_token_cap_without_stop_reason_assumptions() {
-    let engine = test_engine();
+async fn tool_synthesis_uses_structured_completion_with_raised_token_cap() {
+    let mut engine = test_engine();
     let llm = StreamingCaptureLlm::new("summary from stream");
 
     let summary = engine
@@ -1664,7 +1999,28 @@ async fn tool_synthesis_uses_raised_token_cap_without_stop_reason_assumptions() 
         llm.streamed_max_tokens(),
         vec![TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS]
     );
-    assert_eq!(llm.complete_calls(), 0);
+    assert_eq!(llm.complete_calls(), 1);
+}
+
+#[tokio::test]
+async fn tool_synthesis_continues_truncated_terminal_summary() {
+    let mut engine = test_engine();
+    let llm = SequentialMockLlm::new(vec![
+        text_response("supporting Anth", Some("max_tokens"), None),
+        text_response("ropic, OpenAI, and Fireworks.", Some("stop"), None),
+    ]);
+
+    let summary = engine
+        .generate_tool_summary(
+            "summarize this",
+            &llm,
+            CycleStream::disabled(),
+            TextStreamVisibility::Public,
+        )
+        .await
+        .expect("truncated synthesis should continue");
+
+    assert_eq!(summary, "supporting Anthropic, OpenAI, and Fireworks.");
 }
 
 // B2: extract_readable_text unit tests

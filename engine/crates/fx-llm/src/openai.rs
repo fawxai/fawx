@@ -12,11 +12,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::document::document_text_fallback;
-use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
+use crate::openai_common::{
+    filter_model_ids, is_missing_model_read_scope_error, is_missing_model_read_scope_response,
+    log_restricted_model_catalog_fallback_once, missing_model_read_scope_error,
+    OpenAiModelsResponse,
+};
 use crate::provider::{
     bearer_auth_headers, insert_header_value, null_loop_harness,
-    resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
-    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, ProviderCatalogFilters,
+    resolve_loop_harness_from_profiles, CompletionStream, DiscoveredModel, LlmProvider,
+    LoopHarness, LoopModelMatch, LoopModelProfile, LoopPromptOverlayContext,
+    PromptCacheAffinityCapability, ProviderCapabilities, ProviderCatalogFilters,
     StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
@@ -24,8 +29,9 @@ use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ToolCall, ToolUseDelta, Usage,
+    PromptCacheAffinity, StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
+use crate::ModelCatalog;
 
 const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
 When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
@@ -102,17 +108,24 @@ pub(crate) const OPENAI_FALLBACK_MODELS: &[&str] = &[
     "gpt-4o",
     "gpt-4o-mini",
 ];
+// Startup registers these before OpenRouter's live catalog refresh completes.
+// Keep this list in sync with any OpenRouter model IDs that may be persisted as
+// configured defaults, otherwise HTTP startup can temporarily reject them.
 const OPENROUTER_FALLBACK_MODELS: &[&str] = &[
+    "z-ai/glm-5.1",
     "anthropic/claude-sonnet-4",
     "openai/gpt-4o",
     "x-ai/grok-3",
     "qwen/qwen-2.5-72b-instruct",
     "deepseek/deepseek-chat-v3",
 ];
+const FIREWORKS_KIMI_BASE_MODEL_ID: &str = "accounts/fireworks/models/kimi-k2p5";
+pub const FIREWORKS_KIMI_TURBO_ROUTER_ID: &str = "accounts/fireworks/routers/kimi-k2p5-turbo";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiCatalogKind {
     Compatible,
+    Fireworks,
     OpenAi,
     OpenRouter,
 }
@@ -120,6 +133,14 @@ enum OpenAiCatalogKind {
 impl OpenAiCatalogKind {
     fn is_openrouter(self) -> bool {
         matches!(self, Self::OpenRouter)
+    }
+
+    const fn prompt_cache_affinity_capability(self) -> PromptCacheAffinityCapability {
+        match self {
+            Self::OpenAi => PromptCacheAffinityCapability::OpenAiPromptCacheKey,
+            Self::Fireworks => PromptCacheAffinityCapability::FireworksSessionAffinityHeader,
+            Self::Compatible | Self::OpenRouter => PromptCacheAffinityCapability::Unsupported,
+        }
     }
 }
 
@@ -171,15 +192,124 @@ pub(crate) fn openai_context_window(model_id: &str) -> usize {
 
 fn is_openrouter_chat_capable(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
-    id.contains("claude")
-        || id.contains("gpt-")
-        || id.contains("o4")
-        || id.contains("grok")
-        || id.contains("qwen")
-        || id.contains("minimax")
-        || id.contains("liquidai")
-        || id.contains("lfm")
-        || id.contains("deepseek")
+    let tail = id.rsplit('/').next().unwrap_or(id.as_str());
+    let excludes = [
+        "embed",
+        "embedding",
+        "rerank",
+        "reranker",
+        "tts",
+        "whisper",
+        "transcri",
+        "audio",
+        "moderation",
+        "realtime",
+        "search",
+        "dall-e",
+        "image-gen",
+        "image_generation",
+    ];
+
+    !excludes.iter().any(|needle| tail.contains(needle))
+}
+
+fn is_fireworks_chat_capable(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    let tail = id.rsplit('/').next().unwrap_or(id.as_str());
+    let excludes = [
+        "embed",
+        "embedding",
+        "rerank",
+        "reranker",
+        "tts",
+        "whisper",
+        "audio",
+        "moderation",
+        "realtime",
+        "search",
+    ];
+
+    if excludes.iter().any(|needle| tail.contains(needle)) {
+        return false;
+    }
+
+    if id.contains("/routers/") {
+        return true;
+    }
+
+    tail.contains("chat")
+        || tail.contains("instruct")
+        || tail.contains("kimi")
+        || tail.contains("deepseek")
+        || tail.contains("qwen")
+        || tail.contains("qwq")
+        || tail.contains("llama")
+        || tail.contains("mistral")
+        || tail.contains("mixtral")
+        || tail.contains("gemma")
+        || tail.contains("glm")
+        || tail.contains("gpt-")
+        || tail.starts_with("o1")
+        || tail.starts_with("o3")
+        || tail.starts_with("o4")
+}
+
+fn fireworks_supplemental_catalog_model_ids(discovered_model_ids: &[String]) -> Vec<String> {
+    let has_kimi_model = discovered_model_ids
+        .iter()
+        .any(|model_id| is_fireworks_kimi_base_model_id(model_id));
+    let has_kimi_router = discovered_model_ids
+        .iter()
+        .any(|model_id| is_fireworks_kimi_turbo_router_id(model_id));
+
+    if has_kimi_model && !has_kimi_router {
+        vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn preferred_fireworks_default_model(model_ids: &[String]) -> Option<&str> {
+    model_ids
+        .iter()
+        .find(|model_id| is_fireworks_kimi_turbo_router_id(model_id))
+        .map(String::as_str)
+}
+
+pub(crate) fn fireworks_standard_kimi_shadowed_by_turbo(
+    model_id: &str,
+    available_model_ids: &[String],
+) -> bool {
+    is_fireworks_kimi_base_model_id(model_id)
+        && available_model_ids
+            .iter()
+            .any(|candidate| is_fireworks_kimi_turbo_router_id(candidate))
+}
+
+fn prioritize_fireworks_model_ids(model_ids: &mut [String]) {
+    model_ids.sort_by(|left, right| {
+        fireworks_model_preference_rank(left)
+            .cmp(&fireworks_model_preference_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn fireworks_model_preference_rank(model_id: &str) -> u8 {
+    if is_fireworks_kimi_turbo_router_id(model_id) {
+        0
+    } else if is_fireworks_kimi_base_model_id(model_id) {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_fireworks_kimi_turbo_router_id(model_id: &str) -> bool {
+    model_id.trim() == FIREWORKS_KIMI_TURBO_ROUTER_ID
+}
+
+fn is_fireworks_kimi_base_model_id(model_id: &str) -> bool {
+    model_id.trim() == FIREWORKS_KIMI_BASE_MODEL_ID
 }
 
 /// OpenAI-compatible provider implementation.
@@ -204,6 +334,10 @@ impl OpenAiProvider {
 
     pub const fn openrouter_base_url() -> &'static str {
         "https://openrouter.ai/api"
+    }
+
+    pub const fn fireworks_base_url() -> &'static str {
+        "https://api.fireworks.ai/inference/v1"
     }
 
     /// Create a new OpenAI-compatible provider.
@@ -245,6 +379,18 @@ impl OpenAiProvider {
             api_key.into(),
             OpenAiCatalogKind::OpenRouter,
             "openrouter".to_string(),
+        )
+    }
+
+    pub fn fireworks(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, LlmError> {
+        Self::build(
+            base_url.into(),
+            api_key.into(),
+            OpenAiCatalogKind::Fireworks,
+            "fireworks".to_string(),
         )
     }
 
@@ -323,21 +469,14 @@ impl OpenAiProvider {
         parse_model_response(response, self, &self.supported_models).await
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<OpenAiRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
-
+        // The router owns model resolution against the live provider catalog.
+        // Re-validating here against this client's startup snapshot can reject
+        // dynamically discovered models that the router already accepted.
         let mut messages = map_messages_to_openai(&request.messages)?;
 
         if let Some(system_prompt) = &request.system_prompt {
@@ -368,11 +507,41 @@ impl OpenAiProvider {
         Ok(OpenAiRequestBody {
             model: request.model.clone(),
             messages,
+            // Empty tool definitions are an explicit no-tool surface from the
+            // kernel. Some OpenAI-compatible routers can still emit formal
+            // tool-call objects when `tools` is merely omitted, so serialize the
+            // provider-level contract as well.
+            tool_choice: tools.is_empty().then_some("none"),
             tools,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            prompt_cache_key: matches!(self.catalog_kind, OpenAiCatalogKind::OpenAi)
+                .then(|| {
+                    request
+                        .cache_affinity
+                        .as_ref()
+                        .map(|affinity| affinity.as_str().to_string())
+                })
+                .flatten(),
             stream,
         })
+    }
+
+    fn request_builder(
+        &self,
+        endpoint: &str,
+        cache_affinity: Option<&PromptCacheAffinity>,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self.client.post(endpoint).bearer_auth(&self.api_key);
+        if let Some(ref account_id) = self.account_id {
+            builder = builder.header("chatgpt-account-id", account_id);
+        }
+        if matches!(self.catalog_kind, OpenAiCatalogKind::Fireworks) {
+            if let Some(cache_affinity) = cache_affinity {
+                builder = builder.header("x-session-affinity", cache_affinity.as_str());
+            }
+        }
+        builder
     }
 
     fn parse_completion_response(body: OpenAiResponseBody) -> Result<CompletionResponse, LlmError> {
@@ -385,10 +554,8 @@ impl OpenAiProvider {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
 
-        if let Some(OpenAiMessageContent::Text(text)) = choice.message.content {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text { text });
-            }
+        if let Some(text) = openai_message_visible_text(choice.message.content) {
+            content.push(ContentBlock::Text { text });
         }
 
         if let Some(calls) = choice.message.tool_calls {
@@ -411,10 +578,7 @@ impl OpenAiProvider {
         Ok(CompletionResponse {
             content,
             tool_calls,
-            usage: body.usage.map(|usage| Usage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-            }),
+            usage: body.usage.map(openai_usage_to_usage),
             stop_reason: choice.finish_reason,
         })
     }
@@ -605,10 +769,16 @@ impl LlmProvider for OpenAiProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let body = self.build_request_body(&request, false)?;
 
-        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
-        if let Some(ref account_id) = self.account_id {
-            builder = builder.header("chatgpt-account-id", account_id);
-        }
+        let endpoint = self.endpoint();
+        tracing::info!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            requested_model = %body.model,
+            stream = false,
+            "openai-compatible completion request"
+        );
+
+        let builder = self.request_builder(&endpoint, request.cache_affinity.as_ref());
         let response = builder.json(&body).send().await?;
 
         let status = response.status();
@@ -625,6 +795,23 @@ impl LlmProvider for OpenAiProvider {
             .await
             .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
 
+        let returned_model = parsed.model.as_deref().unwrap_or("<missing>");
+        let (prompt_tokens, completion_tokens) = parsed
+            .usage
+            .as_ref()
+            .map(|usage| (usage.prompt_tokens, usage.completion_tokens))
+            .unwrap_or_default();
+        tracing::info!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            requested_model = %body.model,
+            returned_model,
+            prompt_tokens,
+            completion_tokens,
+            stream = false,
+            "openai-compatible completion response"
+        );
+
         Self::parse_completion_response(parsed)
     }
 
@@ -634,10 +821,16 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<CompletionStream, LlmError> {
         let body = self.build_request_body(&request, true)?;
 
-        let mut builder = self.client.post(self.endpoint()).bearer_auth(&self.api_key);
-        if let Some(ref account_id) = self.account_id {
-            builder = builder.header("chatgpt-account-id", account_id);
-        }
+        let endpoint = self.endpoint();
+        tracing::info!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            requested_model = %body.model,
+            stream = true,
+            "openai-compatible completion request"
+        );
+
+        let builder = self.request_builder(&endpoint, request.cache_affinity.as_ref());
         let response = builder.json(&body).send().await?;
 
         let status = response.status();
@@ -680,9 +873,80 @@ impl LlmProvider for OpenAiProvider {
                 tracing::warn!(provider = %self.provider_name, "openai models response was empty; using static fallback");
                 Ok(self.supported_models())
             }
+            Err(error) if is_missing_model_read_scope_error(&error) => {
+                log_restricted_model_catalog_fallback_once(&self.provider_name);
+                Ok(self.supported_models())
+            }
             Err(error) => {
                 tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai models; using static fallback");
                 Ok(self.supported_models())
+            }
+        }
+    }
+
+    async fn list_discovered_models(&self) -> Result<Vec<DiscoveredModel>, LlmError> {
+        if matches!(self.catalog_kind, OpenAiCatalogKind::Compatible) {
+            return self.list_models().await.map(|models| {
+                models
+                    .into_iter()
+                    .map(|id| DiscoveredModel {
+                        id,
+                        display_name: None,
+                        recommended: true,
+                    })
+                    .collect()
+            });
+        }
+
+        if self.api_key.trim().is_empty() {
+            return Ok(self
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect());
+        }
+
+        let catalog = ModelCatalog::with_timeout(Duration::from_secs(20));
+        match catalog
+            .fetch_live_models(self.name(), &self.api_key, self.auth_method())
+            .await
+        {
+            Ok(models) if !models.is_empty() => Ok(models
+                .into_iter()
+                .map(|model| DiscoveredModel {
+                    id: model.id,
+                    display_name: model.display_name,
+                    recommended: model.recommended,
+                })
+                .collect()),
+            Ok(_) => Ok(self
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()),
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.provider_name,
+                    error = %error,
+                    "failed to fetch openai catalog metadata; using static fallback"
+                );
+                Ok(self
+                    .supported_models()
+                    .into_iter()
+                    .map(|id| DiscoveredModel {
+                        id,
+                        display_name: None,
+                        recommended: true,
+                    })
+                    .collect())
             }
         }
     }
@@ -691,6 +955,8 @@ impl LlmProvider for OpenAiProvider {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
+            prompt_cache: Default::default(),
+            prompt_cache_affinity: self.catalog_kind.prompt_cache_affinity_capability(),
         }
     }
 
@@ -731,18 +997,31 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn is_chat_capable(&self, model_id: &str) -> bool {
-        if self.catalog_kind.is_openrouter() {
-            is_openrouter_chat_capable(model_id)
-        } else {
-            is_openai_chat_capable(model_id)
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => is_openrouter_chat_capable(model_id),
+            OpenAiCatalogKind::Fireworks => is_fireworks_chat_capable(model_id),
+            OpenAiCatalogKind::OpenAi | OpenAiCatalogKind::Compatible => {
+                is_openai_chat_capable(model_id)
+            }
         }
     }
 
     fn fallback_models(&self) -> Vec<&'static str> {
-        if self.catalog_kind.is_openrouter() {
-            OPENROUTER_FALLBACK_MODELS.to_vec()
-        } else {
-            OPENAI_FALLBACK_MODELS.to_vec()
+        match self.catalog_kind {
+            OpenAiCatalogKind::OpenRouter => OPENROUTER_FALLBACK_MODELS.to_vec(),
+            OpenAiCatalogKind::OpenAi => OPENAI_FALLBACK_MODELS.to_vec(),
+            OpenAiCatalogKind::Compatible | OpenAiCatalogKind::Fireworks => Vec::new(),
+        }
+    }
+
+    fn supplemental_catalog_model_ids(&self, discovered_model_ids: &[String]) -> Vec<String> {
+        match self.catalog_kind {
+            OpenAiCatalogKind::Fireworks => {
+                fireworks_supplemental_catalog_model_ids(discovered_model_ids)
+            }
+            OpenAiCatalogKind::Compatible
+            | OpenAiCatalogKind::OpenAi
+            | OpenAiCatalogKind::OpenRouter => Vec::new(),
         }
     }
 
@@ -772,6 +1051,9 @@ async fn parse_model_response(
             .text()
             .await
             .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        if is_missing_model_read_scope_response(status, &body) {
+            return Err(missing_model_read_scope_error());
+        }
         return Err(OpenAiProvider::map_http_error(status, body));
     }
 
@@ -779,11 +1061,16 @@ async fn parse_model_response(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| LlmError::InvalidResponse(error.to_string()))?;
-    Ok(filter_model_ids(
-        parsed.data,
-        supported_models,
-        |model_id| provider.is_chat_capable(model_id),
-    ))
+    let mut model_ids = filter_model_ids(parsed.data, supported_models, |model_id| {
+        provider.is_chat_capable(model_id)
+    });
+    model_ids.extend(provider.supplemental_catalog_model_ids(&model_ids));
+    model_ids.sort();
+    model_ids.dedup();
+    if matches!(provider.catalog_kind, OpenAiCatalogKind::Fireworks) {
+        prioritize_fireworks_model_ids(&mut model_ids);
+    }
+    Ok(model_ids)
 }
 
 fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsage>) {
@@ -793,10 +1080,7 @@ fn maybe_push_usage_chunk(chunks: &mut Vec<StreamChunk>, usage: Option<OpenAiUsa
     chunks.push(StreamChunk {
         delta_content: None,
         tool_use_deltas: Vec::new(),
-        usage: Some(Usage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-        }),
+        usage: Some(openai_usage_to_usage(usage)),
         stop_reason: None,
     });
 }
@@ -1025,12 +1309,16 @@ fn legacy_tool_result_content(object: &serde_json::Map<String, Value>) -> Option
 struct OpenAiRequestBody {
     model: String,
     messages: Vec<OpenAiMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
     stream: bool,
 }
 
@@ -1050,6 +1338,30 @@ struct OpenAiMessage {
 enum OpenAiMessageContent {
     Text(String),
     Blocks(Vec<OpenAiInputBlock>),
+}
+
+fn openai_message_visible_text(content: Option<OpenAiMessageContent>) -> Option<String> {
+    match content {
+        Some(OpenAiMessageContent::Text(text)) => non_empty_text(text),
+        Some(OpenAiMessageContent::Blocks(blocks)) => {
+            let text = blocks
+                .into_iter()
+                .filter_map(|block| match block {
+                    OpenAiInputBlock::Text { text } => non_empty_text(text),
+                    OpenAiInputBlock::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            non_empty_text(text)
+        }
+        None => None,
+    }
+}
+
+fn non_empty_text(text: String) -> Option<String> {
+    // Trim only for the emptiness check; preserve provider formatting for
+    // non-empty assistant text so markdown and indentation survive parsing.
+    (!text.trim().is_empty()).then_some(text)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1094,6 +1406,8 @@ struct OpenAiFunctionCall {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiResponseBody {
+    #[serde(default)]
+    model: Option<String>,
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -1106,12 +1420,43 @@ struct OpenAiChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiTokenDetails>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiTokenDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiTokenDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
+}
+
+fn openai_usage_to_usage(usage: OpenAiUsage) -> Usage {
+    let token_details = usage
+        .prompt_tokens_details
+        .as_ref()
+        .or(usage.input_tokens_details.as_ref());
+    let cached_input_tokens = token_details
+        .map(|details| details.cached_tokens)
+        .unwrap_or_default();
+    let cache_creation_input_tokens = token_details
+        .map(|details| details.cache_write_tokens)
+        .unwrap_or_default();
+    Usage::with_prompt_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1193,7 +1538,7 @@ mod tests {
     use crate::test_helpers::{
         callback_events, read_events, simple_pdf_with_text, spawn_json_server,
     };
-    use crate::types::ToolDefinition;
+    use crate::types::{PromptCachePolicy, ToolDefinition};
     use base64::Engine;
     use serde_json::json;
 
@@ -1302,9 +1647,100 @@ mod tests {
             200_000
         );
         assert!(provider.is_chat_capable("x-ai/grok-3"));
+        assert!(provider.is_chat_capable("z-ai/glm-4.5-air:free"));
+        assert!(provider.is_chat_capable("arcee-ai/trinity-large-preview:free"));
+        assert!(provider.is_chat_capable("mistralai/mistral-small-2603"));
         assert!(!provider.is_chat_capable("openai/text-embedding-3-large"));
+        assert!(!provider.is_chat_capable("openai/gpt-4o-transcribe"));
         assert_eq!(provider.fallback_models(), OPENROUTER_FALLBACK_MODELS);
         assert!(provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
+    fn fireworks_catalog_metadata_uses_fireworks_contract() {
+        let provider =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            OpenAiProvider::fireworks_base_url(),
+            "https://api.fireworks.ai/inference/v1"
+        );
+        assert_eq!(
+            provider.endpoint(),
+            "https://api.fireworks.ai/inference/v1/chat/completions"
+        );
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        assert_eq!(
+            provider.supported_thinking_levels(),
+            &["off", "low", "high"]
+        );
+        assert!(provider.is_chat_capable("accounts/fireworks/routers/kimi-k2p5-turbo"));
+        assert!(provider.is_chat_capable("accounts/fireworks/models/llama-v3p1-8b-instruct"));
+        assert!(!provider.is_chat_capable("accounts/fireworks/models/nomic-embed-text-v1.5"));
+        assert!(provider.fallback_models().is_empty());
+        assert!(!provider.catalog_filters().apply_recency_and_price_floor);
+    }
+
+    #[test]
+    fn fireworks_catalog_supplements_kimi_router_alias() {
+        let provider =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+
+        assert_eq!(
+            provider.supplemental_catalog_model_ids(&[
+                "accounts/fireworks/models/kimi-k2p5".to_string()
+            ]),
+            vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()]
+        );
+        assert!(provider
+            .supplemental_catalog_model_ids(&[
+                "accounts/fireworks/models/kimi-k2p5".to_string(),
+                FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()
+            ])
+            .is_empty());
+    }
+
+    #[test]
+    fn fireworks_catalog_prefers_kimi_turbo_router_over_standard_model() {
+        let models = vec![
+            "accounts/fireworks/models/kimi-k2p5".to_string(),
+            FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string(),
+            "accounts/fireworks/models/glm-5".to_string(),
+        ];
+
+        assert_eq!(
+            preferred_fireworks_default_model(&models),
+            Some(FIREWORKS_KIMI_TURBO_ROUTER_ID)
+        );
+        assert!(fireworks_standard_kimi_shadowed_by_turbo(
+            "accounts/fireworks/models/kimi-k2p5",
+            &models
+        ));
+        assert!(!fireworks_standard_kimi_shadowed_by_turbo(
+            "accounts/fireworks/models/glm-5",
+            &models
+        ));
+    }
+
+    #[test]
+    fn fireworks_kimi_shadowing_only_matches_exact_standard_model_id() {
+        let models = vec![FIREWORKS_KIMI_TURBO_ROUTER_ID.to_string()];
+
+        assert!(!fireworks_standard_kimi_shadowed_by_turbo(
+            "accounts/fireworks/models/team-a/kimi-k2p5",
+            &models
+        ));
+        assert!(!fireworks_standard_kimi_shadowed_by_turbo(
+            "accounts/fireworks/models/not-kimi-k2p5",
+            &models
+        ));
+        assert!(!fireworks_standard_kimi_shadowed_by_turbo(
+            "accounts/fireworks/routers/kimi-k2p5",
+            &models
+        ));
     }
 
     #[test]
@@ -1321,7 +1757,9 @@ mod tests {
             provider.thinking_levels("gpt-5.4"),
             &["none", "low", "medium", "high", "xhigh"]
         );
-        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert!(provider.is_chat_capable("gpt-5.4"));
+        assert!(!provider.is_chat_capable("text-embedding-3-small"));
+        assert!(provider.fallback_models().is_empty());
         assert!(!provider.catalog_filters().apply_recency_and_price_floor);
     }
 
@@ -1342,6 +1780,8 @@ mod tests {
             temperature: Some(0.1),
             max_tokens: Some(128),
             system_prompt: Some("Be concise".to_string()),
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1356,6 +1796,90 @@ mod tests {
         assert_eq!(serialized["messages"][1]["content"], "hello");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn openai_compatible_request_ignores_prompt_cache_hints() {
+        let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let request = CompletionRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: vec![ToolDefinition {
+                name: "lookup".to_string(),
+                description: "Lookup docs".to_string(),
+                parameters: json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            }],
+            temperature: None,
+            max_tokens: Some(128),
+            system_prompt: Some("Be concise".to_string()),
+            prompt_cache: PromptCachePolicy::Ephemeral,
+            cache_affinity: PromptCacheAffinity::new("sess-compatible"),
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert!(
+            !serialized.to_string().contains("cache_control"),
+            "OpenAI-compatible providers must not serialize Anthropic cache hints"
+        );
+        assert!(serialized.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn openai_request_serializes_prompt_cache_key_for_direct_provider() {
+        let provider = OpenAiProvider::openai("http://localhost:8080", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["gpt-5.4".to_string()]);
+
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![Message::user("hello")],
+            cache_affinity: PromptCacheAffinity::new("sess-cache-key"),
+            ..Default::default()
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert_eq!(serialized["prompt_cache_key"], "sess-cache-key");
+    }
+
+    #[test]
+    fn openai_compatible_request_serializes_tool_choice_none_without_tools() {
+        let provider = OpenAiProvider::fireworks("http://localhost:8080", "test-key").unwrap();
+        let request = CompletionRequest {
+            model: "accounts/fireworks/routers/kimi-k2p5-turbo".to_string(),
+            messages: vec![Message::user("answer from existing evidence")],
+            tools: Vec::new(),
+            ..Default::default()
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert!(serialized.get("tools").is_none());
+        assert_eq!(serialized["tool_choice"], "none");
+    }
+
+    #[test]
+    fn fireworks_request_uses_session_affinity_header() {
+        let provider = OpenAiProvider::fireworks("http://localhost:8080", "test-key").unwrap();
+        let affinity = PromptCacheAffinity::new("sess-fireworks").unwrap();
+
+        let request = provider
+            .request_builder("http://localhost:8080/v1/chat/completions", Some(&affinity))
+            .build()
+            .expect("request");
+
+        assert_eq!(
+            request.headers().get("x-session-affinity").unwrap(),
+            "sess-fireworks"
+        );
     }
 
     #[test]
@@ -1376,6 +1900,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(128),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1417,6 +1943,7 @@ mod tests {
     #[test]
     fn test_parse_completion_response_maps_text_and_tool_calls() {
         let body = OpenAiResponseBody {
+            model: None,
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
@@ -1436,6 +1963,11 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
+                prompt_tokens_details: Some(OpenAiTokenDetails {
+                    cached_tokens: 7,
+                    cache_write_tokens: 3,
+                }),
+                ..Default::default()
             }),
         };
 
@@ -1450,11 +1982,52 @@ mod tests {
         let usage = mapped.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cached_input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
+    }
+
+    #[test]
+    fn parse_completion_response_preserves_block_shaped_text() {
+        let body = OpenAiResponseBody {
+            model: None,
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAiMessageContent::Blocks(vec![
+                        OpenAiInputBlock::Text {
+                            text: "First paragraph.".to_string(),
+                        },
+                        OpenAiInputBlock::ImageUrl {
+                            image_url: OpenAiImageUrl {
+                                url: "data:image/png;base64,abc123".to_string(),
+                            },
+                        },
+                        OpenAiInputBlock::Text {
+                            text: "Second paragraph.".to_string(),
+                        },
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        let mapped = OpenAiProvider::parse_completion_response(body).unwrap();
+
+        assert_eq!(
+            mapped.content,
+            vec![ContentBlock::Text {
+                text: "First paragraph.\nSecond paragraph.".to_string()
+            }]
+        );
     }
 
     #[test]
     fn openai_chat_length_stop_reason_is_preserved() {
         let body = OpenAiResponseBody {
+            model: None,
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
@@ -1552,6 +2125,7 @@ mod tests {
     #[test]
     fn openai_stream_collection_matches_final_completion_response() {
         let body = OpenAiResponseBody {
+            model: None,
             choices: vec![OpenAiChoice {
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
@@ -1571,6 +2145,7 @@ mod tests {
             usage: Some(OpenAiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
+                ..Default::default()
             }),
         };
         let payload = r#"
@@ -1655,6 +2230,13 @@ mod tests {
         assert_eq!(
             without_v1.endpoint(),
             "https://api.openai.com/v1/chat/completions"
+        );
+
+        let fireworks =
+            OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), "test-key").unwrap();
+        assert_eq!(
+            fireworks.endpoint(),
+            "https://api.fireworks.ai/inference/v1/chat/completions"
         );
     }
 
@@ -1776,23 +2358,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_rejects_unsupported_model() {
+    fn test_build_request_allows_model_outside_startup_snapshot() {
         let provider = OpenAiProvider::new("http://localhost:8080", "test-key")
             .unwrap()
             .with_supported_models(vec!["gpt-4o-mini".to_string()]);
 
         let request = CompletionRequest {
-            model: "gpt-5".to_string(),
+            model: "arcee-ai/trinity-large-preview:free".to_string(),
             messages: vec![Message::user("hello")],
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(128),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
         let result = provider.build_request_body(&request, false);
-        assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+        assert!(result.is_ok());
     }
 
     #[test]

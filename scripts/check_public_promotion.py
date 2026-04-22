@@ -97,11 +97,15 @@ def build_report(script_dir: Path) -> Report:
     config = load_config(script_dir / "check-public-promotion.toml")
     repo_root = resolve_repo_root(script_dir)
     context = collect_diff_context(repo_root, config.base_ref)
-    blocked_paths = find_matching_paths(context.changed_paths, config.blocklist)
+    blocked_paths = find_blocked_paths(
+        context.changed_paths,
+        config.allowlist,
+        config.blocklist,
+    )
     allowlist_misses = find_allowlist_misses(
         context.changed_paths,
         config.allowlist,
-        blocked_paths,
+        config.blocklist,
     )
     marker_findings = scan_added_lines(context.added_lines, config.marker_patterns)
     invariant_findings = collect_invariant_findings(repo_root, context, config)
@@ -257,17 +261,32 @@ def find_matching_paths(paths: Sequence[str], patterns: Sequence[str]) -> tuple[
     return tuple(path for path in paths if any(path_matches(path, pattern) for pattern in patterns))
 
 
+def path_matches_any(path: str, patterns: Sequence[str]) -> bool:
+    return any(path_matches(path, pattern) for pattern in patterns)
+
+
+def find_blocked_paths(
+    paths: Sequence[str],
+    allowlist: Sequence[str],
+    blocklist: Sequence[str],
+) -> tuple[str, ...]:
+    return tuple(
+        path
+        for path in paths
+        if not path_matches_any(path, allowlist) and path_matches_any(path, blocklist)
+    )
+
+
 def find_allowlist_misses(
     paths: Sequence[str],
     allowlist: Sequence[str],
-    blocked_paths: Sequence[str],
+    blocklist: Sequence[str],
 ) -> tuple[str, ...]:
-    blocked_set = set(blocked_paths)
     misses = []
     for path in paths:
-        if path in blocked_set:
+        if path_matches_any(path, allowlist):
             continue
-        if any(path_matches(path, pattern) for pattern in allowlist):
+        if path_matches_any(path, blocklist):
             continue
         misses.append(path)
     return tuple(misses)
@@ -282,9 +301,14 @@ def path_matches(path: str, pattern: str) -> bool:
 def scan_added_lines(
     added_lines: Sequence[AddedLine],
     patterns: Sequence[NamedPattern],
+    *,
+    path_prefix: str | None = None,
+    message_prefix: str = "",
 ) -> tuple[Finding, ...]:
     findings: list[Finding] = []
     for added_line in added_lines:
+        if path_prefix is not None and not added_line.path.startswith(path_prefix):
+            continue
         match = first_named_match(added_line.text, patterns)
         if match is None:
             continue
@@ -292,7 +316,7 @@ def scan_added_lines(
             Finding(
                 path=added_line.path,
                 line_number=added_line.line_number,
-                message=match.name,
+                message=f"{message_prefix}{match.name}",
                 excerpt=added_line.text.strip(),
             )
         )
@@ -382,22 +406,12 @@ def check_workflow_refs(
     added_lines: Sequence[AddedLine],
     config: GuardConfig,
 ) -> tuple[Finding, ...]:
-    findings = []
-    for added_line in added_lines:
-        if not added_line.path.startswith(".github/workflows/"):
-            continue
-        match = first_named_match(added_line.text, config.workflow_private_patterns)
-        if match is None:
-            continue
-        findings.append(
-            Finding(
-                path=added_line.path,
-                line_number=added_line.line_number,
-                message=f"public workflow references {match.name}",
-                excerpt=added_line.text.strip(),
-            )
-        )
-    return tuple(findings)
+    return scan_added_lines(
+        added_lines,
+        config.workflow_private_patterns,
+        path_prefix=".github/workflows/",
+        message_prefix="public workflow references ",
+    )
 
 
 def build_warnings(paths: Sequence[str], config: GuardConfig) -> tuple[str, ...]:

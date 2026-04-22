@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut, Item, Table};
 
 impl FawxConfig {
+    pub fn from_toml_str(content: &str) -> Result<Self, String> {
+        let mut config: Self =
+            toml::from_str(content).map_err(|error| format!("invalid config: {error}"))?;
+        config.validate()?;
+        config.expand_paths();
+        Ok(config)
+    }
+
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let config_path = data_dir.join("config.toml");
         if !config_path.exists() {
@@ -13,11 +21,7 @@ impl FawxConfig {
         }
         let content = fs::read_to_string(&config_path)
             .map_err(|error| format!("failed to read config: {error}"))?;
-        let mut config: Self =
-            toml::from_str(&content).map_err(|error| format!("invalid config: {error}"))?;
-        config.validate()?;
-        config.expand_paths();
-        Ok(config)
+        Self::from_toml_str(&content)
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {

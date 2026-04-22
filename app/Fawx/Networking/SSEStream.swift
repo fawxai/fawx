@@ -1,0 +1,472 @@
+import Foundation
+
+enum SSEEvent: Sendable, Hashable {
+    case textPreviewDelta(String)
+    case workingNarrationDelta(WorkingNarrationDelta)
+    case textReset
+    case textDelta(String)
+    case finalAnswerDelta(String)
+    case completedSummary(String)
+    case progress(kind: String, message: String)
+    case notification(title: String, body: String)
+    case activityStart(id: String, title: String?, kind: String?)
+    case activityEnd(id: String)
+    case activityToolCallStart(activityID: String, id: String?, name: String?)
+    case activityToolCallComplete(activityID: String, id: String?, name: String?, arguments: String)
+    case activityToolResult(
+        activityID: String,
+        id: String?,
+        toolName: String?,
+        output: String,
+        isError: Bool
+    )
+    case toolProgress(
+        activityID: String?,
+        id: String?,
+        toolName: String?,
+        category: String,
+        target: String?,
+        advancesSlot: String?,
+        outcome: String
+    )
+    case toolCallStart(id: String?, name: String?)
+    case toolCallDelta(id: String?, argumentsDelta: String)
+    case toolCallComplete(id: String?, name: String?, arguments: String)
+    case toolResult(id: String?, output: String, isError: Bool)
+    case permissionPrompt(PermissionPrompt)
+    case phase(String)
+    case transcriptPhaseBoundary(String)
+    case contextCompacted(
+        tier: String,
+        messagesRemoved: Int,
+        tokensBefore: Int,
+        tokensAfter: Int,
+        usageRatio: Double
+    )
+    case engineError(category: String, message: String, recoverable: Bool)
+    case done(response: String?)
+    case error(String)
+}
+
+struct WorkingNarrationDelta: Sendable, Hashable {
+    let text: String
+    let voiceoverSuppressed: Bool
+
+    init(text: String, voiceoverSuppressed: Bool = false) {
+        self.text = text
+        self.voiceoverSuppressed = voiceoverSuppressed
+    }
+}
+
+extension SSEEvent {
+    static func workingNarrationDelta(
+        _ text: String,
+        voiceoverSuppressed: Bool = false
+    ) -> SSEEvent {
+        .workingNarrationDelta(
+            WorkingNarrationDelta(
+                text: text,
+                voiceoverSuppressed: voiceoverSuppressed
+            )
+        )
+    }
+}
+
+struct SSEParser {
+    private var currentEventName = ""
+    private var currentDataLines: [String] = []
+
+    mutating func parseLine(_ line: String) throws -> [SSEEvent] {
+        let normalizedLine = line.trimmingTrailingCarriageReturn()
+        var emittedEvents: [SSEEvent] = []
+
+        if normalizedLine.hasPrefix(":") {
+            return []
+        }
+
+        if normalizedLine.isEmpty {
+            return try flush()
+        }
+
+        if normalizedLine.hasPrefix("event:") {
+            if currentDataLines.isEmpty == false {
+                emittedEvents.append(contentsOf: try flush())
+            }
+            currentEventName = normalizedLine
+                .dropFirst("event:".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return emittedEvents
+        }
+
+        if normalizedLine.hasPrefix("data:") {
+            let data = normalizedLine.dropFirst("data:".count)
+            currentDataLines.append(String(data).trimmingPrefixSpace())
+            return emittedEvents
+        }
+
+        return emittedEvents
+    }
+
+    mutating func finish() throws -> [SSEEvent] {
+        try flush()
+    }
+
+    private mutating func flush() throws -> [SSEEvent] {
+        let eventName = currentEventName.isEmpty ? "message" : currentEventName
+        let data = currentDataLines.joined(separator: "\n")
+        currentEventName = ""
+        currentDataLines.removeAll(keepingCapacity: true)
+
+        guard !data.isEmpty else {
+            return []
+        }
+
+        guard let event = try Self.decode(eventName: eventName, data: data) else {
+            return []
+        }
+        return [event]
+    }
+
+    private static func decode(eventName: String, data: String) throws -> SSEEvent? {
+        let decoder = JSONDecoder()
+
+        switch eventName {
+        case "text_preview_delta":
+            let payload = try decoder.decode(TextDeltaPayload.self, from: Data(data.utf8))
+            return .textPreviewDelta(payload.text)
+        case "working_narration_delta":
+            let payload = try decoder.decode(TextDeltaPayload.self, from: Data(data.utf8))
+            return .workingNarrationDelta(
+                payload.text,
+                voiceoverSuppressed: payload.voiceoverSuppressed
+            )
+        case "text_reset":
+            return .textReset
+        case "text_delta":
+            let payload = try decoder.decode(TextDeltaPayload.self, from: Data(data.utf8))
+            return .textDelta(payload.text)
+        case "final_answer_delta":
+            let payload = try decoder.decode(TextDeltaPayload.self, from: Data(data.utf8))
+            return .finalAnswerDelta(payload.text)
+        case "completed_summary":
+            let payload = try decoder.decode(CompletedSummaryPayload.self, from: Data(data.utf8))
+            return .completedSummary(payload.text)
+        case "progress":
+            let payload = try decoder.decode(ProgressPayload.self, from: Data(data.utf8))
+            return .progress(kind: payload.kind, message: payload.message)
+        case "notification":
+            let payload = try decoder.decode(NotificationPayload.self, from: Data(data.utf8))
+            return .notification(title: payload.title, body: payload.body)
+        case "activity_start":
+            let payload = try decoder.decode(ActivityStartPayload.self, from: Data(data.utf8))
+            return .activityStart(id: payload.id, title: payload.title, kind: payload.kind)
+        case "activity_end":
+            let payload = try decoder.decode(ActivityEndPayload.self, from: Data(data.utf8))
+            return .activityEnd(id: payload.id)
+        case "activity_tool_call_start":
+            let payload = try decoder.decode(ActivityToolCallStartPayload.self, from: Data(data.utf8))
+            return .activityToolCallStart(
+                activityID: payload.activityID,
+                id: payload.id,
+                name: payload.name
+            )
+        case "tool_call_start":
+            let payload = try decoder.decode(ToolCallStartPayload.self, from: Data(data.utf8))
+            return .toolCallStart(id: payload.id, name: payload.name)
+        case "activity_tool_call_complete":
+            let payload = try decoder.decode(ActivityToolCallCompletePayload.self, from: Data(data.utf8))
+            return .activityToolCallComplete(
+                activityID: payload.activityID,
+                id: payload.id,
+                name: payload.name,
+                arguments: payload.argumentsString
+            )
+        case "tool_call_delta":
+            let payload = try decoder.decode(ToolCallDeltaPayload.self, from: Data(data.utf8))
+            return .toolCallDelta(
+                id: payload.id,
+                argumentsDelta: payload.argumentsDelta
+            )
+        case "tool_call_complete":
+            let payload = try decoder.decode(ToolCallCompletePayload.self, from: Data(data.utf8))
+            return .toolCallComplete(
+                id: payload.id,
+                name: payload.name,
+                arguments: payload.argumentsString
+            )
+        case "activity_tool_result":
+            let payload = try decoder.decode(ActivityToolResultPayload.self, from: Data(data.utf8))
+            return .activityToolResult(
+                activityID: payload.activityID,
+                id: payload.id,
+                toolName: payload.toolName,
+                output: payload.outputString,
+                isError: payload.isError
+            )
+        case "tool_result":
+            let payload = try decoder.decode(ToolResultPayload.self, from: Data(data.utf8))
+            return .toolResult(
+                id: payload.id,
+                output: payload.outputString,
+                isError: payload.isError
+            )
+        case "tool_progress":
+            let payload = try decoder.decode(ToolProgressPayload.self, from: Data(data.utf8))
+            return .toolProgress(
+                activityID: payload.activityID,
+                id: payload.id,
+                toolName: payload.toolName,
+                category: payload.category,
+                target: payload.target,
+                advancesSlot: payload.advancesSlot,
+                outcome: payload.outcome
+            )
+        case "permission_prompt":
+            let payload = try decoder.decode(PermissionPrompt.self, from: Data(data.utf8))
+            return .permissionPrompt(payload)
+        case "phase", "phase_change":
+            let payload = try decoder.decode(PhasePayload.self, from: Data(data.utf8))
+            return .phase(payload.phase)
+        case "phase_boundary":
+            let payload = try decoder.decode(PhasePayload.self, from: Data(data.utf8))
+            return .transcriptPhaseBoundary(payload.phase)
+        case "context_compacted":
+            let payload = try decoder.decode(ContextCompactedPayload.self, from: Data(data.utf8))
+            return .contextCompacted(
+                tier: payload.tier,
+                messagesRemoved: payload.messagesRemoved,
+                tokensBefore: payload.tokensBefore,
+                tokensAfter: payload.tokensAfter,
+                usageRatio: payload.usageRatio
+            )
+        case "engine_error":
+            let payload = try decoder.decode(EngineErrorPayload.self, from: Data(data.utf8))
+            return .engineError(
+                category: payload.category,
+                message: payload.message,
+                recoverable: payload.recoverable
+            )
+        case "done":
+            let payload = try decoder.decode(DonePayload.self, from: Data(data.utf8))
+            return .done(response: payload.response)
+        case "error":
+            let payload = try decoder.decode(FatalErrorPayload.self, from: Data(data.utf8))
+            return .error(payload.error)
+        default:
+            return nil
+        }
+    }
+}
+
+private struct TextDeltaPayload: Decodable {
+    let text: String
+    let voiceoverSuppressed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case voiceoverSuppressed = "voiceover_suppressed"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decode(String.self, forKey: .text)
+        voiceoverSuppressed = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .voiceoverSuppressed
+        ) ?? false
+    }
+}
+
+private struct CompletedSummaryPayload: Decodable {
+    let text: String
+}
+
+private struct NotificationPayload: Decodable {
+    let title: String
+    let body: String
+}
+
+private struct ProgressPayload: Decodable {
+    let kind: String
+    let message: String
+}
+
+private struct ActivityStartPayload: Decodable {
+    let id: String
+    let title: String?
+    let kind: String?
+}
+
+private struct ActivityEndPayload: Decodable {
+    let id: String
+}
+
+private struct ActivityToolCallStartPayload: Decodable {
+    let activityID: String
+    let id: String?
+    let name: String?
+
+    enum CodingKeys: String, CodingKey {
+        case activityID = "activity_id"
+        case id
+        case name
+    }
+}
+
+private struct ActivityToolCallCompletePayload: Decodable {
+    let activityID: String
+    let id: String?
+    let name: String?
+    let arguments: JSONValue?
+
+    var argumentsString: String {
+        arguments?.toolArgumentsString ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case activityID = "activity_id"
+        case id
+        case name
+        case arguments
+    }
+}
+
+private struct ActivityToolResultPayload: Decodable {
+    let activityID: String
+    let id: String?
+    let toolName: String?
+    let output: JSONValue?
+    let isError: Bool
+
+    var outputString: String {
+        output?.description ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case activityID = "activity_id"
+        case id
+        case toolName = "tool_name"
+        case output
+        case isError = "is_error"
+    }
+}
+
+private struct ToolProgressPayload: Decodable {
+    let activityID: String?
+    let id: String?
+    let toolName: String?
+    let category: String
+    let target: String?
+    let advancesSlot: String?
+    let outcome: String
+
+    enum CodingKeys: String, CodingKey {
+        case activityID = "activity_id"
+        case id
+        case toolName = "tool_name"
+        case category = "class"
+        case target
+        case advancesSlot = "advances_slot"
+        case outcome
+    }
+}
+
+private struct ToolCallStartPayload: Decodable {
+    let id: String?
+    let name: String?
+}
+
+private struct ToolCallCompletePayload: Decodable {
+    let id: String?
+    let name: String?
+    let arguments: JSONValue?
+
+    var argumentsString: String {
+        arguments?.toolArgumentsString ?? ""
+    }
+}
+
+private extension JSONValue {
+    var toolArgumentsString: String? {
+        if case .string(let value) = self {
+            return value
+        }
+
+        return jsonEncodedString
+    }
+
+    var jsonEncodedString: String? {
+        (try? JSONEncoder().encode(self))
+            .flatMap { String(data: $0, encoding: .utf8) }
+    }
+}
+
+private struct ToolCallDeltaPayload: Decodable {
+    let id: String?
+    let argumentsDelta: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case argumentsDelta = "args_delta"
+    }
+}
+
+private struct ToolResultPayload: Decodable {
+    let id: String?
+    let output: JSONValue?
+    let isError: Bool
+
+    var outputString: String {
+        output?.description ?? ""
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case output
+        case isError = "is_error"
+    }
+}
+
+private struct PhasePayload: Decodable {
+    let phase: String
+}
+
+private struct ContextCompactedPayload: Decodable {
+    let tier: String
+    let messagesRemoved: Int
+    let tokensBefore: Int
+    let tokensAfter: Int
+    let usageRatio: Double
+
+    enum CodingKeys: String, CodingKey {
+        case tier
+        case messagesRemoved = "messages_removed"
+        case tokensBefore = "tokens_before"
+        case tokensAfter = "tokens_after"
+        case usageRatio = "usage_ratio"
+    }
+}
+
+private struct EngineErrorPayload: Decodable {
+    let category: String
+    let message: String
+    let recoverable: Bool
+}
+
+private struct DonePayload: Decodable {
+    let response: String?
+}
+
+private struct FatalErrorPayload: Decodable {
+    let error: String
+}
+
+private extension String {
+    func trimmingPrefixSpace() -> String {
+        hasPrefix(" ") ? String(dropFirst()) : self
+    }
+
+    func trimmingTrailingCarriageReturn() -> String {
+        hasSuffix("\r") ? String(dropLast()) : self
+    }
+}

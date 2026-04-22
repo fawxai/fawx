@@ -118,6 +118,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                ..Default::default()
             }
         }
     }
@@ -167,6 +169,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                ..Default::default()
             }
         }
     }
@@ -225,7 +229,7 @@ mod tests {
         let proposals_dir = tmp.path().join("proposals");
         let repo_root = tmp.path().join("repo");
 
-        let store = SignalStore::new(&data_dir, "empty-session").unwrap();
+        let store = SignalStore::open(&data_dir, "empty-session").unwrap();
         let provider = EmptyMockProvider;
         let config = ImprovementConfig::default();
         let paths = CyclePaths {
@@ -253,15 +257,15 @@ mod tests {
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
 
-        let store = SignalStore::new(&data_dir, "planning-failure-session").unwrap();
+        let store = SignalStore::open(&data_dir, "planning-failure-session").unwrap();
         store
-            .persist(&[Signal {
-                step: LoopStep::Act,
-                kind: SignalKind::Friction,
-                message: "test friction".to_string(),
-                metadata: serde_json::json!({}),
-                timestamp_ms: 1000,
-            }])
+            .persist(&[Signal::new(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "test friction",
+                serde_json::json!({}),
+                1000,
+            )])
             .unwrap();
 
         let provider = QueueMockProvider::new(vec![
@@ -300,7 +304,7 @@ mod tests {
         let proposals_dir = tmp.path().join("proposals");
         let repo_root = tmp.path().join("repo");
 
-        let store = SignalStore::new(&data_dir, "invalid-config-session").unwrap();
+        let store = SignalStore::open(&data_dir, "invalid-config-session").unwrap();
         let provider = EmptyMockProvider;
         let mut config = ImprovementConfig::default();
         config.min_evidence_count = 0;

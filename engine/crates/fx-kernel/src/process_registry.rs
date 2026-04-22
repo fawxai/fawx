@@ -1,3 +1,4 @@
+use crate::SharedExecutionRoot;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,6 +94,7 @@ pub struct ListEntry {
 #[derive(Debug)]
 pub struct ProcessRegistry {
     config: ProcessConfig,
+    execution_root: Option<SharedExecutionRoot>,
     processes: Mutex<HashMap<String, Arc<ProcessEntry>>>,
     next_id: AtomicU32,
 }
@@ -238,9 +240,18 @@ impl ProcessEntry {
 impl ProcessRegistry {
     #[must_use]
     pub fn new(config: ProcessConfig) -> Self {
+        Self::new_with_execution_root(config, None)
+    }
+
+    #[must_use]
+    pub fn new_with_execution_root(
+        config: ProcessConfig,
+        execution_root: Option<SharedExecutionRoot>,
+    ) -> Self {
         Self {
             next_id: AtomicU32::new(seed_id()),
             config,
+            execution_root,
             processes: Mutex::new(HashMap::new()),
         }
     }
@@ -340,12 +351,12 @@ impl ProcessRegistry {
     }
 
     fn validate_working_dir(&self, working_dir: &Path) -> Result<(), String> {
-        if self.config.allowed_dirs.is_empty() {
+        let allowed_dirs = self.allowed_dirs();
+        if allowed_dirs.is_empty() {
             return canonicalize_existing_or_parent(working_dir).map(|_| ());
         }
         let resolved = canonicalize_existing_or_parent(working_dir)?;
-        if self
-            .allowed_dirs()
+        if allowed_dirs
             .iter()
             .any(|allowed| path_within(&resolved, allowed))
         {
@@ -358,11 +369,18 @@ impl ProcessRegistry {
     }
 
     fn allowed_dirs(&self) -> Vec<PathBuf> {
-        self.config
+        let mut allowed = self
+            .config
             .allowed_dirs
             .iter()
             .filter_map(|path| canonicalize_existing_or_parent(path).ok())
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(root) = &self.execution_root {
+            if let Ok(path) = canonicalize_existing_or_parent(&root.current()) {
+                allowed.push(path);
+            }
+        }
+        allowed
     }
 
     fn next_session_id(&self) -> String {

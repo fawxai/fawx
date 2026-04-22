@@ -152,8 +152,8 @@ mod tests {
     use fx_core::signals::{LoopStep, SignalKind};
 
     fn simple_plan(count: usize) -> DecompositionPlan {
-        DecompositionPlan {
-            sub_goals: (0..count)
+        DecompositionPlan::standard(
+            (0..count)
                 .map(|index| {
                     SubGoal::new(
                         format!("Goal {index}"),
@@ -163,19 +163,18 @@ mod tests {
                     )
                 })
                 .collect(),
-            strategy: AggregationStrategy::Sequential,
-            truncated_from: None,
-        }
+            AggregationStrategy::Sequential,
+        )
     }
 
     fn sample_signal() -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Success,
-            message: "test signal".to_owned(),
-            metadata: serde_json::json!({"source": "test"}),
-            timestamp_ms: 42,
-        }
+        Signal::new(
+            LoopStep::Act,
+            SignalKind::Success,
+            "test signal",
+            serde_json::json!({"source": "test"}),
+            42,
+        )
     }
 
     #[test]

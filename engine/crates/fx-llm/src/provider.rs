@@ -8,7 +8,8 @@ use std::pin::Pin;
 
 use crate::streaming::{emit_default_stream_response, StreamCallback};
 use crate::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, StreamChunk, ToolCall,
+    CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, PromptCacheAffinity,
+    PromptCachePolicy, StreamChunk, ToolCall,
 };
 
 /// Streaming response type for completion APIs.
@@ -21,6 +22,72 @@ pub struct ProviderCapabilities {
     pub supports_temperature: bool,
     /// Whether this backend requires streaming to be used.
     pub requires_streaming: bool,
+    /// Provider-specific prompt-cache hint support.
+    pub prompt_cache: PromptCacheCapability,
+    /// Provider-specific support for automatic prompt-cache affinity hints.
+    pub prompt_cache_affinity: PromptCacheAffinityCapability,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_temperature: true,
+            requires_streaming: false,
+            prompt_cache: PromptCacheCapability::Unsupported,
+            prompt_cache_affinity: PromptCacheAffinityCapability::Unsupported,
+        }
+    }
+}
+
+/// Static prompt-cache support for a provider backend.
+///
+/// This capability only gates provider-safe request policies. Providers remain
+/// responsible for translating an accepted policy into their own wire format
+/// when serializing the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCacheCapability {
+    /// Ignore request-side prompt-cache hints safely.
+    #[default]
+    Unsupported,
+    /// Anthropic `cache_control: { "type": "ephemeral", "ttl": "1h" }` on eligible blocks.
+    AnthropicEphemeral,
+}
+
+impl PromptCacheCapability {
+    /// Return the provider-safe policy for a request preference.
+    pub const fn normalize_policy(self, policy: PromptCachePolicy) -> PromptCachePolicy {
+        match (self, policy) {
+            (Self::AnthropicEphemeral, PromptCachePolicy::Ephemeral) => {
+                PromptCachePolicy::Ephemeral
+            }
+            _ => PromptCachePolicy::Disabled,
+        }
+    }
+}
+
+/// Static cache-affinity support for providers with automatic prompt caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCacheAffinityCapability {
+    /// Drop request-side affinity hints safely.
+    #[default]
+    Unsupported,
+    /// OpenAI `prompt_cache_key` request-body hint.
+    OpenAiPromptCacheKey,
+    /// Fireworks `x-session-affinity` request-header hint.
+    FireworksSessionAffinityHeader,
+}
+
+impl PromptCacheAffinityCapability {
+    /// Return the provider-safe affinity hint for a request preference.
+    pub fn normalize_affinity(
+        self,
+        affinity: Option<PromptCacheAffinity>,
+    ) -> Option<PromptCacheAffinity> {
+        match self {
+            Self::Unsupported => None,
+            Self::OpenAiPromptCacheKey | Self::FireworksSessionAffinityHeader => affinity,
+        }
+    }
 }
 
 /// Provider-specific catalog filtering policy.
@@ -30,6 +97,14 @@ pub struct ProviderCatalogFilters {
     /// More provider-specific catalog gates can be added here as metadata
     /// contracts expand without proliferating ad hoc boolean methods.
     pub apply_recency_and_price_floor: bool,
+}
+
+/// Typed metadata for a discovered provider model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub recommended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +434,20 @@ pub trait LlmProvider: Send + Sync {
         Ok(self.supported_models())
     }
 
+    /// Fetch available models with typed catalog metadata.
+    async fn list_discovered_models(&self) -> Result<Vec<DiscoveredModel>, LlmError> {
+        self.list_models().await.map(|models| {
+            models
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()
+        })
+    }
+
     /// Provider feature support contract.
     fn capabilities(&self) -> ProviderCapabilities;
 
@@ -394,6 +483,11 @@ pub trait LlmProvider: Send + Sync {
 
     /// Provider-specific static catalog fallback.
     fn fallback_models(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Provider-owned supplemental models to add when a live catalog is incomplete.
+    fn supplemental_catalog_model_ids(&self, _discovered_model_ids: &[String]) -> Vec<String> {
         Vec::new()
     }
 

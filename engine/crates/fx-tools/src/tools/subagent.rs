@@ -1,7 +1,7 @@
 use super::{parse_args, to_tool_result, ToolRegistry};
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
-use fx_kernel::act::{ToolCacheability, ToolResult};
+use fx_kernel::act::{ToolCacheability, ToolCallClassification, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_subagent::{
@@ -10,7 +10,7 @@ use fx_subagent::{
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolContext>) {
     registry.register(SpawnAgentTool::new(context));
@@ -99,6 +99,10 @@ impl Tool for SpawnAgentTool {
         ToolCacheability::SideEffect
     }
 
+    fn classify_call(&self, _call: &ToolCall) -> ToolCallClassification {
+        ToolCallClassification::Orchestration
+    }
+
     fn action_category(&self) -> &'static str {
         "tool_call"
     }
@@ -120,16 +124,20 @@ impl Tool for SubagentStatusTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "list", "cancel", "send"],
+                        "enum": ["status", "wait", "list", "cancel", "send"],
                         "description": "Action to perform"
                     },
                     "id": {
                         "type": "string",
-                        "description": "Subagent ID (required for status/cancel/send)"
+                        "description": "Subagent ID (required for status/wait/cancel/send)"
                     },
                     "message": {
                         "type": "string",
                         "description": "Message to send (required for send action)"
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Maximum wait time for wait action (default: 600)"
                     }
                 },
                 "required": ["action"]
@@ -137,11 +145,13 @@ impl Tool for SubagentStatusTool {
         }
     }
 
-    async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
+    async fn execute(&self, call: &ToolCall, cancel: Option<&CancellationToken>) -> ToolResult {
         to_tool_result(
             &call.id,
             self.name(),
-            self.context.handle_subagent_status(&call.arguments).await,
+            self.context
+                .handle_subagent_status(&call.arguments, cancel)
+                .await,
         )
     }
 
@@ -169,10 +179,12 @@ struct SubagentStatusArgs {
     action: String,
     id: Option<String>,
     message: Option<String>,
+    timeout_seconds: Option<u64>,
 }
 
 enum SubagentAction {
     Status,
+    Wait,
     List,
     Cancel,
     Send,
@@ -208,7 +220,10 @@ impl ToolContext {
     ) -> Result<String, String> {
         let control = self.subagent_control()?;
         let parsed: SpawnAgentArgs = parse_args(args)?;
-        let config = parsed.into_spawn_config()?;
+        let mut config = parsed.into_spawn_config()?;
+        if config.cwd.is_none() {
+            config.cwd = Some(self.working_dir());
+        }
         let handle = control
             .spawn(config)
             .await
@@ -219,6 +234,7 @@ impl ToolContext {
     pub(crate) async fn handle_subagent_status(
         &self,
         args: &serde_json::Value,
+        cancel: Option<&CancellationToken>,
     ) -> Result<String, String> {
         let control = self.subagent_control()?;
         let parsed: SubagentStatusArgs = parse_args(args)?;
@@ -226,6 +242,9 @@ impl ToolContext {
         let output = match action {
             SubagentAction::List => list_subagents_output(control).await?,
             SubagentAction::Status => status_subagent_output(control, parsed.id).await?,
+            SubagentAction::Wait => {
+                wait_subagent_output(control, parsed.id, parsed.timeout_seconds, cancel).await?
+            }
             SubagentAction::Cancel => cancel_subagent_output(control, parsed.id).await?,
             SubagentAction::Send => {
                 send_subagent_output(control, parsed.id, parsed.message).await?
@@ -292,6 +311,36 @@ async fn status_subagent_output(
     Ok(spawned_handle_value(&handle))
 }
 
+async fn wait_subagent_output(
+    control: &Arc<dyn SubagentControl>,
+    id: Option<String>,
+    timeout_seconds: Option<u64>,
+    cancel: Option<&CancellationToken>,
+) -> Result<serde_json::Value, String> {
+    let id = required_subagent_id(id, "wait")?;
+    let timeout = Duration::from_secs(timeout_seconds.unwrap_or(600));
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err("subagent wait cancelled".to_string());
+        }
+
+        let handle = require_subagent_handle(control, &id).await?;
+        if !matches!(handle.status, SubagentStatus::Running) {
+            return Ok(spawned_handle_value(&handle));
+        }
+
+        if Instant::now() >= deadline {
+            let mut value = spawned_handle_value(&handle);
+            value["wait_timed_out"] = serde_json::json!(true);
+            return Ok(value);
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn cancel_subagent_output(
     control: &Arc<dyn SubagentControl>,
     id: Option<String>,
@@ -354,11 +403,12 @@ async fn require_subagent_handle(
 fn parse_subagent_action(action: &str) -> Result<SubagentAction, String> {
     match action {
         "status" => Ok(SubagentAction::Status),
+        "wait" => Ok(SubagentAction::Wait),
         "list" => Ok(SubagentAction::List),
         "cancel" => Ok(SubagentAction::Cancel),
         "send" => Ok(SubagentAction::Send),
         other => Err(format!(
-            "unknown subagent action '{other}', valid actions: status, list, cancel, send"
+            "unknown subagent action '{other}', valid actions: status, wait, list, cancel, send"
         )),
     }
 }

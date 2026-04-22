@@ -5,17 +5,18 @@ use fx_consensus::ProgressCallback;
 use fx_core::memory::MemoryStore;
 use fx_core::runtime_info::RuntimeInfo;
 use fx_core::self_modify::SelfModifyConfig;
+use fx_core::signals::Signal;
 use fx_kernel::act::{
-    JournalAction, SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification, ToolResult,
+    JournalAction, SubGoalToolRoutingRequest, ToolCacheability, ToolCallClassification,
+    ToolExecutionDiagnostics, ToolResult,
 };
 use fx_kernel::budget::BudgetConfig as KernelBudgetConfig;
 use fx_kernel::cancellation::CancellationToken;
-use fx_kernel::ProcessRegistry;
 use fx_kernel::ToolAuthoritySurface;
+use fx_kernel::{ProcessRegistry, SharedExecutionRoot};
 use fx_llm::{ToolCall, ToolDefinition};
 use fx_memory::embedding_index::EmbeddingIndex;
 use fx_subagent::SubagentControl;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -51,7 +52,7 @@ impl Default for ToolConfig {
 
 #[derive(Clone)]
 pub struct ToolContext {
-    pub(crate) working_dir: PathBuf,
+    pub(crate) execution_root: SharedExecutionRoot,
     pub(crate) config: ToolConfig,
     pub(crate) process_registry: Arc<ProcessRegistry>,
     pub(crate) memory: Option<Arc<Mutex<dyn MemoryStore>>>,
@@ -99,6 +100,17 @@ pub trait Tool: Send + Sync {
     }
 
     fn journal_action(&self, _call: &ToolCall, _result: &ToolResult) -> Option<JournalAction> {
+        None
+    }
+
+    fn take_execution_diagnostics(&self, call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        let _ = call_id;
+        None
+    }
+
+    #[must_use = "drained tool signals are cleared and will be lost if ignored"]
+    fn take_emitted_signals(&self, call_id: &str) -> Option<Vec<Signal>> {
+        let _ = call_id;
         None
     }
 

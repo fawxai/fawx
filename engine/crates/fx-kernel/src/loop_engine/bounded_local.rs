@@ -17,8 +17,11 @@ use crate::loop_engine::direct_inspection::{
 };
 use crate::loop_engine::direct_utility::{direct_utility_block_reason, DirectUtilityProfile};
 use crate::signals::{LoopStep, SignalKind};
-use fx_llm::{ToolCall, ToolDefinition};
+use fx_core::command_text::normalize_http_url_token;
+use fx_core::message::ProgressKind;
+use fx_llm::{CompletionResponse, ToolCall, ToolDefinition};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) enum TurnExecutionProfile {
@@ -27,6 +30,7 @@ pub(super) enum TurnExecutionProfile {
     BoundedLocal,
     DirectInspection(DirectInspectionProfile),
     DirectUtility(DirectUtilityProfile),
+    DeterministicLocal(DeterministicLocalPlan),
 }
 
 impl TurnExecutionProfile {
@@ -35,7 +39,10 @@ impl TurnExecutionProfile {
     }
 
     pub(super) fn completes_terminally(&self) -> bool {
-        matches!(self, Self::DirectInspection(_) | Self::DirectUtility(_))
+        matches!(
+            self,
+            Self::DirectInspection(_) | Self::DirectUtility(_) | Self::DeterministicLocal(_)
+        )
     }
 
     pub(super) fn tightened_termination_config(
@@ -57,7 +64,7 @@ impl TurnExecutionProfile {
                 tightened.observation_only_round_strip_after_nudge = 0;
                 Some(tightened)
             }
-            Self::DirectInspection(_) | Self::DirectUtility(_) => {
+            Self::DirectInspection(_) | Self::DirectUtility(_) | Self::DeterministicLocal(_) => {
                 Some(tightened_direct_profile_termination(base))
             }
         }
@@ -70,7 +77,10 @@ impl TurnExecutionProfile {
     pub(super) fn direct_inspection_profile(&self) -> Option<DirectInspectionProfile> {
         match self {
             Self::DirectInspection(profile) => Some(*profile),
-            Self::Standard | Self::BoundedLocal | Self::DirectUtility(_) => None,
+            Self::Standard
+            | Self::BoundedLocal
+            | Self::DirectUtility(_)
+            | Self::DeterministicLocal(_) => None,
         }
     }
 
@@ -116,6 +126,232 @@ pub(super) enum BoundedLocalTerminalReason {
     RecoveryStepDidNotProduceTargetedContext,
 }
 
+const DETERMINISTIC_LOCAL_BLOCK_REASON: &str =
+    "deterministic local intent turns only allow their planned local action";
+const DETERMINISTIC_LOCAL_URL_ALLOWED_TOKENS: &[&str] = &[
+    "a", "an", "browser", "can", "could", "default", "in", "launch", "link", "me", "open", "page",
+    "please", "start", "tab", "the", "this", "url", "webpage", "website", "would", "you",
+];
+const DETERMINISTIC_LOCAL_BROWSER_ALLOWED_TOKENS: &[&str] = &[
+    "a",
+    "an",
+    "app",
+    "application",
+    "browser",
+    "can",
+    "could",
+    "for",
+    "launch",
+    "me",
+    "open",
+    "please",
+    "start",
+    "tab",
+    "the",
+    "would",
+    "you",
+];
+static DETERMINISTIC_LOCAL_TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeterministicLocalPlan {
+    OpenBrowserApplication { browser: BrowserApplication },
+    OpenBrowserUrl { url: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Keep this variant list aligned with the parallel tool-local enum in
+// fx-tools/src/tools/local_actions.rs. The duplication is intentional so the
+// kernel can classify bounded intents without depending on the tool crate, but
+// the supported browser set is one cross-crate contract.
+pub(super) enum BrowserApplication {
+    Chrome,
+    Safari,
+    Firefox,
+    Brave,
+    Edge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserAliasMatch {
+    browser: BrowserApplication,
+    start: usize,
+    len: usize,
+}
+
+impl BrowserApplication {
+    const ALL: [Self; 5] = [
+        Self::Chrome,
+        Self::Safari,
+        Self::Firefox,
+        Self::Brave,
+        Self::Edge,
+    ];
+
+    pub(super) fn argument_value(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Safari => "safari",
+            Self::Firefox => "firefox",
+            Self::Brave => "brave",
+            Self::Edge => "edge",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "Google Chrome",
+            Self::Safari => "Safari",
+            Self::Firefox => "Firefox",
+            Self::Brave => "Brave Browser",
+            Self::Edge => "Microsoft Edge",
+        }
+    }
+
+    fn aliases(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::Chrome => &[&["google", "chrome"], &["chrome"]],
+            Self::Safari => &[&["safari"]],
+            Self::Firefox => &[&["mozilla", "firefox"], &["firefox"]],
+            Self::Brave => &[&["brave", "browser"], &["brave"]],
+            Self::Edge => &[&["microsoft", "edge"], &["edge"]],
+        }
+    }
+
+    fn find_match(self, tokens: &[String]) -> Option<BrowserAliasMatch> {
+        self.aliases()
+            .iter()
+            .filter_map(|alias| {
+                find_token_sequence(tokens, alias).map(|start| BrowserAliasMatch {
+                    browser: self,
+                    start,
+                    len: alias.len(),
+                })
+            })
+            .max_by_key(|matched| matched.len)
+    }
+
+    pub(super) fn from_candidate(candidate: &str) -> Option<Self> {
+        let tokens = tokenize_local_intent(candidate);
+        if tokens.is_empty() {
+            return None;
+        }
+        Self::ALL
+            .into_iter()
+            .filter_map(|browser| browser.find_match(&tokens))
+            .max_by_key(|matched| matched.len)
+            .map(|matched| matched.browser)
+    }
+}
+
+impl DeterministicLocalPlan {
+    pub(super) fn tool_name(&self) -> &'static str {
+        match self {
+            Self::OpenBrowserApplication { .. } => "open_browser_application",
+            Self::OpenBrowserUrl { .. } => "open_browser_url",
+        }
+    }
+
+    pub(super) fn completion_response(&self) -> CompletionResponse {
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: vec![self.tool_call()],
+            usage: None,
+            stop_reason: Some("tool_use".to_string()),
+        }
+    }
+
+    pub(super) fn terminal_response(&self, tool_results: &[ToolResult]) -> String {
+        if let Some(result) = latest_successful_result(tool_results) {
+            if !result.output.trim().is_empty() {
+                return result.output.trim().to_string();
+            }
+            return self.success_message();
+        }
+
+        let prefix = match self {
+            Self::OpenBrowserApplication { browser } => {
+                format!("I couldn't open {}.", browser.display_name())
+            }
+            Self::OpenBrowserUrl { url } => {
+                format!("I couldn't open {url} in the default browser.")
+            }
+        };
+
+        if let Some(result) = latest_non_empty_result(tool_results) {
+            format!("{prefix} {}", result.output.trim())
+        } else {
+            prefix
+        }
+    }
+
+    pub(super) fn progress(&self) -> (ProgressKind, String) {
+        (
+            ProgressKind::Implementing,
+            match self {
+                Self::OpenBrowserApplication { browser } => {
+                    format!("Opening {}...", browser.display_name())
+                }
+                Self::OpenBrowserUrl { url } => {
+                    format!("Opening {url} in the default browser...")
+                }
+            },
+        )
+    }
+
+    pub(super) fn signal_kind(&self) -> &'static str {
+        match self {
+            Self::OpenBrowserApplication { .. } => "open_browser_application",
+            Self::OpenBrowserUrl { .. } => "open_browser_url",
+        }
+    }
+
+    pub(super) fn signal_metadata(&self) -> serde_json::Value {
+        match self {
+            Self::OpenBrowserApplication { browser } => serde_json::json!({
+                "kind": self.signal_kind(),
+                "tool_name": self.tool_name(),
+                "browser": browser.argument_value(),
+            }),
+            Self::OpenBrowserUrl { url } => serde_json::json!({
+                "kind": self.signal_kind(),
+                "tool_name": self.tool_name(),
+                "url": url,
+            }),
+        }
+    }
+
+    fn tool_call(&self) -> ToolCall {
+        let sequence = DETERMINISTIC_LOCAL_TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        ToolCall {
+            id: format!(
+                "deterministic-local-{}-{sequence}",
+                self.signal_kind().replace('_', "-")
+            ),
+            name: self.tool_name().to_string(),
+            arguments: match self {
+                Self::OpenBrowserApplication { browser } => serde_json::json!({
+                    "browser": browser.argument_value(),
+                }),
+                Self::OpenBrowserUrl { url } => serde_json::json!({
+                    "url": url,
+                }),
+            },
+        }
+    }
+
+    fn success_message(&self) -> String {
+        match self {
+            Self::OpenBrowserApplication { browser } => {
+                format!("Opened {}.", browser.display_name())
+            }
+            Self::OpenBrowserUrl { url } => {
+                format!("Opened {url} in the default browser.")
+            }
+        }
+    }
+}
+
 impl LoopEngine {
     pub(super) fn turn_execution_profile_tool_names(&self) -> Option<Vec<String>> {
         match &self.turn_execution_profile {
@@ -147,6 +383,9 @@ impl LoopEngine {
             TurnExecutionProfile::DirectUtility(profile) => {
                 Some(direct_utility_tool_names(profile))
             }
+            TurnExecutionProfile::DeterministicLocal(plan) => {
+                Some(vec![plan.tool_name().to_string()])
+            }
             TurnExecutionProfile::Standard => None,
         }
     }
@@ -160,6 +399,7 @@ impl LoopEngine {
             TurnExecutionProfile::DirectUtility(profile) => {
                 Some(direct_utility_block_reason(profile))
             }
+            TurnExecutionProfile::DeterministicLocal(_) => Some(DETERMINISTIC_LOCAL_BLOCK_REASON),
             TurnExecutionProfile::Standard => None,
         }
     }
@@ -181,6 +421,7 @@ impl LoopEngine {
     pub(super) fn effective_decompose_enabled(&self) -> bool {
         self.decompose_enabled
             && matches!(&self.turn_execution_profile, TurnExecutionProfile::Standard)
+            && self.preflight_route_plan.is_none()
     }
 
     pub(super) fn turn_execution_profile_directive(&self) -> Option<String> {
@@ -207,6 +448,7 @@ impl LoopEngine {
                 Some(format!("{BOUNDED_LOCAL_TASK_DIRECTIVE}{phase_directive}"))
             }
             TurnExecutionProfile::DirectUtility(profile) => Some(direct_utility_directive(profile)),
+            TurnExecutionProfile::DeterministicLocal(_) => None,
         }
     }
 
@@ -348,10 +590,7 @@ pub(super) fn partition_by_bounded_local_phase_semantics(
         };
 
         if let Some(reason) = block_reason {
-            blocked.push(BlockedToolCall {
-                call: call.clone(),
-                reason: reason.to_string(),
-            });
+            blocked.push(BlockedToolCall::policy(call.clone(), reason));
         } else {
             allowed.push(call.clone());
         }
@@ -636,6 +875,126 @@ fn first_effective_command_word(words: &[String]) -> Option<&str> {
     })
 }
 
+fn latest_successful_result(tool_results: &[ToolResult]) -> Option<&ToolResult> {
+    tool_results
+        .iter()
+        .rev()
+        .find(|result| result.success && !result.output.trim().is_empty())
+}
+
+fn latest_non_empty_result(tool_results: &[ToolResult]) -> Option<&ToolResult> {
+    tool_results
+        .iter()
+        .rev()
+        .find(|result| !result.output.trim().is_empty())
+}
+
+fn detect_deterministic_local_plan(
+    user_message: &str,
+    available_tools: &[ToolDefinition],
+) -> Option<DeterministicLocalPlan> {
+    let url = extract_single_http_url(user_message);
+    if let Some(url) = url.filter(|_| tool_available("open_browser_url", available_tools)) {
+        let tokens = tokenize_without_http_urls(user_message);
+        if is_single_open_intent_request(&tokens, DETERMINISTIC_LOCAL_URL_ALLOWED_TOKENS) {
+            return Some(DeterministicLocalPlan::OpenBrowserUrl { url });
+        }
+    }
+
+    if !tool_available("open_browser_application", available_tools) {
+        return None;
+    }
+    let tokens = tokenize_local_intent(user_message);
+    let browser = detect_browser_application(&tokens)?;
+    let tokens_without_browser = strip_browser_alias_tokens(&tokens, browser)?;
+    is_single_open_intent_request(
+        &tokens_without_browser,
+        DETERMINISTIC_LOCAL_BROWSER_ALLOWED_TOKENS,
+    )
+    .then_some(DeterministicLocalPlan::OpenBrowserApplication { browser })
+}
+
+fn tool_available(tool_name: &str, available_tools: &[ToolDefinition]) -> bool {
+    available_tools.iter().any(|tool| tool.name == tool_name)
+}
+
+fn is_single_open_intent_request(tokens: &[String], allowed_tokens: &[&str]) -> bool {
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "open" | "launch" | "start"))
+        && tokens
+            .iter()
+            .all(|token| allowed_tokens.contains(&token.as_str()))
+}
+
+fn extract_single_http_url(user_message: &str) -> Option<String> {
+    let mut urls = user_message
+        .split_whitespace()
+        .filter_map(normalize_http_url_token);
+    let first = urls.next()?;
+    urls.next().is_none().then_some(first)
+}
+
+fn tokenize_without_http_urls(user_message: &str) -> Vec<String> {
+    let filtered = user_message
+        .split_whitespace()
+        .filter(|token| normalize_http_url_token(token).is_none())
+        .collect::<Vec<_>>()
+        .join(" ");
+    tokenize_local_intent(&filtered)
+}
+
+fn tokenize_local_intent(user_message: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in user_message.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn detect_browser_application(tokens: &[String]) -> Option<BrowserApplication> {
+    let matches = BrowserApplication::ALL
+        .into_iter()
+        .filter_map(|browser| browser.find_match(tokens))
+        .collect::<Vec<_>>();
+
+    let first = *matches.first()?;
+    matches
+        .iter()
+        .all(|matched| matched.browser == first.browser)
+        .then_some(first.browser)
+}
+
+fn strip_browser_alias_tokens(
+    tokens: &[String],
+    browser: BrowserApplication,
+) -> Option<Vec<String>> {
+    let matched = browser.find_match(tokens)?;
+    let mut stripped = Vec::with_capacity(tokens.len().saturating_sub(matched.len));
+    stripped.extend(tokens[..matched.start].iter().cloned());
+    stripped.extend(tokens[matched.start + matched.len..].iter().cloned());
+    Some(stripped)
+}
+
+fn find_token_sequence(tokens: &[String], needle: &[&str]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > tokens.len() {
+        return None;
+    }
+
+    tokens
+        .windows(needle.len())
+        .position(|window| window.iter().map(String::as_str).eq(needle.iter().copied()))
+}
+
 #[cfg(test)]
 pub(super) fn detect_turn_execution_profile(
     user_message: &str,
@@ -653,6 +1012,12 @@ pub(super) fn detect_turn_execution_profile_for_ownership(
     available_tools: &[ToolDefinition],
     direct_inspection_ownership: DirectInspectionOwnership,
 ) -> TurnExecutionProfile {
+    // Deterministic local lanes intentionally win over broader direct-utility
+    // detection so an obvious one-shot local action stays on the narrowest
+    // possible control-plane path.
+    if let Some(plan) = detect_deterministic_local_plan(user_message, available_tools) {
+        return TurnExecutionProfile::DeterministicLocal(plan);
+    }
     if let Some(profile) = detect_direct_utility_profile(user_message, available_tools) {
         return TurnExecutionProfile::DirectUtility(profile);
     }
@@ -783,9 +1148,149 @@ pub(super) fn bounded_local_terminal_partial_response(
     let tool_summary = summarize_tool_progress(tool_results)
         .map(|summary| format!("Observed during the run: {summary}"))
         .unwrap_or_else(|| {
-            "Observed during the run: no meaningful tool progress was recorded.".to_string()
+            "Observed during the run: no blocking tool error details were recorded.".to_string()
         });
     let next_step =
         "Next best step: point me to the exact file/function to edit, or give a more specific target for the code change so I can retry with grounded context.";
     format!("{headline}\n\n{access_note}\n\n{tool_summary}\n\n{next_step}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::act::FailureClass;
+    use fx_llm::ToolDefinition;
+
+    fn deterministic_local_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "open_browser_url".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "open_browser_application".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        ]
+    }
+
+    #[test]
+    fn bounded_local_policy_blocks_are_classified_permanent() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "list_directory".to_string(),
+            arguments: serde_json::json!({"path":"."}),
+        }];
+
+        let (_allowed, blocked) = partition_by_bounded_local_phase_semantics(
+            &calls,
+            BoundedLocalPhase::Verification,
+            None,
+        );
+
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].failure_class, Some(FailureClass::Permanent));
+    }
+
+    #[test]
+    fn deterministic_local_detector_rejects_multiple_browsers() {
+        let tools = deterministic_local_tools();
+        assert_eq!(
+            detect_deterministic_local_plan("open google chrome and safari", &tools),
+            None
+        );
+    }
+
+    #[test]
+    fn deterministic_local_detector_matches_multi_token_browser_alias() {
+        let tools = deterministic_local_tools();
+        assert_eq!(
+            detect_deterministic_local_plan("open brave browser", &tools),
+            Some(DeterministicLocalPlan::OpenBrowserApplication {
+                browser: BrowserApplication::Brave,
+            })
+        );
+    }
+
+    #[test]
+    fn deterministic_local_detector_accepts_url_with_filler_tokens() {
+        let tools = deterministic_local_tools();
+        assert_eq!(
+            detect_deterministic_local_plan("Open https://example.com in a browser", &tools),
+            Some(DeterministicLocalPlan::OpenBrowserUrl {
+                url: "https://example.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn deterministic_local_detector_rejects_open_without_target() {
+        let tools = deterministic_local_tools();
+        assert_eq!(detect_deterministic_local_plan("open", &tools), None);
+    }
+
+    #[test]
+    fn deterministic_local_detector_rejects_multiple_urls() {
+        let tools = deterministic_local_tools();
+        assert_eq!(
+            detect_deterministic_local_plan("open https://foo.com https://bar.com", &tools),
+            None
+        );
+    }
+
+    #[test]
+    fn deterministic_local_detector_is_case_insensitive() {
+        let tools = deterministic_local_tools();
+        assert_eq!(
+            detect_deterministic_local_plan("OPEN CHROME", &tools),
+            Some(DeterministicLocalPlan::OpenBrowserApplication {
+                browser: BrowserApplication::Chrome,
+            })
+        );
+        assert_eq!(
+            detect_deterministic_local_plan("Open HTTPS://Example.Com", &tools),
+            Some(DeterministicLocalPlan::OpenBrowserUrl {
+                url: "HTTPS://Example.Com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn browser_application_from_candidate_uses_alias_sequences_not_substrings() {
+        assert_eq!(
+            BrowserApplication::from_candidate("Google Chrome"),
+            Some(BrowserApplication::Chrome)
+        );
+        assert_eq!(
+            BrowserApplication::from_candidate("/Applications/Google Chrome.app"),
+            Some(BrowserApplication::Chrome)
+        );
+        assert_eq!(BrowserApplication::from_candidate("knowledge"), None);
+        assert_eq!(BrowserApplication::from_candidate("bravery"), None);
+        assert_eq!(BrowserApplication::from_candidate("chromeedge"), None);
+    }
+
+    #[test]
+    fn normalize_http_url_token_only_trims_one_trailing_sentence_punctuation_mark() {
+        assert_eq!(
+            normalize_http_url_token("https://example.com."),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            normalize_http_url_token("https://example.com..."),
+            Some("https://example.com..".to_string())
+        );
+    }
+
+    #[test]
+    fn deterministic_local_tool_call_ids_are_unique() {
+        let plan = DeterministicLocalPlan::OpenBrowserUrl {
+            url: "https://example.com".to_string(),
+        };
+        let first = plan.completion_response().tool_calls[0].id.clone();
+        let second = plan.completion_response().tool_calls[0].id.clone();
+        assert_ne!(first, second);
+    }
 }

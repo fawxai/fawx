@@ -53,11 +53,7 @@ impl MarkdownRenderer {
     fn drain_complete_lines(&mut self) -> String {
         let mut output = String::new();
 
-        loop {
-            let Some(nl_pos) = self.pending.find('\n') else {
-                break;
-            };
-
+        while let Some(nl_pos) = self.pending.find('\n') {
             // Split off the complete line (including the newline).
             let line: String = self.pending.drain(..=nl_pos).collect();
             let trimmed = line.trim_end_matches('\n');

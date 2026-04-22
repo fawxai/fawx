@@ -416,6 +416,7 @@ fn capability_denied_result(call: &ToolCall, decision: &AuthorityDecision) -> To
         tool_name: call.name.clone(),
         success: false,
         output: message.to_string(),
+        failure_class: None,
     }
 }
 
@@ -425,6 +426,7 @@ fn denied_result(call: &ToolCall, reason: &str) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: format!("PERMISSION DENIED: {reason}"),
+        failure_class: None,
     }
 }
 
@@ -491,6 +493,7 @@ mod tests {
                     tool_name: c.name.clone(),
                     success: true,
                     output: "executed".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -975,12 +978,14 @@ mod tests {
                 tool_name: "a".into(),
                 success: true,
                 output: "ok".into(),
+                failure_class: None,
             },
             ToolResult {
                 tool_call_id: "c".into(),
                 tool_name: "c".into(),
                 success: true,
                 output: "ok".into(),
+                failure_class: None,
             },
         ];
         let denied = vec![(1, denied_result(&test_call("b"), "denied"))];

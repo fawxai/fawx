@@ -1,5 +1,6 @@
 //! Budget accounting and guardrails for the Decide step budget gate.
 
+use crate::signals::SignalSeverity;
 use crate::types::*;
 use fx_decompose::{ComplexityHint, SubGoal};
 use serde::{Deserialize, Serialize};
@@ -29,11 +30,14 @@ const DEFAULT_MAX_SYNTHESIS_TOKENS: usize = 50_000;
 const DEFAULT_LLM_CALL_TOKENS: u64 = 1_000;
 pub(crate) const DEFAULT_LLM_CALL_COST_CENTS: u64 = 2;
 pub(crate) const DEFAULT_TOOL_INVOCATION_COST_CENTS: u64 = 1;
+pub(crate) const DISABLE_TOOL_STRIPPING_AFTER_NUDGE: u16 = u16::MAX;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u16 = 3;
 const DEFAULT_MAX_CYCLE_FAILURES: u16 = 15;
 const DEFAULT_MAX_NO_PROGRESS: u16 = 3;
 #[cfg(test)]
 const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
+const DEFAULT_SIGNAL_FEEDBACK_LOOKBACK_CYCLES: u8 = 3;
+const DEFAULT_SIGNAL_FEEDBACK_MAX_SUMMARY_TOKENS: usize = 80;
 const COMPLEXITY_KEYWORDS: [&str; 6] = [
     "analyze",
     "refactor",
@@ -42,6 +46,51 @@ const COMPLEXITY_KEYWORDS: [&str; 6] = [
     "migrate",
     "rewrite",
 ];
+
+/// Runtime interpretation of the serialized `*_strip_after_nudge` fields.
+///
+/// Config keeps the legacy `u16` wire shape for backwards compatibility, but
+/// loop code should not reason directly about `u16::MAX`. Mapping the sentinel
+/// into an explicit variant keeps the "nudge but never strip" contract visible
+/// at every decision point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolStrippingAfterNudge {
+    Disabled,
+    AfterAdditionalRounds(u16),
+}
+
+impl ToolStrippingAfterNudge {
+    pub(crate) fn from_config_value(value: u16) -> Self {
+        if value == DISABLE_TOOL_STRIPPING_AFTER_NUDGE {
+            Self::Disabled
+        } else {
+            Self::AfterAdditionalRounds(value)
+        }
+    }
+
+    pub(crate) fn threshold_after_nudge(self, nudge_after_rounds: u16) -> Option<u32> {
+        match self {
+            Self::Disabled => None,
+            Self::AfterAdditionalRounds(additional_rounds) => {
+                Some(u32::from(nudge_after_rounds).saturating_add(u32::from(additional_rounds)))
+            }
+        }
+    }
+
+    pub(crate) fn should_strip(self, nudge_after_rounds: u16, current_rounds: u32) -> bool {
+        self.threshold_after_nudge(nudge_after_rounds)
+            .is_some_and(|threshold| current_rounds >= threshold)
+    }
+
+    pub(crate) fn pressure_limit(self, nudge_after_rounds: u16) -> Option<u16> {
+        match self {
+            Self::Disabled => Some(DISABLE_TOOL_STRIPPING_AFTER_NUDGE),
+            Self::AfterAdditionalRounds(additional_rounds) => {
+                Some(nudge_after_rounds.saturating_add(additional_rounds))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum DepthMode {
@@ -154,6 +203,9 @@ pub struct BudgetConfig {
     /// Total attempts in the old model = `max_tool_retries + 1`.
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: u8,
+    /// Bounded prompt injection of recent actionable signal patterns.
+    #[serde(default)]
+    pub signal_feedback: SignalFeedbackConfig,
     /// Controls graceful termination behavior when budget limits fire and
     /// how tool-turn runs are handled.
     #[serde(default)]
@@ -176,8 +228,10 @@ pub struct TerminationConfig {
 
     /// Additional consecutive tool turns *after the nudge fires* before tools
     /// are stripped entirely, forcing a text response. 0 means strip
-    /// immediately when the nudge threshold is reached. Set to `u16::MAX`
-    /// to disable stripping while keeping the nudge.
+    /// immediately when the nudge threshold is reached. The serialized value
+    /// [`DISABLE_TOOL_STRIPPING_AFTER_NUDGE`] maps to
+    /// [`ToolStrippingAfterNudge::Disabled`] so runtime policy never has to
+    /// infer intent from a magic numeric sentinel.
     #[serde(default = "default_strip_tools_after_nudge")]
     pub strip_tools_after_nudge: u16,
 
@@ -199,8 +253,22 @@ pub struct TerminationConfig {
 
     /// Additional observation-only rounds after the targeted nudge before the
     /// loop strips observation-only tools, leaving only side-effecting tools.
+    /// The serialized value [`DISABLE_TOOL_STRIPPING_AFTER_NUDGE`] maps to
+    /// [`ToolStrippingAfterNudge::Disabled`] so runtime policy never has to
+    /// infer intent from a magic numeric sentinel.
     #[serde(default = "default_observation_only_round_strip_after_nudge")]
     pub observation_only_round_strip_after_nudge: u16,
+
+    /// Consecutive outer-loop failures in the same tool failure family before
+    /// the loop injects guidance and then trips the repeated-failure breaker.
+    #[serde(default = "default_max_repeated_failure_streak")]
+    pub max_repeated_failure_streak: u16,
+
+    /// Maximum times the kernel will block an incomplete terminal response for
+    /// unmet root-turn deliverables before allowing the current response
+    /// through with a warning signal.
+    #[serde(default = "default_root_turn_completion_retry_limit")]
+    pub root_turn_completion_retry_limit: u8,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -210,19 +278,48 @@ fn default_nudge_after_tool_turns() -> u16 {
     6
 }
 fn default_strip_tools_after_nudge() -> u16 {
-    3
+    DISABLE_TOOL_STRIPPING_AFTER_NUDGE
 }
 fn default_tool_round_nudge_after() -> u16 {
     4
 }
 fn default_tool_round_strip_after_nudge() -> u16 {
-    2
+    DISABLE_TOOL_STRIPPING_AFTER_NUDGE
 }
 fn default_observation_only_round_nudge_after() -> u16 {
     2
 }
 fn default_observation_only_round_strip_after_nudge() -> u16 {
-    1
+    DISABLE_TOOL_STRIPPING_AFTER_NUDGE
+}
+fn default_max_repeated_failure_streak() -> u16 {
+    DEFAULT_MAX_CONSECUTIVE_FAILURES
+}
+fn default_root_turn_completion_retry_limit() -> u8 {
+    2
+}
+fn default_signal_feedback_enabled() -> bool {
+    true
+}
+fn default_signal_feedback_lookback_cycles() -> u8 {
+    DEFAULT_SIGNAL_FEEDBACK_LOOKBACK_CYCLES
+}
+fn default_signal_feedback_min_severity() -> SignalSeverity {
+    SignalSeverity::Medium
+}
+fn default_signal_feedback_max_summary_tokens() -> usize {
+    DEFAULT_SIGNAL_FEEDBACK_MAX_SUMMARY_TOKENS
+}
+
+impl Default for SignalFeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_signal_feedback_enabled(),
+            lookback_cycles: default_signal_feedback_lookback_cycles(),
+            min_severity: default_signal_feedback_min_severity(),
+            max_summary_tokens: default_signal_feedback_max_summary_tokens(),
+        }
+    }
 }
 
 impl Default for TerminationConfig {
@@ -236,8 +333,38 @@ impl Default for TerminationConfig {
             observation_only_round_nudge_after: default_observation_only_round_nudge_after(),
             observation_only_round_strip_after_nudge:
                 default_observation_only_round_strip_after_nudge(),
+            max_repeated_failure_streak: default_max_repeated_failure_streak(),
+            root_turn_completion_retry_limit: default_root_turn_completion_retry_limit(),
         }
     }
+}
+
+/// Controls whether recent signal patterns may steer the next reasoning pass.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignalFeedbackConfig {
+    /// Enable signal-to-context feedback.
+    #[serde(default = "default_signal_feedback_enabled")]
+    pub enabled: bool,
+
+    /// Number of completed recent cycles to retain for summarization.
+    #[serde(default = "default_signal_feedback_lookback_cycles")]
+    pub lookback_cycles: u8,
+
+    /// Minimum signal severity that can contribute to the summary.
+    #[serde(default = "default_signal_feedback_min_severity")]
+    pub min_severity: SignalSeverity,
+
+    /// Approximate token budget for the injected advisory.
+    #[serde(default = "default_signal_feedback_max_summary_tokens")]
+    pub max_summary_tokens: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TerminationConfigSerde {
+    #[serde(flatten)]
+    config: TerminationConfig,
+    #[serde(default)]
+    signal_feedback: Option<SignalFeedbackConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,11 +396,17 @@ struct BudgetConfigSerde {
     #[serde(default)]
     max_tool_retries: Option<u8>,
     #[serde(default)]
-    termination: TerminationConfig,
+    signal_feedback: Option<SignalFeedbackConfig>,
+    #[serde(default)]
+    termination: TerminationConfigSerde,
 }
 
 impl From<BudgetConfigSerde> for BudgetConfig {
     fn from(value: BudgetConfigSerde) -> Self {
+        let signal_feedback = value
+            .signal_feedback
+            .or(value.termination.signal_feedback)
+            .unwrap_or_default();
         let max_consecutive_failures = value
             .max_tool_retries
             .map(max_consecutive_failures_from_legacy_retries)
@@ -299,7 +432,8 @@ impl From<BudgetConfigSerde> for BudgetConfig {
             max_cycle_failures: value.max_cycle_failures,
             max_no_progress: value.max_no_progress,
             max_tool_retries,
-            termination: value.termination,
+            signal_feedback,
+            termination: value.termination.config,
         }
     }
 }
@@ -383,6 +517,7 @@ impl BudgetConfig {
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         }
     }
@@ -425,6 +560,7 @@ impl BudgetConfig {
             max_tool_retries: legacy_retries_from_consecutive_failures(
                 retry_policy.max_consecutive_failures,
             ),
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         }
     }
@@ -458,6 +594,7 @@ impl Default for BudgetConfig {
             max_cycle_failures: retry_policy.max_cycle_failures,
             max_no_progress: retry_policy.max_no_progress,
             max_tool_retries,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         }
     }
@@ -611,6 +748,7 @@ impl BudgetAllocator {
                 max_cycle_failures: template.max_cycle_failures,
                 max_no_progress: template.max_no_progress,
                 max_tool_retries: template.max_tool_retries,
+                signal_feedback: template.signal_feedback.clone(),
                 termination: template.termination.clone(),
             });
         }
@@ -851,6 +989,41 @@ impl BudgetTracker {
                 .max_wall_time_ms
                 .saturating_sub(current_time_ms.saturating_sub(self.start_time_ms)),
         }
+    }
+
+    /// Conservative remaining-budget percentage for signal feedback guidance.
+    ///
+    /// Uses the tightest bounded resource among LLM calls, cost, and aggregate
+    /// tool-result bytes so prompt guidance errs on the side of directness.
+    pub fn signal_feedback_remaining_percent(&self) -> u8 {
+        [
+            Self::remaining_percent(
+                u64::from(self.llm_calls),
+                u64::from(self.config.max_llm_calls),
+            ),
+            Self::remaining_percent(self.cost_cents, self.config.max_cost_cents),
+            Self::remaining_percent(
+                self.accumulated_result_bytes as u64,
+                self.config.max_aggregate_result_bytes as u64,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(100)
+    }
+
+    fn remaining_percent(consumed: u64, max: u64) -> Option<u8> {
+        if max == 0 {
+            return None;
+        }
+        let remaining = max.saturating_sub(consumed);
+        let percent = remaining
+            .saturating_mul(100)
+            .checked_div(max)
+            .unwrap_or(0)
+            .min(100);
+        Some(percent as u8)
     }
 
     /// Return true when elapsed wall time is greater than the configured maximum.
@@ -1249,6 +1422,7 @@ fn budget_from_remaining(template: &BudgetConfig, remaining: &BudgetRemaining) -
         max_cycle_failures: template.max_cycle_failures,
         max_no_progress: template.max_no_progress,
         max_tool_retries: template.max_tool_retries,
+        signal_feedback: template.signal_feedback.clone(),
         termination: template.termination.clone(),
     }
 }
@@ -1271,6 +1445,7 @@ fn zeroed_config_like(template: &BudgetConfig) -> BudgetConfig {
         max_cycle_failures: template.max_cycle_failures,
         max_no_progress: template.max_no_progress,
         max_tool_retries: template.max_tool_retries,
+        signal_feedback: template.signal_feedback.clone(),
         termination: template.termination.clone(),
     }
 }
@@ -1344,6 +1519,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         }
     }
@@ -1376,6 +1552,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         }
     }
@@ -1812,6 +1989,7 @@ mod tests {
         assert_eq!(unlimited.max_cost_cents, u64::MAX);
         assert_eq!(unlimited.max_wall_time_ms, u64::MAX);
         assert_eq!(unlimited.max_recursion_depth, u32::MAX);
+        assert_eq!(default.signal_feedback, SignalFeedbackConfig::default());
     }
 
     #[test]
@@ -1856,6 +2034,108 @@ mod tests {
         };
 
         assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn budget_config_deserializes_root_turn_completion_retry_limit() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "termination": {
+                "root_turn_completion_retry_limit": 5
+            }
+        }"#;
+        let config: BudgetConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.termination.root_turn_completion_retry_limit, 5);
+    }
+
+    #[test]
+    fn budget_config_deserializes_signal_feedback_config() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "signal_feedback": {
+                "enabled": false,
+                "lookback_cycles": 5,
+                "min_severity": "high",
+                "max_summary_tokens": 24
+            }
+        }"#;
+
+        let config: BudgetConfig = serde_json::from_str(json).expect("deserialize");
+
+        assert!(!config.signal_feedback.enabled);
+        assert_eq!(config.signal_feedback.lookback_cycles, 5);
+        assert_eq!(config.signal_feedback.min_severity, SignalSeverity::High);
+        assert_eq!(config.signal_feedback.max_summary_tokens, 24);
+    }
+
+    #[test]
+    fn budget_config_deserializes_legacy_nested_signal_feedback_config() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "termination": {
+                "signal_feedback": {
+                    "enabled": false,
+                    "lookback_cycles": 4,
+                    "min_severity": "high",
+                    "max_summary_tokens": 21
+                }
+            }
+        }"#;
+
+        let config: BudgetConfig = serde_json::from_str(json).expect("deserialize");
+
+        assert!(!config.signal_feedback.enabled);
+        assert_eq!(config.signal_feedback.lookback_cycles, 4);
+        assert_eq!(config.signal_feedback.min_severity, SignalSeverity::High);
+        assert_eq!(config.signal_feedback.max_summary_tokens, 21);
+    }
+
+    #[test]
+    fn signal_feedback_remaining_percent_uses_tightest_bounded_resource() {
+        let mut tracker = BudgetTracker::new(test_config(), 0, 0);
+        tracker.record(&ActionCost {
+            llm_calls: 2,
+            tool_invocations: 0,
+            tokens: 0,
+            cost_cents: 60,
+        });
+        tracker.record_result_bytes(50_000);
+
+        assert_eq!(tracker.signal_feedback_remaining_percent(), 40);
+    }
+
+    #[test]
+    fn budget_config_deserializes_repeated_failure_streak_limit() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "termination": {
+                "max_repeated_failure_streak": 4
+            }
+        }"#;
+        let config: BudgetConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.termination.max_repeated_failure_streak, 4);
     }
 
     #[test]
@@ -1975,6 +2255,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config.clone(), 0, 0);
@@ -2023,6 +2304,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2081,6 +2363,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2117,6 +2400,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2172,6 +2456,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2236,6 +2521,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2268,6 +2554,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);
@@ -2304,6 +2591,7 @@ mod tests {
             max_cycle_failures: DEFAULT_MAX_CYCLE_FAILURES,
             max_no_progress: DEFAULT_MAX_NO_PROGRESS,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
+            signal_feedback: SignalFeedbackConfig::default(),
             termination: TerminationConfig::default(),
         };
         let tracker = BudgetTracker::new(config, 0, 0);

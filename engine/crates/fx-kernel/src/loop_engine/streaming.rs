@@ -1,4 +1,11 @@
-use super::{loop_error, merge_usage, CycleStream, LlmProvider, LoopEngine};
+use super::tool_call_normalization::{
+    normalize_completion_response as apply_tool_call_normalization,
+    CompletionResponseNormalization, ToolCallNormalizationOutcome,
+    ToolCallNormalizationSignalMetadata,
+};
+use super::{loop_error, merge_usage, signal_metadata_value, CycleStream, LlmProvider, LoopEngine};
+use crate::signals::{ControlPlaneDecisionKind, LoopStep, SignalKind};
+use crate::streaming::TranscriptTurnPhase;
 use crate::streaming::{ErrorCategory, StreamCallback, StreamEvent};
 use crate::types::LoopError;
 use futures_util::StreamExt;
@@ -6,26 +13,36 @@ use fx_core::message::{InternalMessage, StreamPhase};
 use fx_llm::{
     CompletionRequest, CompletionResponse, CompletionStream, ContentBlock, ProviderError,
     StreamCallback as ProviderStreamCallback, StreamChunk, StreamEvent as ProviderStreamEvent,
-    ToolCall, ToolUseDelta, Usage,
+    ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use std::collections::HashMap;
+use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::sleep;
 
 pub(super) type StreamCallbackRef<'a> = Option<&'a StreamCallback>;
 type SharedBufferedDeltas = Arc<Mutex<Vec<String>>>;
+type SharedPreviewTextSent = Arc<AtomicBool>;
+const DEFAULT_PROVIDER_STREAM_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const PROVIDER_STREAM_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROVIDER_STREAM_CHUNK_IDLE_TIMEOUT_ENV: &str = "FAWX_PROVIDER_STREAM_CHUNK_IDLE_TIMEOUT_SECS";
 
 #[derive(Clone, Copy)]
 struct StreamingCompletionContext<'a> {
     buffered_deltas: Option<&'a SharedBufferedDeltas>,
+    preview_text_sent: Option<&'a SharedPreviewTextSent>,
     callback: &'a StreamCallback,
     event_bus: Option<&'a fx_core::EventBus>,
-    request: StreamingRequestContext<'a>,
+    request: StreamingRequestContext,
 }
 
 impl StreamingCompletionContext<'_> {
     fn stream_context(&self) -> StreamConsumeContext<'_> {
         StreamConsumeContext {
             event_bus: self.event_bus,
+            step: self.request.step,
             phase: self.request.phase,
             text_visibility: self.request.text_visibility,
         }
@@ -35,6 +52,7 @@ impl StreamingCompletionContext<'_> {
 #[derive(Clone, Copy)]
 struct StreamConsumeContext<'a> {
     event_bus: Option<&'a fx_core::EventBus>,
+    step: LoopStep,
     phase: StreamPhase,
     text_visibility: TextStreamVisibility,
 }
@@ -44,6 +62,7 @@ struct StreamConsumptionState {
     response: StreamResponseState,
     buffered_deltas: Vec<String>,
     should_buffer_deltas: bool,
+    preview_text_sent: bool,
 }
 
 impl StreamConsumptionState {
@@ -52,29 +71,52 @@ impl StreamConsumptionState {
             response: StreamResponseState::default(),
             buffered_deltas: Vec::new(),
             should_buffer_deltas: buffer_phase_text_until_response(phase),
+            preview_text_sent: false,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct StreamingRequestContext<'a> {
-    stage: &'a str,
+pub(super) struct StreamingRequestContext {
+    step: LoopStep,
     phase: StreamPhase,
     text_visibility: TextStreamVisibility,
+    commit_preview_as_final: bool,
 }
 
-impl<'a> StreamingRequestContext<'a> {
+impl StreamingRequestContext {
     pub(super) fn new(
-        stage: &'a str,
+        step: LoopStep,
         phase: StreamPhase,
         text_visibility: TextStreamVisibility,
     ) -> Self {
         Self {
-            stage,
+            step,
             phase,
             text_visibility,
+            commit_preview_as_final: true,
         }
     }
+
+    pub(super) fn with_preview_final_commit(mut self, enabled: bool) -> Self {
+        self.commit_preview_as_final = enabled;
+        self
+    }
+
+    pub(super) fn stage(self) -> &'static str {
+        self.step.to_label()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CostSignalMetadata<'a> {
+    stage: &'static str,
+    model: &'a str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    total_tokens: u64,
 }
 
 pub(super) fn buffer_phase_text_until_response(phase: StreamPhase) -> bool {
@@ -85,10 +127,21 @@ fn shared_buffered_deltas(phase: StreamPhase) -> Option<SharedBufferedDeltas> {
     buffer_phase_text_until_response(phase).then(|| Arc::new(Mutex::new(Vec::new())))
 }
 
+fn shared_preview_text_sent(visibility: TextStreamVisibility) -> Option<SharedPreviewTextSent> {
+    matches!(visibility, TextStreamVisibility::Preview).then(|| Arc::new(AtomicBool::new(false)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TextStreamVisibility {
+    Preview,
     Public,
     Hidden,
+}
+
+enum StreamRead {
+    Chunk(Result<StreamChunk, ProviderError>),
+    End,
+    Cancelled(CompletionResponse),
 }
 
 fn emit_phase_text_delta(
@@ -101,6 +154,11 @@ fn emit_phase_text_delta(
     if matches!(visibility, TextStreamVisibility::Hidden) {
         return;
     }
+    let event = match visibility {
+        TextStreamVisibility::Preview => StreamEvent::TextPreviewDelta { text: text.clone() },
+        TextStreamVisibility::Public => StreamEvent::FinalAnswerDelta { text: text.clone() },
+        TextStreamVisibility::Hidden => return,
+    };
     if let Some(bus) = event_bus {
         let _ = bus.publish(InternalMessage::StreamDelta {
             delta: text.clone(),
@@ -108,8 +166,37 @@ fn emit_phase_text_delta(
         });
     }
     if let Some(callback) = callback {
-        callback(StreamEvent::TextDelta { text });
+        callback(event);
     }
+}
+
+fn reset_preview_text(callback: StreamCallbackRef<'_>) {
+    if let Some(callback) = callback {
+        callback(StreamEvent::TextReset);
+    }
+}
+
+fn reset_preview_text_if_sent(
+    callback: StreamCallbackRef<'_>,
+    preview_text_sent: Option<&SharedPreviewTextSent>,
+) {
+    if preview_text_sent.is_some_and(|sent| sent.load(Ordering::Acquire)) {
+        reset_preview_text(callback);
+    }
+}
+
+fn preview_text_must_be_cleared(normalized: &CompletionResponseNormalization) -> bool {
+    normalized.outcome.suppresses_buffered_text() || !normalized.response.tool_calls.is_empty()
+}
+
+fn preview_text_can_commit_as_final_answer(
+    normalized: &CompletionResponseNormalization,
+    request: StreamingRequestContext,
+) -> bool {
+    normalized.response.tool_calls.is_empty()
+        && request.commit_preview_as_final
+        && matches!(request.text_visibility, TextStreamVisibility::Preview)
+        && matches!(request.step, LoopStep::Reason)
 }
 
 fn flush_phase_text_deltas(
@@ -140,20 +227,75 @@ fn flush_shared_phase_text_deltas(
     flush_phase_text_deltas(&mut deltas, callback, event_bus, visibility, phase);
 }
 
+fn emit_final_answer_text(
+    response: &CompletionResponse,
+    callback: StreamCallbackRef<'_>,
+    event_bus: Option<&fx_core::EventBus>,
+    phase: StreamPhase,
+) {
+    let Some(text) = completion_response_text(response) else {
+        return;
+    };
+    emit_phase_text_delta(
+        callback,
+        event_bus,
+        TextStreamVisibility::Public,
+        phase,
+        text,
+    );
+}
+
+fn completion_response_text(response: &CompletionResponse) -> Option<String> {
+    let text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Document { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 fn provider_stream_bridge(
     callback: StreamCallback,
     event_bus: Option<fx_core::EventBus>,
     visibility: TextStreamVisibility,
     phase: StreamPhase,
     buffered_deltas: Option<SharedBufferedDeltas>,
+    preview_text_sent: Option<SharedPreviewTextSent>,
 ) -> ProviderStreamCallback {
     Arc::new(move |event| {
         if let ProviderStreamEvent::TextDelta { text } = event {
             if let Some(buffered_deltas) = &buffered_deltas {
+                // Preview text is emitted immediately for responsiveness, but
+                // kept buffered until normalization proves it is safe to
+                // commit. Tool-intent text clears the preview instead.
                 buffered_deltas
                     .lock()
                     .expect("buffered stream deltas lock poisoned")
-                    .push(text);
+                    .push(text.clone());
+                if matches!(visibility, TextStreamVisibility::Preview) {
+                    if !text.is_empty() {
+                        if let Some(sent) = &preview_text_sent {
+                            sent.store(true, Ordering::Release);
+                        }
+                    }
+                    emit_phase_text_delta(
+                        Some(&callback),
+                        event_bus.as_ref(),
+                        visibility,
+                        phase,
+                        text,
+                    );
+                }
             } else {
                 emit_phase_text_delta(Some(&callback), event_bus.as_ref(), visibility, phase, text);
             }
@@ -243,27 +385,71 @@ impl LoopEngine {
     pub(super) async fn request_completion(
         &mut self,
         llm: &dyn LlmProvider,
-        request: CompletionRequest,
-        context: StreamingRequestContext<'_>,
+        mut request: CompletionRequest,
+        context: StreamingRequestContext,
         stream: CycleStream<'_>,
     ) -> Result<CompletionResponse, LoopError> {
-        match stream.callback {
+        self.apply_turn_steer_to_request(&mut request, context);
+        match context.text_visibility {
+            TextStreamVisibility::Preview => {
+                self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::CollectingWork)
+            }
+            TextStreamVisibility::Hidden if context.step == LoopStep::Synthesize => {
+                self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Summarizing)
+            }
+            TextStreamVisibility::Public => {
+                self.emit_transcript_phase_boundary(stream, TranscriptTurnPhase::Finalizing)
+            }
+            TextStreamVisibility::Hidden => {}
+        }
+        let allowed_tools = request.tools.clone();
+        let response = match stream.callback {
             Some(callback) => {
-                self.request_streaming_completion(llm, request, context, callback)
+                self.request_streaming_completion(llm, request, &allowed_tools, context, callback)
                     .await
             }
             None => {
-                self.request_buffered_completion(llm, request, context)
+                self.request_buffered_completion(llm, request, &allowed_tools, context)
                     .await
             }
-        }
+        }?;
+        self.emit_cost_signal_if_available(llm.model_name(), &response, context);
+        Ok(response)
+    }
+
+    fn emit_cost_signal_if_available(
+        &mut self,
+        model_name: &str,
+        response: &CompletionResponse,
+        context: StreamingRequestContext,
+    ) {
+        let Some(usage) = response.usage else {
+            return;
+        };
+
+        self.emit_signal(
+            context.step,
+            SignalKind::Cost,
+            "LLM usage observed",
+            signal_metadata_value(CostSignalMetadata {
+                stage: context.stage(),
+                model: model_name,
+                input_tokens: u64::from(usage.input_tokens),
+                output_tokens: u64::from(usage.output_tokens),
+                cached_input_tokens: u64::from(usage.cached_input_tokens),
+                cache_creation_input_tokens: u64::from(usage.cache_creation_input_tokens),
+                total_tokens: u64::from(usage.input_tokens)
+                    .saturating_add(u64::from(usage.output_tokens)),
+            }),
+        );
     }
 
     async fn request_buffered_completion(
         &mut self,
         llm: &dyn LlmProvider,
         request: CompletionRequest,
-        context: StreamingRequestContext<'_>,
+        allowed_tools: &[ToolDefinition],
+        context: StreamingRequestContext,
     ) -> Result<CompletionResponse, LoopError> {
         let mut stream = llm.complete_stream(request).await.map_err(|error| {
             self.emit_background_error(
@@ -271,64 +457,116 @@ impl LoopEngine {
                 format!("LLM request failed: {error}"),
                 false,
             );
-            loop_error(context.stage, &format!("completion failed: {error}"), true)
+            loop_error(
+                context.stage(),
+                &format!("completion failed: {error}"),
+                true,
+            )
         })?;
         self.publish_stream_started(context.phase);
-        self.consume_stream_with_events(&mut stream, context.phase, context.text_visibility)
-            .await
+        self.consume_stream_with_events(
+            &mut stream,
+            allowed_tools,
+            context.step,
+            context.phase,
+            context.text_visibility,
+        )
+        .await
     }
 
     pub(super) async fn request_streaming_completion(
-        &self,
+        &mut self,
         llm: &dyn LlmProvider,
         request: CompletionRequest,
-        context: StreamingRequestContext<'_>,
+        allowed_tools: &[ToolDefinition],
+        context: StreamingRequestContext,
         callback: &StreamCallback,
     ) -> Result<CompletionResponse, LoopError> {
         self.publish_stream_started(context.phase);
         let event_bus = self.public_event_bus_clone();
         let buffered_deltas = shared_buffered_deltas(context.phase);
+        let preview_text_sent = shared_preview_text_sent(context.text_visibility);
         let bridge = provider_stream_bridge(
             callback.clone(),
             event_bus.clone(),
             context.text_visibility,
             context.phase,
             buffered_deltas.clone(),
+            preview_text_sent.clone(),
         );
         let completion_context = StreamingCompletionContext {
             buffered_deltas: buffered_deltas.as_ref(),
+            preview_text_sent: preview_text_sent.as_ref(),
             callback,
             event_bus: event_bus.as_ref(),
             request: context,
         };
-        self.finish_streaming_completion(llm.stream(request, bridge).await, completion_context)
+        self.finish_streaming_completion(
+            llm.stream(request, bridge).await,
+            allowed_tools,
+            completion_context,
+        )
     }
 
     fn finish_streaming_completion(
-        &self,
+        &mut self,
         response: Result<CompletionResponse, ProviderError>,
+        allowed_tools: &[ToolDefinition],
         context: StreamingCompletionContext<'_>,
     ) -> Result<CompletionResponse, LoopError> {
         match response {
-            Ok(response) => Ok(self.handle_streaming_success(response, context)),
+            Ok(response) => Ok(self.handle_streaming_success(response, allowed_tools, context)),
             Err(error) => Err(self.handle_streaming_failure(error, context)),
         }
     }
 
     fn handle_streaming_success(
-        &self,
+        &mut self,
         response: CompletionResponse,
+        allowed_tools: &[ToolDefinition],
         context: StreamingCompletionContext<'_>,
     ) -> CompletionResponse {
-        if response.tool_calls.is_empty() {
+        let normalized =
+            self.normalize_completion_response(response, allowed_tools, context.request.step);
+        if preview_text_must_be_cleared(&normalized) {
+            if matches!(
+                context.request.text_visibility,
+                TextStreamVisibility::Preview
+            ) {
+                reset_preview_text_if_sent(Some(context.callback), context.preview_text_sent);
+            }
+            self.clear_shared_stream_deltas(context.buffered_deltas);
+        } else if normalized.response.tool_calls.is_empty()
+            && !matches!(
+                context.request.text_visibility,
+                TextStreamVisibility::Preview
+            )
+        {
             self.flush_shared_stream_deltas(
                 context.buffered_deltas,
                 Some(context.callback),
                 context.stream_context(),
             );
+            if matches!(
+                context.request.text_visibility,
+                TextStreamVisibility::Public
+            ) && completion_response_text(&normalized.response).is_some()
+            {
+                self.mark_final_answer_streamed();
+            }
+        } else if preview_text_can_commit_as_final_answer(&normalized, context.request) {
+            emit_final_answer_text(
+                &normalized.response,
+                Some(context.callback),
+                context.event_bus,
+                context.request.phase,
+            );
+            if completion_response_text(&normalized.response).is_some() {
+                self.mark_final_answer_streamed();
+            }
         }
         self.publish_stream_finished(context.request.phase);
-        response
+        normalized.response
     }
 
     fn handle_streaming_failure(
@@ -336,6 +574,12 @@ impl LoopEngine {
         error: ProviderError,
         context: StreamingCompletionContext<'_>,
     ) -> LoopError {
+        if matches!(
+            context.request.text_visibility,
+            TextStreamVisibility::Preview
+        ) {
+            reset_preview_text_if_sent(Some(context.callback), context.preview_text_sent);
+        }
         self.flush_shared_stream_deltas(
             context.buffered_deltas,
             Some(context.callback),
@@ -348,7 +592,7 @@ impl LoopEngine {
         });
         self.publish_stream_finished(context.request.phase);
         loop_error(
-            context.request.stage,
+            context.request.stage(),
             &format!("completion failed: {error}"),
             true,
         )
@@ -361,6 +605,13 @@ impl LoopEngine {
         context: StreamConsumeContext<'_>,
     ) {
         if let Some(buffered_deltas) = buffered_deltas {
+            if matches!(context.text_visibility, TextStreamVisibility::Preview) {
+                buffered_deltas
+                    .lock()
+                    .expect("buffered stream deltas lock poisoned")
+                    .clear();
+                return;
+            }
             flush_shared_phase_text_deltas(
                 buffered_deltas,
                 callback,
@@ -369,6 +620,16 @@ impl LoopEngine {
                 context.phase,
             );
         }
+    }
+
+    fn clear_shared_stream_deltas(&self, buffered_deltas: Option<&SharedBufferedDeltas>) {
+        let Some(buffered_deltas) = buffered_deltas else {
+            return;
+        };
+        buffered_deltas
+            .lock()
+            .expect("buffered stream deltas lock poisoned")
+            .clear();
     }
 
     pub(super) fn publish_stream_started(&self, phase: StreamPhase) {
@@ -404,26 +665,72 @@ impl LoopEngine {
     pub(super) async fn consume_stream_with_events(
         &mut self,
         stream: &mut CompletionStream,
+        allowed_tools: &[ToolDefinition],
+        step: LoopStep,
         phase: StreamPhase,
         text_visibility: TextStreamVisibility,
     ) -> Result<CompletionResponse, LoopError> {
         let event_bus = self.public_event_bus_clone();
         let context = StreamConsumeContext {
             event_bus: event_bus.as_ref(),
+            step,
             phase,
             text_visibility,
         };
         let mut state = StreamConsumptionState::new(phase);
 
-        while let Some(chunk_result) = stream.next().await {
-            if let Some(response) =
-                self.consume_stream_iteration(&mut state, chunk_result, context)?
-            {
-                return Ok(response);
+        loop {
+            match self.next_stream_read(stream, &mut state, context).await? {
+                StreamRead::Chunk(chunk_result) => {
+                    if let Some(response) =
+                        self.consume_stream_iteration(&mut state, chunk_result, context)?
+                    {
+                        return Ok(response);
+                    }
+                }
+                StreamRead::End => break,
+                StreamRead::Cancelled(response) => return Ok(response),
             }
         }
 
-        Ok(self.finish_stream_response(state, context))
+        Ok(self.finish_stream_response(state, allowed_tools, context))
+    }
+
+    async fn next_stream_read(
+        &mut self,
+        stream: &mut CompletionStream,
+        state: &mut StreamConsumptionState,
+        context: StreamConsumeContext<'_>,
+    ) -> Result<StreamRead, LoopError> {
+        let next_chunk = stream.next();
+        tokio::pin!(next_chunk);
+        let idle_timeout = provider_stream_chunk_idle_timeout();
+        let idle_deadline = sleep(idle_timeout);
+        tokio::pin!(idle_deadline);
+
+        loop {
+            tokio::select! {
+                chunk = &mut next_chunk => {
+                    return Ok(match chunk {
+                        Some(chunk) => StreamRead::Chunk(chunk),
+                        None => StreamRead::End,
+                    });
+                }
+                _ = sleep(PROVIDER_STREAM_CANCEL_POLL_INTERVAL) => {
+                    if let Some(response) = self.cancelled_stream_response(state, context) {
+                        return Ok(StreamRead::Cancelled(response));
+                    }
+                }
+                _ = &mut idle_deadline => {
+                    let error = ProviderError::Streaming(format!(
+                        "provider stream was idle for {} seconds",
+                        idle_timeout.as_secs()
+                    ));
+                    self.fail_stream_consumption(error, state, context)?;
+                    unreachable!("fail_stream_consumption always returns Err");
+                }
+            }
+        }
     }
 
     fn consume_stream_iteration(
@@ -507,7 +814,22 @@ impl LoopEngine {
         };
 
         if state.should_buffer_deltas {
-            state.buffered_deltas.push(delta);
+            state.buffered_deltas.push(delta.clone());
+            if matches!(context.text_visibility, TextStreamVisibility::Preview) {
+                // Preview duplicates the buffered delta intentionally: the UI
+                // can show speculative final text now, while the buffer is
+                // either discarded for tool calls or withheld from commit.
+                if !delta.is_empty() {
+                    state.preview_text_sent = true;
+                }
+                emit_phase_text_delta(
+                    None,
+                    context.event_bus,
+                    context.text_visibility,
+                    context.phase,
+                    delta,
+                );
+            }
             return;
         }
 
@@ -521,12 +843,27 @@ impl LoopEngine {
     }
 
     fn finish_stream_response(
-        &self,
+        &mut self,
         mut state: StreamConsumptionState,
+        allowed_tools: &[ToolDefinition],
         context: StreamConsumeContext<'_>,
     ) -> CompletionResponse {
-        let response = state.response.into_response();
-        if state.should_buffer_deltas && response.tool_calls.is_empty() {
+        let normalized = self.normalize_completion_response(
+            state.response.into_response(),
+            allowed_tools,
+            context.step,
+        );
+        if preview_text_must_be_cleared(&normalized) {
+            if matches!(context.text_visibility, TextStreamVisibility::Preview)
+                && state.preview_text_sent
+            {
+                reset_preview_text(None);
+            }
+            state.buffered_deltas.clear();
+        } else if state.should_buffer_deltas
+            && normalized.response.tool_calls.is_empty()
+            && !matches!(context.text_visibility, TextStreamVisibility::Preview)
+        {
             flush_phase_text_deltas(
                 &mut state.buffered_deltas,
                 None,
@@ -534,9 +871,12 @@ impl LoopEngine {
                 context.text_visibility,
                 context.phase,
             );
+            if completion_response_text(&normalized.response).is_some() {
+                self.mark_final_answer_streamed();
+            }
         }
         self.publish_stream_finished(context.phase);
-        response
+        normalized.response
     }
 
     fn flush_local_stream_deltas(
@@ -545,6 +885,10 @@ impl LoopEngine {
         context: StreamConsumeContext<'_>,
     ) {
         if state.should_buffer_deltas {
+            if matches!(context.text_visibility, TextStreamVisibility::Preview) {
+                state.buffered_deltas.clear();
+                return;
+            }
             flush_phase_text_deltas(
                 &mut state.buffered_deltas,
                 None,
@@ -554,6 +898,62 @@ impl LoopEngine {
             );
         }
     }
+
+    fn normalize_completion_response(
+        &mut self,
+        response: CompletionResponse,
+        allowed_tools: &[ToolDefinition],
+        step: LoopStep,
+    ) -> CompletionResponseNormalization {
+        // Emitting normalization trace signals makes the streaming intake path
+        // mutable even though most stream consumption remains read-only.
+        let normalized = apply_tool_call_normalization(response, allowed_tools);
+
+        match &normalized.outcome {
+            ToolCallNormalizationOutcome::None => {}
+            ToolCallNormalizationOutcome::Normalized { source, tool_names } => {
+                self.emit_signal(
+                    step,
+                    SignalKind::Trace,
+                    "normalized malformed tool-call markup",
+                    signal_metadata_value(ToolCallNormalizationSignalMetadata {
+                        decision_kind: ControlPlaneDecisionKind::ToolCallNormalization,
+                        decision: "normalized",
+                        outcome: "normalized",
+                        source: *source,
+                        tool_names: tool_names.clone(),
+                        reason: None,
+                    }),
+                );
+            }
+            ToolCallNormalizationOutcome::Rejected { source, reason } => {
+                self.emit_signal(
+                    step,
+                    SignalKind::Trace,
+                    "rejected malformed tool-call markup",
+                    signal_metadata_value(ToolCallNormalizationSignalMetadata {
+                        decision_kind: ControlPlaneDecisionKind::ToolCallNormalization,
+                        decision: "rejected",
+                        outcome: "rejected",
+                        source: *source,
+                        tool_names: Vec::new(),
+                        reason: Some(*reason),
+                    }),
+                );
+            }
+        }
+
+        normalized
+    }
+}
+
+fn provider_stream_chunk_idle_timeout() -> Duration {
+    env::var(PROVIDER_STREAM_CHUNK_IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PROVIDER_STREAM_CHUNK_IDLE_TIMEOUT)
 }
 
 fn phase_stage(phase: StreamPhase) -> &'static str {
@@ -739,7 +1139,7 @@ fn finalized_stream_tool_call_from_state(
     }
 
     let identity = finalized_stream_tool_identity(&state)?;
-    let arguments = parse_stream_tool_arguments(&state.arguments, &identity.id, &identity.name)?;
+    let arguments = parse_stream_tool_arguments(&state.arguments, &identity.id, &identity.name);
     Some(FinalizedStreamToolCall {
         provider_id: identity.provider_id,
         call: ToolCall {
@@ -775,28 +1175,23 @@ fn normalized_provider_id(provider_id: Option<&str>, id: &str) -> Option<String>
     })
 }
 
-fn parse_stream_tool_arguments(
-    raw_arguments: &str,
-    id: &str,
-    name: &str,
-) -> Option<serde_json::Value> {
+fn parse_stream_tool_arguments(raw_arguments: &str, id: &str, name: &str) -> serde_json::Value {
     let raw_arguments = if raw_arguments.trim().is_empty() {
         "{}"
     } else {
         raw_arguments
     };
 
-    match serde_json::from_str::<serde_json::Value>(raw_arguments) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            tracing::warn!(
-                tool_id = %id,
-                tool_name = %name,
-                raw_arguments = %raw_arguments,
-                error = %error,
-                "dropping tool call with malformed JSON arguments"
-            );
-            None
-        }
+    let arguments = fx_llm::parse_tool_arguments_object(raw_arguments);
+    if let Some(details) = fx_llm::malformed_tool_arguments(&arguments) {
+        tracing::warn!(
+            tool_id = %id,
+            tool_name = %name,
+            raw_arguments = %details.raw,
+            error = %details.error,
+            "preserving malformed tool call for actionable rejection"
+        );
     }
+
+    arguments
 }

@@ -327,7 +327,7 @@ impl ToolContext {
             Some(sm) => (sm.enabled, sm.allow_paths.clone(), sm.deny_paths.clone()),
             None => (false, Vec::new(), Vec::new()),
         };
-        let working_dir = self.working_dir.to_string_lossy().into_owned();
+        let working_dir = self.working_dir().to_string_lossy().into_owned();
         let budget = build_budget_summary(&self.kernel_budget);
         let can_request_capabilities = runtime.skills.iter().any(|skill| {
             skill

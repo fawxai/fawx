@@ -14,6 +14,7 @@ use crate::authority::{
     AuthorityCoordinator, AuthorityDecision, AuthorityVerdict, ToolAuthoritySurface,
 };
 use crate::cancellation::CancellationToken;
+use crate::{ExecutionRoot, SharedExecutionRoot};
 use async_trait::async_trait;
 use fx_core::self_modify::{classify_write_domain, SelfModifyConfig, WriteDomain};
 use fx_llm::{ToolCall, ToolDefinition};
@@ -37,17 +38,30 @@ pub struct ActiveProposal {
 pub struct ProposalGateState {
     active: Option<ActiveProposal>,
     config: SelfModifyConfig,
-    working_dir: PathBuf,
+    execution_root: SharedExecutionRoot,
     proposals_dir: PathBuf,
 }
 
 impl ProposalGateState {
     #[must_use]
     pub fn new(config: SelfModifyConfig, working_dir: PathBuf, proposals_dir: PathBuf) -> Self {
+        Self::with_execution_root(
+            config,
+            Arc::new(ExecutionRoot::new(working_dir)),
+            proposals_dir,
+        )
+    }
+
+    #[must_use]
+    pub fn with_execution_root(
+        config: SelfModifyConfig,
+        execution_root: SharedExecutionRoot,
+        proposals_dir: PathBuf,
+    ) -> Self {
         Self {
             active: None,
             config,
-            working_dir,
+            execution_root,
             proposals_dir,
         }
     }
@@ -70,8 +84,8 @@ impl ProposalGateState {
         &self.config
     }
 
-    pub(crate) fn working_dir(&self) -> &Path {
-        &self.working_dir
+    pub(crate) fn working_dir(&self) -> PathBuf {
+        self.execution_root.current()
     }
 
     pub(crate) fn proposals_dir(&self) -> &Path {
@@ -123,6 +137,7 @@ fn blocked_result(call: &ToolCall, path: &str, reason: &str) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This operation is not permitted.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -132,6 +147,7 @@ fn blind_read_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This file is not available.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -145,6 +161,7 @@ fn proposal_result(call: &ToolCall, path: &str, proposal_path: &Path) -> ToolRes
              Proposal saved to: {}",
             proposal_path.display()
         ),
+        failure_class: None,
     }
 }
 
@@ -404,6 +421,7 @@ fn prompt_required_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: false,
         output: "This operation requires approval before it can run.".to_string(),
+        failure_class: None,
     }
 }
 
@@ -574,6 +592,7 @@ mod tests {
                     tool_name: c.name.clone(),
                     success: true,
                     output: format!("executed:{}", c.name),
+                    failure_class: None,
                 })
                 .collect())
         }
