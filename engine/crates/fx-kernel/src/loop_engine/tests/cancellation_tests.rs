@@ -301,6 +301,20 @@ fn read_file_definition() -> ToolDefinition {
     }
 }
 
+fn run_command_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "run_command".to_string(),
+        description: "Execute a shell command".to_string(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties": {
+                "command": { "type": "string" }
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
 fn read_file_call(id: &str) -> ToolCall {
     ToolCall {
         id: id.to_string(),
@@ -315,6 +329,7 @@ fn success_result(call: &ToolCall) -> ToolResult {
         tool_name: call.name.clone(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }
 }
 
@@ -345,6 +360,21 @@ fn stream_recorder() -> (StreamCallback, Arc<Mutex<Vec<StreamEvent>>>) {
         captured.lock().expect("lock").push(event);
     });
     (callback, events)
+}
+
+fn allowed_tool_names(names: &[&str]) -> Vec<ToolDefinition> {
+    names
+        .iter()
+        .map(|name| match *name {
+            "read_file" => read_file_definition(),
+            "run_command" => run_command_definition(),
+            name => ToolDefinition {
+                name: name.to_string(),
+                description: "Test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect()
 }
 
 #[test]
@@ -398,6 +428,16 @@ fn loop_engine_builder_debug_skips_error_callback() {
 
 fn assert_done_event(events: &[StreamEvent], expected: &str) {
     assert!(matches!(events.last(), Some(StreamEvent::Done { response }) if response == expected));
+}
+
+fn transcript_phase_boundaries(events: &[StreamEvent]) -> Vec<TranscriptTurnPhase> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TranscriptPhaseBoundary { phase } => Some(*phase),
+            _ => None,
+        })
+        .collect()
 }
 
 fn tool_delta(id: &str, name: Option<&str>, arguments_delta: &str, done: bool) -> ToolUseDelta {
@@ -516,7 +556,10 @@ async fn run_cycle_streaming_emits_text_and_done_events() {
         phase: Phase::Reason,
     }));
     assert!(events.contains(&StreamEvent::PhaseChange { phase: Phase::Act }));
-    assert!(events.contains(&StreamEvent::TextDelta {
+    assert!(events.contains(&StreamEvent::TextPreviewDelta {
+        text: "done".to_string(),
+    }));
+    assert!(events.contains(&StreamEvent::FinalAnswerDelta {
         text: "done".to_string(),
     }));
     assert!(events.iter().any(|event| matches!(
@@ -524,12 +567,20 @@ async fn run_cycle_streaming_emits_text_and_done_events() {
         StreamEvent::Progress { kind: ProgressKind::Researching, message }
             if message == "Researching the request and planning the next step..."
     )));
+    assert_eq!(
+        transcript_phase_boundaries(&events),
+        vec![
+            TranscriptTurnPhase::CollectingWork,
+            TranscriptTurnPhase::Finalizing,
+            TranscriptTurnPhase::Completed
+        ]
+    );
     assert!(matches!(events.last(), Some(StreamEvent::Done { response }) if response == "done"));
 }
 
 #[tokio::test]
 async fn request_streaming_completion_suppresses_reason_text_when_tool_calls_present() {
-    let engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
     let llm = ScriptedLlm::new(vec![CompletionResponse {
         content: vec![ContentBlock::Text {
             text: "I know which file to edit.".to_string(),
@@ -550,10 +601,13 @@ async fn request_streaming_completion_suppresses_reason_text_when_tool_calls_pre
                 temperature: None,
                 max_tokens: None,
                 system_prompt: None,
+                prompt_cache: Default::default(),
+                cache_affinity: None,
                 thinking: None,
             },
+            &allowed_tool_names(&["read_file"]),
             StreamingRequestContext::new(
-                "reason",
+                LoopStep::Reason,
                 StreamPhase::Reason,
                 TextStreamVisibility::Public,
             ),
@@ -570,6 +624,158 @@ async fn request_streaming_completion_suppresses_reason_text_when_tool_calls_pre
             StreamEvent::TextDelta { text } if text == "I know which file to edit."
         )),
         "streaming reason text should stay buffered when the final response contains tool calls"
+    );
+}
+
+#[tokio::test]
+async fn request_streaming_completion_resets_preview_text_when_tool_calls_present() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let llm = ScriptedLlm::new(vec![CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: "I know which file to edit.".to_string(),
+        }],
+        tool_calls: vec![read_file_call("call-1")],
+        usage: None,
+        stop_reason: Some("tool_use".to_string()),
+    }]);
+    let (callback, events) = stream_recorder();
+
+    let response = engine
+        .request_streaming_completion(
+            &llm,
+            CompletionRequest {
+                model: "scripted".to_string(),
+                messages: vec![Message::user("fix it")],
+                tools: vec![read_file_definition()],
+                temperature: None,
+                max_tokens: None,
+                system_prompt: None,
+                prompt_cache: Default::default(),
+                cache_affinity: None,
+                thinking: None,
+            },
+            &allowed_tool_names(&["read_file"]),
+            StreamingRequestContext::new(
+                LoopStep::Reason,
+                StreamPhase::Reason,
+                TextStreamVisibility::Preview,
+            ),
+            &callback,
+        )
+        .await
+        .expect("streaming completion");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    let events = events.lock().expect("lock").clone();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::TextPreviewDelta { text } if text == "I know which file to edit."
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::TextReset)));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { text } if text == "I know which file to edit."
+        )),
+        "preview text must not be committed when the response resolves to tool calls"
+    );
+}
+
+#[tokio::test]
+async fn request_streaming_completion_does_not_reset_empty_preview_on_error() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let llm = FailingStreamingLlm;
+    let (callback, events) = stream_recorder();
+
+    let error = engine
+        .request_streaming_completion(
+            &llm,
+            CompletionRequest {
+                model: "scripted".to_string(),
+                messages: vec![Message::user("fix it")],
+                tools: vec![read_file_definition()],
+                temperature: None,
+                max_tokens: None,
+                system_prompt: None,
+                prompt_cache: Default::default(),
+                cache_affinity: None,
+                thinking: None,
+            },
+            &allowed_tool_names(&["read_file"]),
+            StreamingRequestContext::new(
+                LoopStep::Reason,
+                StreamPhase::Reason,
+                TextStreamVisibility::Preview,
+            ),
+            &callback,
+        )
+        .await
+        .expect_err("streaming setup should fail");
+
+    assert!(error.reason.contains("completion failed"));
+    let events = events.lock().expect("lock").clone();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextReset)),
+        "preview reset is unnecessary when no preview text was emitted"
+    );
+}
+
+#[tokio::test]
+async fn request_streaming_completion_normalizes_raw_markup_and_suppresses_markup_delta() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let llm = ScriptedLlm::new(vec![CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: "<tool_call>run_command<arg_key>command</arg_key><arg_value>git status --short</arg_value></tool_call>"
+                .to_string(),
+        }],
+        tool_calls: Vec::new(),
+        usage: None,
+        stop_reason: None,
+    }]);
+    let (callback, events) = stream_recorder();
+
+    let response = engine
+        .request_streaming_completion(
+            &llm,
+            CompletionRequest {
+                model: "scripted".to_string(),
+                messages: vec![Message::user("inspect git status")],
+                tools: vec![run_command_definition()],
+                temperature: None,
+                max_tokens: None,
+                system_prompt: None,
+                prompt_cache: Default::default(),
+                cache_affinity: None,
+                thinking: None,
+            },
+            &allowed_tool_names(&["run_command"]),
+            StreamingRequestContext::new(
+                LoopStep::Reason,
+                StreamPhase::Reason,
+                TextStreamVisibility::Public,
+            ),
+            &callback,
+        )
+        .await
+        .expect("streaming completion");
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].name, "run_command");
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        serde_json::json!({"command": "git status --short"})
+    );
+    let events = events.lock().expect("lock").clone();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { text } if text.contains("<tool_call>")
+        )),
+        "raw malformed markup must not leak through streamed text deltas"
     );
 }
 
@@ -613,6 +819,31 @@ async fn run_cycle_streaming_emits_tool_events_and_synthesize_phase() {
         output: "ok".to_string(),
         is_error: false,
     }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolProgress {
+            activity_id: Some(activity_id),
+            id,
+            tool_name,
+            class: crate::streaming::StreamToolProgressClass::Observation,
+            target: Some(target),
+            advances_slot: Some(_),
+            outcome: crate::streaming::StreamToolProgressOutcome::Advanced,
+        } if activity_id == "tool-round-call-1"
+            && id == "call-1"
+            && tool_name == "read_file"
+            && target.contains("read_file")
+    )));
+    assert_eq!(
+        transcript_phase_boundaries(&events),
+        vec![
+            TranscriptTurnPhase::CollectingWork,
+            TranscriptTurnPhase::ExecutingTools,
+            TranscriptTurnPhase::Summarizing,
+            TranscriptTurnPhase::Finalizing,
+            TranscriptTurnPhase::Completed
+        ]
+    );
     assert_done_event(&events, "done");
 }
 
@@ -732,6 +963,44 @@ fn activity_progress_expires_back_to_turn_state() {
 }
 
 #[test]
+fn activity_progress_emits_working_narration_for_next_activity_group() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let (callback, events) = stream_recorder();
+    let stream = CycleStream::enabled(&callback);
+    let calls = vec![ToolCall {
+        id: "call-1".to_string(),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({
+            "command": "git diff --stat",
+            "working_dir": "app/Fawx"
+        }),
+    }];
+
+    engine.maybe_publish_tool_round_progress(1, &calls, stream);
+
+    let events = events.lock().expect("lock").clone();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Progress { kind: ProgressKind::Researching, message }
+                if message == "Running local checks with `git diff --stat` in app/Fawx"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::WorkingNarrationDelta {
+                text,
+                voiceover_suppressed,
+            } if text == "I'm running local checks with `git diff --stat` in app/Fawx."
+                && *voiceover_suppressed
+        )),
+        "{events:?}"
+    );
+}
+
+#[test]
 fn bounded_local_phase_change_refreshes_turn_state_progress_before_activity_expires() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
     engine.turn_execution_profile = TurnExecutionProfile::BoundedLocal;
@@ -756,6 +1025,7 @@ fn bounded_local_phase_change_refreshes_turn_state_progress_before_activity_expi
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     };
 
     engine.advance_bounded_local_phase_after_tool_round(
@@ -783,12 +1053,11 @@ fn bounded_local_phase_change_refreshes_turn_state_progress_before_activity_expi
 }
 
 #[tokio::test]
-async fn run_cycle_streaming_hides_internal_tool_synthesis_until_root_completion() {
+async fn run_cycle_streaming_keeps_tool_continuation_preview_separate_from_final_answer() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
     let llm = ScriptedLlm::new(vec![
         tool_use_response("call-1"),
-        text_response("Internal tool synthesis"),
-        text_response("Final root answer"),
+        text_response("Tool-informed final answer"),
     ]);
     let (callback, events) = stream_recorder();
 
@@ -803,19 +1072,120 @@ async fn run_cycle_streaming_hides_internal_tool_synthesis_until_root_completion
     };
     let events = events.lock().expect("lock").clone();
 
-    assert_eq!(response, "Final root answer");
+    assert_eq!(response, "Tool-informed final answer");
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            StreamEvent::TextDelta { text } if text == "Internal tool synthesis"
+            StreamEvent::TextDelta { text } if text == "Tool-informed final answer"
         )),
-        "intermediate tool synthesis should remain internal"
+        "tool-continuation text should not also be emitted on the legacy public delta channel"
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        StreamEvent::TextDelta { text } if text == "Final root answer"
+        StreamEvent::TextPreviewDelta { text } if text == "Tool-informed final answer"
     )));
-    assert_done_event(&events, "Final root answer");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                StreamEvent::FinalAnswerDelta { text } if text == "Tool-informed final answer"
+            ))
+            .count(),
+        1,
+        "terminal answer should be emitted exactly once over the typed final-answer channel"
+    );
+    assert_done_event(&events, "Tool-informed final answer");
+}
+
+#[tokio::test]
+async fn run_cycle_streaming_forces_synthesis_at_iteration_limit() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 1);
+    let final_response = "**Final Answer**\nFinal synthesized answer";
+    let llm = ScriptedLlm::new(vec![
+        tool_use_response("call-1"),
+        text_response("Need one more tool pass"),
+        text_response(final_response),
+    ]);
+    let (callback, events) = stream_recorder();
+
+    let result = engine
+        .run_cycle_streaming(
+            test_snapshot("read file\n\nDeliverables:\n- Final Answer"),
+            &llm,
+            Some(callback),
+        )
+        .await
+        .expect("run_cycle_streaming");
+
+    let response = match result {
+        LoopResult::Complete { response, .. } => response,
+        other => panic!("expected forced synthesis completion, got {other:?}"),
+    };
+    let events = events.lock().expect("lock").clone();
+
+    assert_eq!(response, final_response);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::FinalAnswerDelta { text } if text == final_response
+    )));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Done { response } if response == "Need one more tool pass"
+        )),
+        "tool-continuation text must not be finalized when iteration cap forces synthesis: {events:?}"
+    );
+    assert_done_event(&events, final_response);
+}
+
+#[tokio::test]
+async fn run_cycle_streaming_rejects_forced_synthesis_missing_root_contract() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 1);
+    let invalid_synthesis = "Let me inspect the renderer again. Let me inspect the renderer again.";
+    let llm = ScriptedLlm::new(vec![
+        tool_use_response("call-1"),
+        text_response("Need one more tool pass"),
+        text_response(invalid_synthesis),
+    ]);
+    let (callback, events) = stream_recorder();
+
+    let result = engine
+        .run_cycle_streaming(
+            test_snapshot(
+                "inspect the renderer\n\nDeliverables:\n- What you inspected\n- Current architecture",
+            ),
+            &llm,
+            Some(callback),
+        )
+        .await
+        .expect("run_cycle_streaming");
+
+    let reason = match result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            ..
+        } => {
+            assert_eq!(
+                partial_response, None,
+                "invalid forced synthesis must not be promoted as user-visible final text"
+            );
+            reason
+        }
+        other => panic!("expected incomplete result, got {other:?}"),
+    };
+    assert!(reason.contains("What you inspected"));
+    assert!(reason.contains("Current architecture"));
+
+    let events = events.lock().expect("lock").clone();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            StreamEvent::FinalAnswerDelta { text } if text.contains("Let me inspect")
+        )),
+        "invalid forced synthesis should remain hidden until contract validation passes: {events:?}"
+    );
 }
 
 #[test]
@@ -896,7 +1266,7 @@ fn finish_streaming_result_skips_notification_for_single_iteration_completion() 
 }
 
 #[test]
-fn finish_streaming_result_uses_polished_incomplete_fallback_when_no_partial_exists() {
+fn finish_streaming_result_reports_incomplete_without_final_answer_when_no_partial_exists() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
     let (callback, events) = stream_recorder();
 
@@ -912,7 +1282,23 @@ fn finish_streaming_result_uses_polished_incomplete_fallback_when_no_partial_exi
     );
 
     let events = events.lock().expect("lock").clone();
-    assert_done_event(&events, INCOMPLETE_FALLBACK_RESPONSE);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error {
+                category: ErrorCategory::System,
+                message,
+                recoverable: false,
+            } if message == "iteration limit reached before a usable final response was produced"
+        )),
+        "incomplete terminal state should be surfaced as an error event: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })),
+        "incomplete terminal state without answer text must not emit final done text: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -1096,7 +1482,57 @@ async fn steer_dedups_and_applies_latest_value_in_perceive_window() {
         .perceive(&test_snapshot("hello again"))
         .await
         .expect("perceive");
-    assert_eq!(next.steer_context, None);
+    assert_eq!(next.steer_context.as_deref(), Some("latest"));
+
+    engine.prepare_cycle();
+    let next_turn = engine
+        .perceive(&test_snapshot("new turn"))
+        .await
+        .expect("perceive");
+    assert_eq!(next_turn.steer_context, None);
+}
+
+#[tokio::test]
+async fn request_snapshot_steering_survives_perceive_window() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let mut snapshot = test_snapshot("hello");
+    snapshot.steer_context = Some("keep it terse".to_string());
+
+    let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+    assert_eq!(processed.steer_context.as_deref(), Some("keep it terse"));
+}
+
+#[tokio::test]
+async fn request_snapshot_steering_is_guidance_not_root_turn_contract() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let mut snapshot = test_snapshot("Inspect the transcript UI.");
+    snapshot.steer_context = Some(
+        "Return:\n- what you inspected\n- current architecture\n- recommendations".to_string(),
+    );
+
+    let processed = engine.perceive(&snapshot).await.expect("perceive");
+    let extraction = extract_root_turn_contract(&processed.user_message);
+
+    assert!(extraction.contract.is_none());
+    assert_eq!(processed.steer_context, snapshot.steer_context);
+}
+
+#[tokio::test]
+async fn queued_steering_overrides_request_snapshot_steering() {
+    let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
+    let (sender, channel) = loop_input_channel();
+    engine.set_input_channel(channel);
+    sender
+        .send(LoopCommand::Steer("live override".to_string()))
+        .expect("steer");
+    assert_eq!(engine.check_user_input(), None);
+
+    let mut snapshot = test_snapshot("hello");
+    snapshot.steer_context = Some("request steering".to_string());
+    let processed = engine.perceive(&snapshot).await.expect("perceive");
+
+    assert_eq!(processed.steer_context.as_deref(), Some("live override"));
 }
 
 #[test]
@@ -1152,6 +1588,8 @@ async fn consume_stream_with_events_publishes_delta_events() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -1208,6 +1646,8 @@ async fn consume_stream_with_events_assembles_tool_calls_from_deltas() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1247,6 +1687,8 @@ async fn consume_stream_with_events_suppresses_synthesize_deltas_when_tool_calls
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["web_search"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1289,6 +1731,8 @@ async fn consume_stream_with_events_suppresses_reason_deltas_when_tool_calls_pre
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -1327,6 +1771,8 @@ async fn consume_stream_with_events_preserves_provider_ids_in_content() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1380,6 +1826,8 @@ async fn consume_stream_with_events_promotes_call_id_over_provider_id() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["weather"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1415,6 +1863,8 @@ async fn consume_stream_with_events_keeps_distinct_calls_when_new_id_reuses_chun
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1452,6 +1902,8 @@ async fn consume_stream_with_events_supports_multi_tool_ids_across_chunks_same_l
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1485,6 +1937,8 @@ async fn consume_stream_with_events_replaces_partial_args_with_done_payload() {
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&["read_file"]),
+            LoopStep::Act,
             StreamPhase::Synthesize,
             TextStreamVisibility::Public,
         )
@@ -1656,7 +2110,7 @@ async fn execute_tool_calls_emits_stream_error_on_executor_failure() {
     let calls = vec![read_file_call("call-1")];
 
     let error = engine
-        .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+        .execute_tool_calls_batch_with_stream(&calls, CycleStream::enabled(&callback))
         .await
         .expect_err("tool execution should fail");
     assert!(error.reason.contains("tool execution failed: tool crashed"));
@@ -1691,7 +2145,7 @@ async fn execute_tool_calls_emits_stream_error_when_retry_budget_blocks_tool() {
     let calls = vec![read_file_call("call-1")];
 
     let _ = engine
-        .execute_tool_calls_with_stream(&calls, CycleStream::enabled(&callback))
+        .execute_tool_calls_batch_with_stream(&calls, CycleStream::enabled(&callback))
         .await
         .expect("blocked tool call should return synthetic result");
     let events = events.lock().expect("lock").clone();
@@ -1702,7 +2156,7 @@ async fn execute_tool_calls_emits_stream_error_when_retry_budget_blocks_tool() {
             message,
             recoverable: true,
         } if message
-            == &blocked_tool_message("read_file", &same_call_failure_reason(1))
+            == &blocked_tool_message("read_file", &same_call_failure_reason(1), None)
     )));
 }
 
@@ -1745,6 +2199,8 @@ async fn consume_stream_with_events_sets_cancelled_stop_reason_on_mid_stream_can
     let response = engine
         .consume_stream_with_events(
             &mut stream,
+            &allowed_tool_names(&[]),
+            LoopStep::Reason,
             StreamPhase::Reason,
             TextStreamVisibility::Public,
         )
@@ -1771,6 +2227,7 @@ fn response_to_chunk_converts_completion_response() {
         usage: Some(Usage {
             input_tokens: 3,
             output_tokens: 2,
+            ..Default::default()
         }),
         stop_reason: Some("stop".to_string()),
     };
@@ -1783,6 +2240,7 @@ fn response_to_chunk_converts_completion_response() {
         Some(Usage {
             input_tokens: 3,
             output_tokens: 2,
+            ..Default::default()
         })
     );
     assert_eq!(chunk.tool_use_deltas.len(), 1);

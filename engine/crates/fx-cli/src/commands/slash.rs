@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::helpers::thinking_config_for_active_model;
+pub(crate) use fx_config::MAX_SYNTHESIS_INSTRUCTION_LENGTH;
 
 pub(crate) const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
     "Use the tool output to directly answer the user's question. Be natural and specific — \
@@ -15,7 +16,6 @@ pub(crate) const DEFAULT_SYNTHESIS_INSTRUCTION: &str =
  raw value), use exactly that format — do not reformat into a 'friendlier' version unless \
  explicitly asked. If they asked a simple question, give a simple answer. If they asked \
  for a listing or search results, present it cleanly formatted.";
-pub(crate) const MAX_SYNTHESIS_INSTRUCTION_LENGTH: usize = 500;
 
 pub trait CommandHost {
     fn supports_embedded_slash_commands(&self) -> bool {
@@ -1435,13 +1435,13 @@ mod tests {
 
     #[test]
     fn render_signals_summary_uses_shared_signal_collector_format() {
-        let signals = vec![Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Friction,
-            message: "tool timed out".to_string(),
-            metadata: serde_json::Value::Null,
-            timestamp_ms: 42,
-        }];
+        let signals = vec![Signal::new(
+            LoopStep::Act,
+            SignalKind::Friction,
+            "tool timed out",
+            serde_json::Value::Null,
+            42,
+        )];
 
         assert_eq!(
             render_signals_summary(&signals),

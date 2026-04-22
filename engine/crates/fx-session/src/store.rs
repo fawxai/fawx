@@ -85,6 +85,7 @@ mod tests {
             SessionConfig {
                 label: Some("test".to_string()),
                 model: "gpt-4".to_string(),
+                thinking: None,
             },
         )
     }

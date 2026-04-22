@@ -1,4 +1,5 @@
-use crate::current_epoch_secs;
+use crate::{current_epoch_secs, DegradedDimension, HealthSnapshot};
+use fx_kernel::SignalSeverity;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,11 +12,52 @@ pub trait RollbackTrigger: Send + Sync {
     fn trigger_rollback(&self, reason: &RollbackReason) -> Result<(), RollbackError>;
 }
 
+/// Explicit rollback policy for canary degradation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackPolicy {
+    pub critical_dimensions: usize,
+    pub high_dimensions: usize,
+    pub medium_dimensions: usize,
+}
+
+impl Default for RollbackPolicy {
+    fn default() -> Self {
+        Self {
+            critical_dimensions: 1,
+            high_dimensions: 2,
+            medium_dimensions: 3,
+        }
+    }
+}
+
+impl RollbackPolicy {
+    pub fn should_trigger(&self, degraded_dimensions: &[DegradedDimension]) -> bool {
+        let critical_count = degraded_dimensions
+            .iter()
+            .filter(|dimension| dimension.severity == SignalSeverity::Critical)
+            .count();
+        if critical_count >= self.critical_dimensions {
+            return true;
+        }
+
+        let high_or_worse_count = degraded_dimensions
+            .iter()
+            .filter(|dimension| dimension.severity >= SignalSeverity::High)
+            .count();
+        if high_or_worse_count >= self.high_dimensions {
+            return true;
+        }
+
+        degraded_dimensions.len() >= self.medium_dimensions
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackReason {
     pub verdict_message: String,
-    pub current_success_rate: f64,
-    pub baseline_success_rate: f64,
+    pub current_health: HealthSnapshot,
+    pub baseline_health: HealthSnapshot,
+    pub degraded_dimensions: Vec<DegradedDimension>,
     pub timestamp_epoch_secs: u64,
 }
 
@@ -253,9 +295,23 @@ mod tests {
     fn reason() -> RollbackReason {
         RollbackReason {
             verdict_message: "degraded".to_string(),
-            current_success_rate: 0.25,
-            baseline_success_rate: 0.90,
+            current_health: snapshot(2, 0.25),
+            baseline_health: snapshot(1, 0.90),
+            degraded_dimensions: Vec::new(),
             timestamp_epoch_secs: current_epoch_secs(),
+        }
+    }
+
+    fn snapshot(captured_at: u64, success_rate: f64) -> HealthSnapshot {
+        HealthSnapshot {
+            captured_at,
+            window_seconds: 60,
+            total_signals: 20,
+            cycle_count: 2,
+            health: crate::HealthVector {
+                success_rate: Some(success_rate),
+                ..crate::HealthVector::default()
+            },
         }
     }
 
@@ -351,5 +407,30 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("status 7"));
         assert!(message.contains("fail"));
+    }
+
+    #[test]
+    fn rollback_policy_requires_multi_dimension_pressure() {
+        let policy = RollbackPolicy::default();
+        let medium = DegradedDimension {
+            dimension: crate::HealthDimension::RetryRate,
+            baseline_value: 0.0,
+            current_value: 0.4,
+            threshold: 0.25,
+            severity: SignalSeverity::Medium,
+        };
+        let high = DegradedDimension {
+            severity: SignalSeverity::High,
+            ..medium.clone()
+        };
+        let critical = DegradedDimension {
+            severity: SignalSeverity::Critical,
+            ..medium.clone()
+        };
+
+        assert!(!policy.should_trigger(std::slice::from_ref(&medium)));
+        assert!(policy.should_trigger(&[high.clone(), high]));
+        assert!(policy.should_trigger(std::slice::from_ref(&critical)));
+        assert!(policy.should_trigger(&[medium.clone(), medium.clone(), medium]));
     }
 }

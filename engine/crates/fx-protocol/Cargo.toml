@@ -1,0 +1,13 @@
+[package]
+name = "fx-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared wire contracts for Fawx host, kernel, and WASM skill boundaries."
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

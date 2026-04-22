@@ -13,6 +13,7 @@ test-support = []
 fx-core = { workspace = true }
 fx-kernel = { workspace = true }
 fx-llm = { path = "../fx-llm" }
+fx-protocol = { workspace = true }
 fx-session = { workspace = true }
 fx-skills = { path = "../fx-skills" }
 fx-transactions = { path = "../fx-transactions" }

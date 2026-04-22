@@ -20,7 +20,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 
 [agent]
 # name = "Fawx"
-# personality = "casual"  # "casual" | "professional" | "technical" | "minimal" | "custom"
+# personality = "casual"  # "casual" | "direct" | "professional" | "technical" | "caveman" | "custom"
 # custom_personality = ""
 # [agent.behavior]
 # custom_instructions = "Be concise and direct."

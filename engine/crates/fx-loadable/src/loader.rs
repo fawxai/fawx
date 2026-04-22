@@ -27,6 +27,9 @@ pub struct SkillManifest {
     /// Tool names this skill provides.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Optional skill-level intent hints for future routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_hints: Vec<String>,
 }
 
 impl SkillLoader {
@@ -97,6 +100,25 @@ impl SkillLoader {
                     );
                     return None;
                 }
+                if let Err(err) =
+                    fx_skills::manifest::validate_nonblank_string_entries("tools", &manifest.tools)
+                {
+                    warn!(
+                        path = %manifest_path.display(),
+                        error = %err,
+                        "skipping skill manifest: invalid tool names"
+                    );
+                    return None;
+                }
+                if let Err(err) = fx_skills::manifest::validate_intent_hints(&manifest.intent_hints)
+                {
+                    warn!(
+                        path = %manifest_path.display(),
+                        error = %err,
+                        "skipping skill manifest: invalid intent hints"
+                    );
+                    return None;
+                }
                 Some(manifest)
             }
             Err(err) => {
@@ -146,6 +168,33 @@ tools = ["say_hello", "say_goodbye"]
         assert_eq!(manifests[0].name, "greeting");
         assert_eq!(manifests[0].version, "0.1.0");
         assert_eq!(manifests[0].tools, vec!["say_hello", "say_goodbye"]);
+        assert!(manifests[0].intent_hints.is_empty());
+    }
+
+    #[test]
+    fn discover_parses_intent_hints() {
+        let tmp = TempDir::new().unwrap();
+
+        let skill_dir = tmp.path().join("review");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+name = "review"
+version = "1.0.0"
+description = "A review skill"
+intent_hints = ["review pr", "github issue management"]
+"#,
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new(tmp.path().to_path_buf());
+        let manifests = loader.discover();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests[0].intent_hints,
+            vec!["review pr", "github issue management"]
+        );
     }
 
     #[test]
@@ -174,6 +223,28 @@ description = "A good skill"
         let manifests = loader.discover();
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].name, "good");
+        assert!(manifests[0].intent_hints.is_empty());
+    }
+
+    #[test]
+    fn discover_skips_manifest_with_blank_tool_names() {
+        let tmp = TempDir::new().unwrap();
+
+        let skill_dir = tmp.path().join("blank-tools");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+name = "blank-tools"
+version = "1.0.0"
+description = "blank tools"
+tools = ["say_hello", "   "]
+"#,
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new(tmp.path().to_path_buf());
+        assert!(loader.discover().is_empty());
     }
 
     #[test]
@@ -194,6 +265,27 @@ description = "A good skill"
 name = ""
 version = "1.0.0"
 description = "missing name"
+"#,
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new(tmp.path().to_path_buf());
+        assert!(loader.discover().is_empty());
+    }
+
+    #[test]
+    fn discover_skips_manifest_with_blank_intent_hints() {
+        let tmp = TempDir::new().unwrap();
+
+        let skill_dir = tmp.path().join("blank-hints");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+name = "blank-hints"
+version = "1.0.0"
+description = "blank hints"
+intent_hints = ["   "]
 "#,
         )
         .unwrap();

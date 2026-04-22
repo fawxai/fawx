@@ -1253,3 +1253,25 @@ fn code_block_preserves_trailing_blank_lines() {
         "trailing blank line inside code fence was lost: {content:?}"
     );
 }
+
+#[test]
+fn pipe_table_renders_as_terminal_table_instead_of_raw_markdown() {
+    let md = "| Concern | Current State | Assessment |\n| --- | --- | --- |\n| Live narration | Present via thinking blocks | Good |\n| Final answer | Generic text block without phase | Needs work |\n";
+    let text = crate::markdown_render::render_markdown_text_with_width(md, Some(72));
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(rendered[0].contains("Concern"));
+    assert!(rendered[0].contains("Current State"));
+    assert!(rendered.iter().any(|line| line.contains("─┼─")));
+    assert!(rendered.iter().any(|line| line.contains("Live narration")));
+    assert!(!rendered.iter().any(|line| line.trim_start().starts_with("| ---")));
+}

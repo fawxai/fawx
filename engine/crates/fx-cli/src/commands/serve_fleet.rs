@@ -254,7 +254,7 @@ async fn run_task(
     provider: &dyn fx_llm::CompletionProvider,
     data_dir: &Path,
 ) -> Result<StubExecutionOutcome, String> {
-    let signal_store = fx_memory::SignalStore::new(data_dir, "fleet-worker")
+    let signal_store = fx_memory::SignalStore::open(data_dir, "fleet-worker")
         .map_err(|e| format!("signal store: {e}"))?;
     let config = fx_improve::ImprovementConfig::default();
     let proposals_dir = data_dir.join("proposals");

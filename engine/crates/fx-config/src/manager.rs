@@ -5,8 +5,9 @@
 //! using `toml_edit`.
 
 use crate::{
-    parse_config_document, parse_log_level, set_typed_field, validate_synthesis_instruction,
-    write_config_file, FawxConfig, VALID_LOG_LEVELS,
+    parse_config_document, parse_log_level, set_typed_field, validate_agent_personality,
+    validate_custom_instructions, validate_synthesis_instruction, write_config_file, FawxConfig,
+    VALID_LOG_LEVELS,
 };
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
@@ -180,6 +181,8 @@ fn validate_field_value(key: &str, value: &str) -> Result<(), String> {
         "memory.max_entries" => validate_positive_usize(key, value),
         "model.default_model" => validate_model_name(value),
         "model.synthesis_instruction" => validate_synthesis_instruction(value),
+        "agent.personality" => validate_agent_personality(value),
+        "agent.behavior.custom_instructions" => validate_custom_instructions(value),
         "logging.max_files" => validate_positive_usize(key, value),
         "logging.file_level" | "logging.stderr_level" => validate_log_level(value),
         _ => Ok(()),
@@ -547,6 +550,19 @@ mod tests {
 
         let err = mgr.set("model.synthesis_instruction", "   ").unwrap_err();
         assert!(err.contains("synthesis_instruction must not be empty"));
+    }
+
+    #[test]
+    fn set_validates_agent_personality_before_write() {
+        let temp = TempDir::new().expect("tempdir");
+        write_config(temp.path(), "[agent]\npersonality = \"casual\"\n");
+        let mut mgr = ConfigManager::new(temp.path()).expect("manager");
+
+        let err = mgr.set("agent.personality", "wizard").unwrap_err();
+        assert!(err.contains("agent.personality must be one of"));
+
+        let content = std::fs::read_to_string(temp.path().join("config.toml")).expect("read");
+        assert!(content.contains("personality = \"casual\""));
     }
 
     #[test]

@@ -15,7 +15,18 @@ pub fn check_push_allowed(targets: &[String], protected_branches: &[String]) -> 
 /// Returns empty vec if the command is not a git push or targets can't be determined.
 pub fn extract_push_targets(command: &str) -> Vec<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    match push_refspecs(&tokens) {
+    extract_push_targets_from_tokens(&tokens)
+}
+
+/// Extract target branches from an exact argv token list.
+/// Returns empty vec if the argv is not a git push or targets can't be determined.
+pub fn extract_push_targets_from_tokens<S: AsRef<str>>(tokens: &[S]) -> Vec<String> {
+    let tokens: Vec<&str> = tokens.iter().map(AsRef::as_ref).collect();
+    extract_push_targets_from_token_refs(&tokens)
+}
+
+fn extract_push_targets_from_token_refs(tokens: &[&str]) -> Vec<String> {
+    match push_refspecs(tokens) {
         Some(PushTargets::Refspecs(refspecs)) => {
             refspecs.into_iter().filter_map(normalize_target).collect()
         }
@@ -203,7 +214,7 @@ fn refspec_target(refspec: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_push_allowed, extract_push_targets};
+    use super::{check_push_allowed, extract_push_targets, extract_push_targets_from_tokens};
 
     #[test]
     fn check_push_allowed_blocks_protected_branches() {
@@ -334,5 +345,19 @@ mod tests {
                 "command: {command}"
             );
         }
+    }
+
+    #[test]
+    fn extract_push_targets_from_tokens_preserves_exact_argv_boundaries() {
+        let tokens = vec![
+            "git".to_string(),
+            "push".to_string(),
+            "origin".to_string(),
+            "feature with spaces".to_string(),
+        ];
+
+        let actual = extract_push_targets_from_tokens(&tokens);
+
+        assert_eq!(actual, vec!["feature with spaces".to_string()]);
     }
 }

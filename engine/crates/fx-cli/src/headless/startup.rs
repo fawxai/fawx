@@ -137,7 +137,8 @@ fn build_seeded_router(
     auth_manager: &fx_auth::auth::AuthManager,
     config: &FawxConfig,
 ) -> anyhow::Result<SharedModelRouter> {
-    let mut router = crate::startup::build_router(auth_manager)?;
+    let data_dir = crate::startup::configured_data_dir(&crate::startup::fawx_data_dir(), config);
+    let mut router = crate::startup::build_router_for_data_dir(auth_manager, &data_dir)?;
     seed_headless_router_active_model(&mut router, config);
     Ok(Arc::new(RwLock::new(router)))
 }
@@ -321,6 +322,7 @@ fn parent_loop_build_options(
 ) -> HeadlessLoopBuildOptions {
     HeadlessLoopBuildOptions {
         memory_enabled: true,
+        signal_session_id: Some(HEADLESS_SIGNAL_SESSION_ID.to_string()),
         subagent_control: Some(
             Arc::clone(subagent_manager) as Arc<dyn fx_subagent::SubagentControl>
         ),
@@ -337,11 +339,16 @@ fn build_headless_app_deps(
     subagent_manager: Arc<SubagentManager>,
     session_bus: Option<SessionBus>,
 ) -> HeadlessAppDeps {
+    let improvement_provider = bundle.improvement_provider.clone();
+    let credential_store = bundle.credential_store.clone();
+    let token_broker =
+        crate::startup::build_token_broker(&build_config.config, credential_store.as_ref());
     HeadlessAppDeps {
         loop_engine: bundle.engine,
         router: build_config.router,
         runtime_info: bundle.runtime_info,
         config: build_config.config,
+        execution_root: bundle.execution_root,
         memory: bundle.memory,
         embedding_index_persistence: bundle.embedding_index_persistence,
         system_prompt_path: build_config.system_prompt,
@@ -356,6 +363,9 @@ fn build_headless_app_deps(
         stream_callback_slot: bundle.stream_callback_slot,
         permission_prompt_state: Some(bundle.permission_prompt_state),
         ripcord_journal: bundle.ripcord_journal,
+        improvement_provider,
+        credential_store,
+        token_broker,
         #[cfg(feature = "http")]
         experiment_registry: build_config.experiment_registry,
     }

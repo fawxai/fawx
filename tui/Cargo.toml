@@ -21,6 +21,7 @@ embedded = ["dep:fx-cli", "dep:fx-consensus"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = "0.22"
 clap = { workspace = true, features = ["derive"] }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 fx-auth = { workspace = true }

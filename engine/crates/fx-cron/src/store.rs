@@ -36,7 +36,7 @@ impl CronStore {
                 jobs.push(job);
             }
         }
-        jobs.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        jobs.sort_by_key(|job| job.created_at);
         Ok(jobs)
     }
 

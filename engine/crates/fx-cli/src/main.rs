@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Fawx CLI - Management interface for the Fawx agent.
 
 mod auth_store;
@@ -441,6 +443,9 @@ enum SessionsCommands {
 
     /// Export full conversation from a session
     Export(commands::sessions::ExportArgs),
+
+    /// Export the latest failed turn diagnostic from a session
+    FailedTurn(commands::sessions::FailedTurnArgs),
 }
 
 #[derive(Subcommand)]
@@ -867,6 +872,7 @@ fn dispatch_sessions(command: SessionsCommands) -> anyhow::Result<i32> {
     match command {
         SessionsCommands::List(args) => commands::sessions::run_list(&args),
         SessionsCommands::Export(args) => commands::sessions::run_export(&args),
+        SessionsCommands::FailedTurn(args) => commands::sessions::run_failed_turn(&args),
     }
 }
 
@@ -1626,6 +1632,25 @@ mod tests {
             Some(Commands::Sessions {
                 command: SessionsCommands::Export(crate::commands::sessions::ExportArgs { id, json: true, limit: Some(5) })
             }) if id == "sess-123"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_sessions_failed_turn_command() {
+        let cli = Cli::parse_from([
+            "fawx",
+            "sessions",
+            "failed-turn",
+            "sess-123",
+            "--json",
+            "--data-dir",
+            "/tmp/fawx-lane",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionsCommands::FailedTurn(crate::commands::sessions::FailedTurnArgs { id, json: true, data_dir: Some(data_dir) })
+            }) if id == "sess-123" && data_dir == std::path::Path::new("/tmp/fawx-lane")
         ));
     }
 

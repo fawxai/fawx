@@ -149,7 +149,7 @@ impl ForgeOrchestrator {
     }
 
     pub fn list_jobs(&self) -> Result<Vec<ForgeJob>, ForgeError> {
-        let mut jobs = Vec::new();
+        let mut jobs: Vec<ForgeJob> = Vec::new();
         for entry in std::fs::read_dir(&self.jobs_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -160,7 +160,7 @@ impl ForgeOrchestrator {
             let job = serde_json::from_str(&content)?;
             jobs.push(job);
         }
-        jobs.sort_by(|left: &ForgeJob, right: &ForgeJob| right.created_at.cmp(&left.created_at));
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         Ok(jobs)
     }
 

@@ -28,6 +28,7 @@ fx-memory.workspace = true
 fx-marketplace = { path = "../fx-marketplace" }
 fx-ripcord = { path = "../fx-ripcord" }
 fx-session.workspace = true
+fx-skills.workspace = true
 fx-storage.workspace = true
 fx-telemetry = { path = "../fx-telemetry" }
 fx-tools.workspace = true

@@ -46,3 +46,6 @@ fx-consensus = { workspace = true, features = ["test-support"] }
 fx-embeddings = { workspace = true, features = ["test-support"] }
 fx-subagent = { path = "../fx-subagent", features = ["test-support"] }
 fx-storage.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

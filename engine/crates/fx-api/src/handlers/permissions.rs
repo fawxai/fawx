@@ -351,12 +351,28 @@ fn all_actions() -> &'static [PermissionAction] {
 }
 
 async fn reload_config_manager(state: &HttpState) -> HandlerResult<()> {
-    let Some(manager) = config_manager_handle(state).await else {
-        return Ok(());
-    };
+    if let Some(manager) = config_manager_handle(state).await {
+        let mut guard = manager.lock().map_err(config_lock_error)?;
+        guard.reload().map_err(internal_error)?;
+    }
 
-    let mut guard = manager.lock().map_err(config_lock_error)?;
-    guard.reload().map_err(internal_error)
+    let (active_model, thinking, models, max_history) = {
+        let mut app = state.app.lock().await;
+        app.reload_config()
+            .map_err(|error| internal_error(format!("failed to reload runtime config: {error}")))?;
+        (
+            app.active_model().to_owned(),
+            app.thinking_level(),
+            app.available_models(),
+            app.max_history(),
+        )
+    };
+    state
+        .shared
+        .update_model(&active_model, &thinking, models, max_history)
+        .await;
+    state.session_engines.clear().await;
+    Ok(())
 }
 
 fn write_permissions_config(
@@ -868,6 +884,8 @@ mod tests {
             })),
             config_manager: None,
             session_registry: None,
+            session_runs: crate::state::SessionRunRegistry::default(),
+            session_engines: crate::state::SessionEnginePool::default(),
             start_time: Instant::now(),
             server_runtime: ServerRuntime::local(8400),
             tailscale_ip: None,

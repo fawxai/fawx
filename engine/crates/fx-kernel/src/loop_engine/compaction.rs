@@ -5,6 +5,7 @@ use crate::conversation_compactor::{
     summary_message, CompactionConfig, CompactionError, CompactionMemoryFlush, CompactionResult,
     ConversationBudget, SlideSummarizationPlan, SlidingWindowCompactor,
 };
+use crate::signals::LoopStep;
 use crate::streaming::{ErrorCategory, StreamCallback, StreamEvent};
 use crate::types::{LoopError, ReasoningContext};
 use fx_llm::{ContentBlock, Message, MessageRole};
@@ -30,6 +31,14 @@ impl CompactionScope {
             Self::Perceive => "perceive",
             Self::ToolContinuation => "tool_continuation",
             Self::DecomposeChild => "decompose_child",
+        }
+    }
+
+    pub fn loop_step(self) -> LoopStep {
+        match self {
+            Self::Perceive => LoopStep::Perceive,
+            Self::ToolContinuation => LoopStep::Act,
+            Self::DecomposeChild => LoopStep::Reason,
         }
     }
 }

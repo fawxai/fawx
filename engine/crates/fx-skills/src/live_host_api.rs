@@ -1,8 +1,11 @@
 //! Live implementation of HostApi with real HTTP support.
 
-use crate::host_api::{HostApi, HostApiBase};
+use crate::host_api::{
+    HostApi, HostApiBase, HttpResponseEnvelope, HttpResponseRecord, HttpTransportError,
+};
 use crate::manifest::Capability;
 use fx_core::error::SkillError;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -29,6 +32,20 @@ const HOST_REQUEST_BINARY_BASE64_PREFIX: &str = "__fawx_request_binary_base64__:
 
 /// HTTP request timeout in seconds.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Response headers safe to preserve across the WASM boundary.
+///
+/// Inclusion criteria: only headers needed for failure classification,
+/// authentication/rate-limit hints, or basic content handling. Sensitive
+/// headers such as cookies or raw authorization data must never be forwarded.
+const SAFE_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "retry-after",
+    "www-authenticate",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "x-ratelimit-resource",
+];
 
 /// Trait for providing credentials to WASM skills via `kv_get`.
 ///
@@ -122,10 +139,26 @@ fn prepare_request_body(body: &str) -> RequestBody<'_> {
 ///
 /// Enforces HTTPS-only, 30s timeout, and 1MB response limit.
 pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) -> Option<String> {
+    let envelope = execute_http_request_envelope(method, url, headers, body)?;
+    match envelope {
+        HttpResponseEnvelope::Response(response) => Some(response.body),
+        HttpResponseEnvelope::TransportError(_) => None,
+    }
+}
+
+/// Execute an HTTP request and preserve status, safe headers, and transport failures.
+pub fn execute_http_request_envelope(
+    method: &str,
+    url: &str,
+    headers: &str,
+    body: &str,
+) -> Option<HttpResponseEnvelope> {
     // HTTPS only
     if !url.starts_with("https://") {
         tracing::error!("http_request denied: URL must use HTTPS, got: {}", url);
-        return None;
+        return Some(HttpResponseEnvelope::transport_error(format!(
+            "URL must use HTTPS: {url}"
+        )));
     }
 
     tracing::info!("http_request: {} {}", method, url);
@@ -138,7 +171,9 @@ pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) 
             Some(h) => h,
             None => {
                 tracing::error!("http_request: invalid headers JSON: {}", headers);
-                return None;
+                return Some(HttpResponseEnvelope::transport_error(
+                    "invalid headers JSON",
+                ));
             }
         }
     };
@@ -158,7 +193,9 @@ pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) 
         "HEAD" => agent.head(url),
         other => {
             tracing::error!("http_request: unsupported method: {}", other);
-            return None;
+            return Some(HttpResponseEnvelope::transport_error(format!(
+                "unsupported method: {other}"
+            )));
         }
     };
 
@@ -175,22 +212,31 @@ pub fn execute_http_request(method: &str, url: &str, headers: &str, body: &str) 
     };
 
     match response {
-        Ok(resp) => read_response_body(resp),
+        Ok(resp) => read_response_envelope(resp),
         Err(ureq::Error::Status(status, resp)) => {
             tracing::warn!("http_request: HTTP {} for {}", status, url);
-            read_response_body(resp)
+            read_response_envelope(resp)
         }
         Err(e) => {
             tracing::error!("http_request failed for {}: {}", url, e);
-            None
+            Some(HttpResponseEnvelope::TransportError(HttpTransportError {
+                message: e.to_string(),
+            }))
         }
     }
 }
 
-/// Read response body with size limit enforcement.
-fn read_response_body(response: ureq::Response) -> Option<String> {
+/// Read response body and safe headers with size limit enforcement.
+fn read_response_envelope(response: ureq::Response) -> Option<HttpResponseEnvelope> {
+    let status_code = response.status();
+    let headers = safe_response_headers(&response);
     let reader = response.into_reader().take(MAX_RESPONSE_BYTES);
-    read_limited_body(reader)
+    let body = read_limited_body(reader)?;
+    Some(HttpResponseEnvelope::Response(HttpResponseRecord {
+        status_code,
+        headers,
+        body,
+    }))
 }
 
 /// Read a response body from a size-limited reader.
@@ -206,6 +252,28 @@ fn read_limited_body(mut reader: impl Read) -> Option<String> {
     }
 
     Some(encode_http_response_body(&body))
+}
+
+fn safe_response_headers(response: &ureq::Response) -> BTreeMap<String, String> {
+    response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            let normalized = name.to_ascii_lowercase();
+            SAFE_RESPONSE_HEADERS
+                .contains(&normalized.as_str())
+                .then(|| {
+                    response
+                        .all(&name)
+                        .into_iter()
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .map(|value| (normalized, value))
+        })
+        .collect()
 }
 
 fn encode_http_response_body(body: &[u8]) -> String {
@@ -355,6 +423,22 @@ impl HostApi for LiveHostApi {
         execute_http_request(method, url, headers, body)
     }
 
+    fn http_request_v2(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &str,
+        body: &str,
+    ) -> Option<String> {
+        if !self.has_capability(&Capability::Network) {
+            tracing::error!("http_request_v2 denied: skill lacks Network capability");
+            return None;
+        }
+
+        execute_http_request_envelope(method, url, headers, body)
+            .and_then(|response| serde_json::to_string(&response).ok())
+    }
+
     fn get_output(&self) -> String {
         self.base.get_output()
     }
@@ -454,6 +538,23 @@ mod tests {
     fn unsupported_method_returns_none() {
         // execute_http_request rejects unknown methods
         let result = execute_http_request("CONNECT", "https://example.com", "{}", "");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn http_request_envelope_preserves_transport_failures() {
+        let response = execute_http_request_envelope("CONNECT", "https://example.com", "{}", "")
+            .expect("structured transport failure");
+        assert_eq!(
+            response,
+            HttpResponseEnvelope::transport_error("unsupported method: CONNECT")
+        );
+    }
+
+    #[test]
+    fn capability_gating_no_network_returns_none_for_structured_http() {
+        let api = LiveHostApi::new(make_config(vec![Capability::Storage]));
+        let result = api.http_request_v2("GET", "https://example.com", "{}", "");
         assert_eq!(result, None);
     }
 

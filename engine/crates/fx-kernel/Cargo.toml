@@ -13,8 +13,10 @@ kernel-blind = []
 fx-core = { workspace = true }
 fx-config.workspace = true
 fx-decompose = { workspace = true }
+fx-protocol = { workspace = true }
 fx-propose = { workspace = true }
 fx-storage = { workspace = true }
+fx-memory = { workspace = true }
 fx-llm = { path = "../fx-llm" }
 fx-session = { workspace = true }
 

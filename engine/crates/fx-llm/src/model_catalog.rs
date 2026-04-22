@@ -6,14 +6,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::AnthropicProvider;
-use crate::openai::OpenAiProvider;
+use crate::openai::{fireworks_standard_kimi_shadowed_by_turbo, OpenAiProvider};
+use crate::openai_common::{model_architecture_supports_text_chat, OpenAiModelArchitecture};
 use crate::provider::{CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities};
 use crate::types::{CompletionRequest, CompletionResponse, LlmError};
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Maximum model age in seconds (~180 days). Models older than this are filtered out.
+/// Maximum model age in seconds (~180 days) for the shared "recommended" tier.
 const MODEL_AGE_CUTOFF_SECS: u64 = 180 * 24 * 60 * 60;
-/// Minimum input price per token (USD) to filter out weak-tier models.
+/// Minimum input price per token (USD) for the shared "recommended" tier.
 /// $3/M tokens = 0.000003 per token. Roughly sonnet-tier floor.
 const MIN_INPUT_PRICE_PER_TOKEN: f64 = 0.000003;
 
@@ -23,6 +24,7 @@ pub struct CatalogModel {
     pub id: String,
     pub display_name: Option<String>,
     pub provider: String,
+    pub recommended: bool,
 }
 
 /// In-memory dynamic model catalog with provider-scoped cache.
@@ -82,6 +84,8 @@ impl CompletionProvider for UnknownCatalogProvider {
         ProviderCapabilities {
             supports_temperature: false,
             requires_streaming: false,
+            prompt_cache: Default::default(),
+            prompt_cache_affinity: Default::default(),
         }
     }
 }
@@ -112,6 +116,18 @@ impl ModelCatalog {
         api_key: &str,
         auth_mode: &str,
     ) -> Result<usize, String> {
+        self.fetch_live_models(provider, api_key, auth_mode)
+            .await
+            .map(|models| models.len())
+    }
+
+    /// Fetch models directly from the provider catalog endpoint without using fallback state.
+    pub async fn fetch_live_models(
+        &self,
+        provider: &str,
+        api_key: &str,
+        auth_mode: &str,
+    ) -> Result<Vec<CatalogModel>, String> {
         let provider = catalog_provider(provider, api_key)?;
         self.verify_provider_credentials(provider.as_ref(), api_key, auth_mode)
             .await
@@ -154,11 +170,9 @@ impl ModelCatalog {
         provider: &dyn CompletionProvider,
         api_key: &str,
         auth_mode: &str,
-    ) -> Result<usize, String> {
-        let models = self
-            .fetch_provider_models(provider, api_key, auth_mode)
-            .await?;
-        Ok(models.len())
+    ) -> Result<Vec<CatalogModel>, String> {
+        self.fetch_provider_models(provider, api_key, auth_mode)
+            .await
     }
 
     async fn get_provider_models(
@@ -225,6 +239,7 @@ impl ModelCatalog {
                 id: id.to_string(),
                 display_name: None,
                 provider: provider_key.clone(),
+                recommended: true,
             })
             .collect()
     }
@@ -301,11 +316,7 @@ impl ModelCatalog {
                 continue;
             };
 
-            if !provider.is_chat_capable(id) {
-                continue;
-            }
-
-            if !quality_filters_allow(provider, &model, now_secs) {
+            if !model_is_chat_capable(provider, &model, id) {
                 continue;
             }
 
@@ -313,10 +324,49 @@ impl ModelCatalog {
                 continue;
             }
 
+            let recommended = quality_filters_allow(provider, &model, now_secs);
+
             models.push(CatalogModel {
                 id: id.clone(),
                 display_name: model.display_name.or(model.name),
                 provider: provider_key.clone(),
+                recommended,
+            });
+        }
+
+        let discovered_model_ids = models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let supplemental_model_ids = provider.supplemental_catalog_model_ids(&discovered_model_ids);
+        let available_model_ids = discovered_model_ids
+            .iter()
+            .chain(supplemental_model_ids.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if provider_key == "fireworks" {
+            for model in &mut models {
+                // Keep this richer CatalogModel recommendation contract aligned
+                // with the string-only `/models` ordering path in `openai.rs`:
+                // standard Kimi remains visible, but the turbo router is the
+                // preferred route whenever both are available.
+                if fireworks_standard_kimi_shadowed_by_turbo(&model.id, &available_model_ids) {
+                    model.recommended = false;
+                }
+            }
+        }
+
+        for supplemental_id in supplemental_model_ids {
+            if !seen.insert(supplemental_id.clone()) {
+                continue;
+            }
+
+            models.push(CatalogModel {
+                id: supplemental_id,
+                display_name: None,
+                provider: provider_key.clone(),
+                recommended: true,
             });
         }
 
@@ -342,6 +392,11 @@ fn quality_filters_allow(
         return true;
     }
     is_model_recent_enough(model.created, now_secs) && is_model_capable_enough(&model.pricing)
+}
+
+fn model_is_chat_capable(provider: &dyn CompletionProvider, model: &ModelEntry, id: &str) -> bool {
+    model_architecture_supports_text_chat(model.architecture.as_ref())
+        .unwrap_or_else(|| provider.is_chat_capable(id))
 }
 
 fn metadata_credential(credential: &str) -> &str {
@@ -372,6 +427,9 @@ fn catalog_provider(
                 .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
                 .map_err(|error| format!("failed to build provider metadata: {error}"))
         }
+        "fireworks" => OpenAiProvider::fireworks(OpenAiProvider::fireworks_base_url(), credential)
+            .map(|provider| Box::new(provider) as Box<dyn CompletionProvider>)
+            .map_err(|error| format!("failed to build provider metadata: {error}")),
         _ => Ok(Box::new(UnknownCatalogProvider::new(&provider_name))),
     }
 }
@@ -418,6 +476,8 @@ struct ModelEntry {
     display_name: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    architecture: Option<OpenAiModelArchitecture>,
     #[serde(default)]
     created: Option<u64>,
     #[serde(default)]
@@ -471,6 +531,7 @@ mod tests {
             id: id.to_string(),
             display_name: None,
             provider: provider.to_string(),
+            recommended: true,
         }
     }
 
@@ -521,6 +582,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
 
@@ -607,6 +670,102 @@ mod tests {
             .iter()
             .any(|model| model.id == "anthropic/claude-sonnet-4"));
         assert!(parsed.iter().any(|model| model.id == "x-ai/grok-3"));
+    }
+
+    #[test]
+    fn catalog_provider_creates_fireworks_provider() {
+        let provider = test_provider("fireworks");
+        assert_eq!(provider.name(), "fireworks");
+        assert_eq!(
+            provider.models_endpoint(),
+            Some("https://api.fireworks.ai/inference/v1/models")
+        );
+        assert!(provider.is_chat_capable("accounts/fireworks/routers/kimi-k2p5-turbo"));
+        assert!(!provider.is_chat_capable("accounts/fireworks/models/nomic-embed-text-v1.5"));
+    }
+
+    #[test]
+    fn parse_models_supplements_fireworks_kimi_router_alias() {
+        let provider = test_provider("fireworks");
+        let json = r#"{
+            "data": [
+                {"id": "accounts/fireworks/models/kimi-k2p5"},
+                {"id": "accounts/fireworks/models/glm-5"}
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+        let ids = parsed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"accounts/fireworks/models/kimi-k2p5"));
+        assert!(ids.contains(&"accounts/fireworks/models/glm-5"));
+        assert!(ids.contains(&"accounts/fireworks/routers/kimi-k2p5-turbo"));
+        assert!(
+            !parsed
+                .iter()
+                .find(|model| model.id == "accounts/fireworks/models/kimi-k2p5")
+                .expect("standard kimi model")
+                .recommended
+        );
+        assert!(
+            parsed
+                .iter()
+                .find(|model| model.id == "accounts/fireworks/routers/kimi-k2p5-turbo")
+                .expect("turbo kimi router")
+                .recommended
+        );
+    }
+
+    #[test]
+    fn parse_models_demotes_fireworks_standard_kimi_when_router_is_discovered() {
+        let provider = test_provider("fireworks");
+        let json = r#"{
+            "data": [
+                {"id": "accounts/fireworks/models/kimi-k2p5"},
+                {"id": "accounts/fireworks/routers/kimi-k2p5-turbo"}
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+
+        assert_eq!(parsed.len(), 2);
+        assert!(
+            !parsed
+                .iter()
+                .find(|model| model.id == "accounts/fireworks/models/kimi-k2p5")
+                .expect("standard kimi model")
+                .recommended
+        );
+        assert!(
+            parsed
+                .iter()
+                .find(|model| model.id == "accounts/fireworks/routers/kimi-k2p5-turbo")
+                .expect("turbo kimi router")
+                .recommended
+        );
+    }
+
+    #[test]
+    fn parse_models_does_not_supplement_router_for_non_standard_kimi_suffixes() {
+        let provider = test_provider("fireworks");
+        let json = r#"{
+            "data": [
+                {"id": "accounts/fireworks/models/not-kimi-k2p5"},
+                {"id": "accounts/fireworks/models/team-a/kimi-k2p5"}
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+        let ids = parsed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"accounts/fireworks/models/not-kimi-k2p5"));
+        assert!(!ids.contains(&"accounts/fireworks/routers/kimi-k2p5-turbo"));
     }
 
     #[test]
@@ -763,6 +922,7 @@ mod tests {
         assert_eq!(
             openrouter,
             vec![
+                "z-ai/glm-5.1".to_string(),
                 "anthropic/claude-sonnet-4".to_string(),
                 "openai/gpt-4o".to_string(),
                 "x-ai/grok-3".to_string(),
@@ -913,8 +1073,11 @@ mod tests {
 
         let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-within-cutoff");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-beyond-cutoff");
+        assert!(!parsed[0].recommended);
+        assert_eq!(parsed[1].id, "anthropic/claude-sonnet-within-cutoff");
+        assert!(parsed[1].recommended);
     }
 
     #[test]
@@ -980,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_models_openrouter_filters_old_and_cheap_models() {
+    fn parse_models_openrouter_marks_old_and_cheap_models_not_recommended() {
         let provider = test_provider("openrouter");
         let now_secs = 1_900_000_000_u64;
         let recent = now_secs - (30 * 24 * 60 * 60);
@@ -1001,7 +1164,12 @@ mod tests {
                     {{
                         "id": "some-provider/cheap-model",
                         "created": {recent},
-                        "pricing": {{"prompt": "0.0000001"}}
+                        "pricing": {{"prompt": "0.0000001"}},
+                        "architecture": {{
+                            "modality": "text->text",
+                            "input_modalities": ["text"],
+                            "output_modalities": ["text"]
+                        }}
                     }}
                 ]
             }}"#
@@ -1009,8 +1177,72 @@ mod tests {
 
         let parsed = parse_models_with_now(provider.as_ref(), &json, now_secs);
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].id, "anthropic/claude-sonnet-4");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].id, "anthropic/claude-3.5-sonnet");
+        assert!(!parsed[0].recommended);
+        assert_eq!(parsed[1].id, "anthropic/claude-sonnet-4");
+        assert!(parsed[1].recommended);
+        assert_eq!(parsed[2].id, "some-provider/cheap-model");
+        assert!(!parsed[2].recommended);
+    }
+
+    #[test]
+    fn parse_models_openrouter_uses_architecture_metadata_for_chat_capability() {
+        let provider = test_provider("openrouter");
+        let json = r#"{
+            "data": [
+                {
+                    "id": "z-ai/glm-4.5-air:free",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"]
+                    }
+                },
+                {
+                    "id": "arcee-ai/trinity-large-preview:free",
+                    "architecture": {
+                        "modality": "text->text",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["text"]
+                    }
+                },
+                {
+                    "id": "mistralai/mistral-small-2603",
+                    "architecture": {
+                        "modality": "text+image->text"
+                    }
+                },
+                {
+                    "id": "openai/text-embedding-3-large",
+                    "architecture": {
+                        "modality": "text->embedding",
+                        "input_modalities": ["text"],
+                        "output_modalities": ["embedding"]
+                    }
+                },
+                {
+                    "id": "openai/gpt-4o-transcribe",
+                    "architecture": {
+                        "modality": "audio->text",
+                        "input_modalities": ["audio"],
+                        "output_modalities": ["text"]
+                    }
+                }
+            ]
+        }"#;
+
+        let parsed = parse_models(provider.as_ref(), json);
+        let ids = parsed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"z-ai/glm-4.5-air:free"));
+        assert!(ids.contains(&"arcee-ai/trinity-large-preview:free"));
+        assert!(ids.contains(&"mistralai/mistral-small-2603"));
+        assert!(!ids.contains(&"openai/text-embedding-3-large"));
+        assert!(!ids.contains(&"openai/gpt-4o-transcribe"));
     }
 
     #[test]

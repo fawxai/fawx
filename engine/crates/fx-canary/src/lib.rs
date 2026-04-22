@@ -1,37 +1,37 @@
-//! fx-canary — Signal quality monitor for the Fawx agentic engine.
+//! fx-canary — signal health monitor for the Fawx agentic engine.
 //!
-//! Captures signal baselines (success/friction/decision ratios), evaluates
-//! current signals against baseline, and returns verdicts: Healthy, Warning,
-//! or Degraded (with rollback recommendation).
+//! Captures multi-dimensional health baselines, evaluates current health
+//! against those baselines, and returns verdicts that drive warnings or
+//! rollback recommendations.
 //!
 //! Pure computation — no I/O, no file writes, no network.
 
+mod health;
 mod monitor;
 mod time;
 mod trigger;
 mod window;
 
+pub use health::{
+    summarize_degraded_dimensions, DegradedDimension, HealthDimension, HealthThresholds,
+    HealthVector,
+};
 pub use monitor::CanaryMonitor;
-pub use trigger::{RipcordTrigger, RollbackError, RollbackReason, RollbackTrigger};
+pub use trigger::{RipcordTrigger, RollbackError, RollbackPolicy, RollbackReason, RollbackTrigger};
 pub use window::SignalWindow;
 
 pub(crate) use time::current_epoch_secs;
 
-use fx_kernel::{Signal, SignalKind};
 use serde::{Deserialize, Serialize};
 
-/// Captured signal ratios at a point in time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalBaseline {
+/// Baseline or current health captured for a rolling signal window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthSnapshot {
     pub captured_at: u64,
     pub window_seconds: u64,
     pub total_signals: u64,
-    pub success_count: u64,
-    pub friction_count: u64,
-    pub decision_count: u64,
-    pub avg_friction_severity: f64,
-    pub success_rate: f64,
-    pub friction_rate: f64,
+    pub cycle_count: u64,
+    pub health: HealthVector,
 }
 
 /// Degradation verdict emitted by the canary.
@@ -39,11 +39,15 @@ pub struct SignalBaseline {
 pub enum Verdict {
     /// Signal quality is stable or improved.
     Healthy,
-    /// Minor degradation detected, within tolerance.
-    Warning { message: String },
+    /// Some degradation is present, but not enough to justify rollback.
+    Warning {
+        message: String,
+        degraded_dimensions: Vec<DegradedDimension>,
+    },
     /// Significant degradation — recommend rollback.
     Degraded {
         message: String,
+        degraded_dimensions: Vec<DegradedDimension>,
         rollback_recommended: bool,
     },
 }
@@ -53,12 +57,10 @@ pub enum Verdict {
 pub struct CanaryConfig {
     /// Minimum signals needed before baseline is meaningful.
     pub min_signals_for_baseline: u64,
-    /// Success rate drop threshold for Warning (e.g., 0.10 = 10% drop).
-    pub warning_threshold: f64,
-    /// Success rate drop threshold for Degraded (e.g., 0.25 = 25% drop).
-    pub degraded_threshold: f64,
-    /// Friction rate increase threshold for Degraded.
-    pub friction_increase_threshold: f64,
+    /// Per-dimension degradation thresholds.
+    pub health_thresholds: HealthThresholds,
+    /// Typed rollback policy based on degraded-dimension severity counts.
+    pub rollback_policy: RollbackPolicy,
     /// Time window for signal collection (seconds).
     pub window_seconds: u64,
 }
@@ -67,18 +69,17 @@ impl Default for CanaryConfig {
     fn default() -> Self {
         Self {
             min_signals_for_baseline: 20,
-            warning_threshold: 0.10,
-            degraded_threshold: 0.25,
-            friction_increase_threshold: 0.20,
+            health_thresholds: HealthThresholds::default(),
+            rollback_policy: RollbackPolicy::default(),
             window_seconds: 3600,
         }
     }
 }
 
-/// The canary monitor.
+/// The canary monitor core.
 pub struct Canary {
     config: CanaryConfig,
-    baseline: Option<SignalBaseline>,
+    baseline: Option<HealthSnapshot>,
 }
 
 impl Canary {
@@ -95,31 +96,60 @@ impl Canary {
         Self::new(CanaryConfig::default())
     }
 
-    /// Capture a baseline from a slice of signals.
-    pub fn capture_baseline(&mut self, signals: &[Signal], window_seconds: u64) {
-        let mut baseline = compute_ratios(signals);
-        baseline.window_seconds = window_seconds;
+    /// Capture a baseline from a health snapshot.
+    pub fn capture_baseline(&mut self, baseline: HealthSnapshot) {
         self.baseline = Some(baseline);
     }
 
-    /// Compare current signals against baseline, return verdict.
-    pub fn evaluate(&self, current_signals: &[Signal]) -> Verdict {
+    /// Compare current health against baseline, return verdict.
+    pub fn evaluate(&self, current: &HealthSnapshot) -> Verdict {
         let baseline = match &self.baseline {
-            Some(b) => b,
+            Some(baseline) => baseline,
             None => return Verdict::Healthy,
         };
 
-        let current_len = current_signals.len() as u64;
-        if current_len < self.config.min_signals_for_baseline {
+        if current.total_signals < self.config.min_signals_for_baseline {
             return Verdict::Healthy;
         }
 
-        let current = compute_ratios(current_signals);
-        classify_degradation(&self.config, baseline, &current)
+        let degraded_dimensions = current
+            .health
+            .evaluate(&baseline.health, &self.config.health_thresholds);
+        if degraded_dimensions.is_empty() {
+            return Verdict::Healthy;
+        }
+
+        let message = format!(
+            "{} degraded dimension{}: {}",
+            degraded_dimensions.len(),
+            if degraded_dimensions.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            summarize_degraded_dimensions(&degraded_dimensions)
+        );
+
+        if self
+            .config
+            .rollback_policy
+            .should_trigger(&degraded_dimensions)
+        {
+            Verdict::Degraded {
+                message,
+                degraded_dimensions,
+                rollback_recommended: true,
+            }
+        } else {
+            Verdict::Warning {
+                message,
+                degraded_dimensions,
+            }
+        }
     }
 
     /// Get the current baseline (if captured).
-    pub fn baseline(&self) -> Option<&SignalBaseline> {
+    pub fn baseline(&self) -> Option<&HealthSnapshot> {
         self.baseline.as_ref()
     }
 
@@ -127,259 +157,118 @@ impl Canary {
     pub fn has_sufficient_baseline(&self) -> bool {
         self.baseline
             .as_ref()
-            .is_some_and(|b| b.total_signals >= self.config.min_signals_for_baseline)
+            .is_some_and(|baseline| baseline.total_signals >= self.config.min_signals_for_baseline)
     }
-}
-
-/// Classify degradation by comparing current ratios against baseline.
-fn classify_degradation(
-    config: &CanaryConfig,
-    baseline: &SignalBaseline,
-    current: &SignalBaseline,
-) -> Verdict {
-    let success_drop = baseline.success_rate - current.success_rate;
-    let friction_increase = current.friction_rate - baseline.friction_rate;
-
-    if success_drop >= config.degraded_threshold {
-        return Verdict::Degraded {
-            message: format!(
-                "success rate dropped {:.1}% (baseline {:.1}% → current {:.1}%)",
-                success_drop * 100.0,
-                baseline.success_rate * 100.0,
-                current.success_rate * 100.0,
-            ),
-            rollback_recommended: true,
-        };
-    }
-
-    if friction_increase >= config.friction_increase_threshold {
-        return Verdict::Degraded {
-            message: format!(
-                "friction rate increased {:.1}% (baseline {:.1}% → current {:.1}%)",
-                friction_increase * 100.0,
-                baseline.friction_rate * 100.0,
-                current.friction_rate * 100.0,
-            ),
-            rollback_recommended: true,
-        };
-    }
-
-    if success_drop >= config.warning_threshold {
-        return Verdict::Warning {
-            message: format!(
-                "success rate dropped {:.1}% (baseline {:.1}% → current {:.1}%)",
-                success_drop * 100.0,
-                baseline.success_rate * 100.0,
-                current.success_rate * 100.0,
-            ),
-        };
-    }
-
-    Verdict::Healthy
-}
-
-/// Compute signal ratios from a slice of signals.
-pub fn compute_ratios(signals: &[Signal]) -> SignalBaseline {
-    let total = signals.len() as u64;
-    let mut success_count: u64 = 0;
-    let mut friction_count: u64 = 0;
-    let mut decision_count: u64 = 0;
-    let mut severity_sum: f64 = 0.0;
-
-    for signal in signals {
-        match signal.kind {
-            SignalKind::Success => success_count += 1,
-            SignalKind::Friction => {
-                friction_count += 1;
-                severity_sum += extract_severity(&signal.metadata);
-            }
-            SignalKind::Decision => decision_count += 1,
-            _ => {}
-        }
-    }
-
-    let (success_rate, friction_rate, avg_friction_severity) = if total == 0 {
-        (0.0, 0.0, 0.0)
-    } else {
-        let sr = success_count as f64 / total as f64;
-        let fr = friction_count as f64 / total as f64;
-        let afs = if friction_count > 0 {
-            severity_sum / friction_count as f64
-        } else {
-            0.0
-        };
-        (sr, fr, afs)
-    };
-
-    SignalBaseline {
-        captured_at: 0,
-        window_seconds: 0,
-        total_signals: total,
-        success_count,
-        friction_count,
-        decision_count,
-        avg_friction_severity,
-        success_rate,
-        friction_rate,
-    }
-}
-
-/// Extract severity from signal metadata, defaulting to 1.0 if absent.
-fn extract_severity(metadata: &serde_json::Value) -> f64 {
-    metadata
-        .get("severity")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_kernel::LoopStep;
 
-    fn mk(kind: SignalKind) -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind,
-            message: String::new(),
-            metadata: serde_json::json!({}),
-            timestamp_ms: 0,
+    fn snapshot(success_rate: f64, retry_rate: Option<f64>, total_signals: u64) -> HealthSnapshot {
+        HealthSnapshot {
+            captured_at: 1,
+            window_seconds: 60,
+            total_signals,
+            cycle_count: 3,
+            health: HealthVector {
+                success_rate: Some(success_rate),
+                retry_rate,
+                ..HealthVector::default()
+            },
         }
-    }
-
-    fn mk_friction(severity: f64) -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind: SignalKind::Friction,
-            message: String::new(),
-            metadata: serde_json::json!({ "severity": severity }),
-            timestamp_ms: 0,
-        }
-    }
-
-    fn mk_signals(success: usize, friction: usize, decision: usize) -> Vec<Signal> {
-        let mut signals = Vec::new();
-        for _ in 0..success {
-            signals.push(mk(SignalKind::Success));
-        }
-        for _ in 0..friction {
-            signals.push(mk_friction(0.5));
-        }
-        for _ in 0..decision {
-            signals.push(mk(SignalKind::Decision));
-        }
-        signals
-    }
-
-    #[test]
-    fn compute_ratios_empty_signals() {
-        let ratios = compute_ratios(&[]);
-        assert_eq!(ratios.total_signals, 0);
-        assert_eq!(ratios.success_count, 0);
-        assert_eq!(ratios.friction_count, 0);
-        assert_eq!(ratios.decision_count, 0);
-        assert!((ratios.success_rate - 0.0).abs() < f64::EPSILON);
-        assert!((ratios.friction_rate - 0.0).abs() < f64::EPSILON);
-        assert!((ratios.avg_friction_severity - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn compute_ratios_all_success() {
-        let signals: Vec<Signal> = (0..10).map(|_| mk(SignalKind::Success)).collect();
-        let ratios = compute_ratios(&signals);
-        assert_eq!(ratios.total_signals, 10);
-        assert_eq!(ratios.success_count, 10);
-        assert!((ratios.success_rate - 1.0).abs() < f64::EPSILON);
-        assert!((ratios.friction_rate - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn compute_ratios_mixed_signals() {
-        // 5 success, 3 friction (sev 0.5), 2 decision = 10 total
-        let signals = mk_signals(5, 3, 2);
-        let ratios = compute_ratios(&signals);
-        assert_eq!(ratios.total_signals, 10);
-        assert_eq!(ratios.success_count, 5);
-        assert_eq!(ratios.friction_count, 3);
-        assert_eq!(ratios.decision_count, 2);
-        assert!((ratios.success_rate - 0.5).abs() < f64::EPSILON);
-        assert!((ratios.friction_rate - 0.3).abs() < f64::EPSILON);
-        assert!((ratios.avg_friction_severity - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn evaluate_healthy_when_no_baseline() {
         let canary = Canary::with_defaults();
-        let signals = mk_signals(10, 5, 5);
-        assert_eq!(canary.evaluate(&signals), Verdict::Healthy);
+        assert_eq!(
+            canary.evaluate(&snapshot(0.8, Some(0.1), 20)),
+            Verdict::Healthy
+        );
     }
 
     #[test]
     fn evaluate_healthy_when_insufficient_data() {
         let mut canary = Canary::with_defaults();
-        canary.capture_baseline(&mk_signals(20, 0, 0), 3600);
-        // Only 5 current signals — below min_signals_for_baseline (20)
-        let current = mk_signals(3, 1, 1);
-        assert_eq!(canary.evaluate(&current), Verdict::Healthy);
+        canary.capture_baseline(snapshot(0.9, Some(0.0), 20));
+
+        assert_eq!(
+            canary.evaluate(&snapshot(0.3, Some(0.8), 5)),
+            Verdict::Healthy
+        );
     }
 
     #[test]
-    fn evaluate_warning_on_moderate_drop() {
+    fn evaluate_returns_warning_for_single_dimension_regression() {
         let mut canary = Canary::with_defaults();
-        // Baseline: 80% success (16/20)
-        canary.capture_baseline(&mk_signals(16, 2, 2), 3600);
-        // Current: 65% success (13/20) — drop of 15%, above warning (10%)
-        let current = mk_signals(13, 3, 4);
-        let verdict = canary.evaluate(&current);
+        canary.capture_baseline(snapshot(0.9, Some(0.0), 20));
+
+        let verdict = canary.evaluate(&snapshot(0.9, Some(0.4), 20));
+
         match verdict {
-            Verdict::Warning { .. } => {}
+            Verdict::Warning {
+                degraded_dimensions,
+                ..
+            } => {
+                assert_eq!(degraded_dimensions.len(), 1);
+                assert_eq!(degraded_dimensions[0].dimension, HealthDimension::RetryRate);
+            }
             other => panic!("expected Warning, got {other:?}"),
         }
     }
 
     #[test]
-    fn evaluate_degraded_on_large_drop() {
+    fn evaluate_returns_degraded_for_multi_dimension_regression() {
         let mut canary = Canary::with_defaults();
-        // Baseline: 80% success (16/20)
-        canary.capture_baseline(&mk_signals(16, 2, 2), 3600);
-        // Current: 50% success (10/20) — drop of 30%, above degraded (25%)
-        let current = mk_signals(10, 5, 5);
-        let verdict = canary.evaluate(&current);
+        canary.capture_baseline(HealthSnapshot {
+            captured_at: 1,
+            window_seconds: 60,
+            total_signals: 40,
+            cycle_count: 4,
+            health: HealthVector {
+                success_rate: Some(0.9),
+                friction_rate: Some(0.05),
+                avg_latency_ms: Some(120.0),
+                retry_rate: Some(0.0),
+                ..HealthVector::default()
+            },
+        });
+
+        let verdict = canary.evaluate(&HealthSnapshot {
+            captured_at: 2,
+            window_seconds: 60,
+            total_signals: 40,
+            cycle_count: 4,
+            health: HealthVector {
+                success_rate: Some(0.6),
+                friction_rate: Some(0.2),
+                avg_latency_ms: Some(240.0),
+                retry_rate: Some(0.4),
+                ..HealthVector::default()
+            },
+        });
+
         match verdict {
             Verdict::Degraded {
                 rollback_recommended,
+                degraded_dimensions,
                 ..
-            } => assert!(rollback_recommended),
+            } => {
+                assert!(rollback_recommended);
+                assert!(degraded_dimensions.len() >= 3);
+            }
             other => panic!("expected Degraded, got {other:?}"),
         }
     }
 
     #[test]
-    fn evaluate_degraded_on_friction_spike() {
+    fn capture_baseline_stores_health_vector() {
         let mut canary = Canary::with_defaults();
-        // Baseline: 5% friction (1/20)
-        canary.capture_baseline(&mk_signals(15, 1, 4), 3600);
-        // Current: 30% friction (6/20) — increase of 25%, above threshold (20%)
-        let current = mk_signals(10, 6, 4);
-        let verdict = canary.evaluate(&current);
-        match verdict {
-            Verdict::Degraded {
-                rollback_recommended,
-                ..
-            } => assert!(rollback_recommended),
-            other => panic!("expected Degraded, got {other:?}"),
-        }
-    }
+        let baseline = snapshot(0.8, Some(0.1), 20);
+        canary.capture_baseline(baseline.clone());
 
-    #[test]
-    fn capture_baseline_stores_ratios() {
-        let mut canary = Canary::with_defaults();
-        assert!(canary.baseline().is_none());
-        canary.capture_baseline(&mk_signals(8, 1, 1), 7200);
-        let baseline = canary.baseline().expect("baseline should be set");
-        assert_eq!(baseline.total_signals, 10);
-        assert_eq!(baseline.window_seconds, 7200);
-        assert!((baseline.success_rate - 0.8).abs() < f64::EPSILON);
+        assert_eq!(canary.baseline(), Some(&baseline));
     }
 
     #[test]
@@ -387,12 +276,10 @@ mod tests {
         let mut canary = Canary::with_defaults();
         assert!(!canary.has_sufficient_baseline());
 
-        // 10 signals — below default min of 20
-        canary.capture_baseline(&mk_signals(8, 1, 1), 3600);
+        canary.capture_baseline(snapshot(0.8, Some(0.1), 10));
         assert!(!canary.has_sufficient_baseline());
 
-        // 20 signals — meets minimum
-        canary.capture_baseline(&mk_signals(16, 2, 2), 3600);
+        canary.capture_baseline(snapshot(0.8, Some(0.1), 20));
         assert!(canary.has_sufficient_baseline());
     }
 }

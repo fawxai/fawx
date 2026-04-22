@@ -6,7 +6,7 @@ use crate::session::{
 use crate::store::SessionStore;
 use crate::types::{
     MessageRole, SessionArchiveFilter, SessionConfig, SessionInfo, SessionKey, SessionKind,
-    SessionStatus,
+    SessionStatus, SessionThreadBinding,
 };
 use fx_core::error::StorageError;
 use fx_storage::Storage;
@@ -303,6 +303,18 @@ impl SessionRegistry {
         })
     }
 
+    /// Persist workspace/worktree ownership for a thread-backed session.
+    pub fn set_thread_binding(
+        &self,
+        key: &SessionKey,
+        thread_binding: Option<SessionThreadBinding>,
+    ) -> Result<()> {
+        self.update_session(key, |session| {
+            session.set_thread_binding(thread_binding);
+            Ok(())
+        })
+    }
+
     /// Retrieve conversation history for a session (most recent `limit`).
     pub fn history(&self, key: &SessionKey, limit: usize) -> Result<Vec<SessionMessage>> {
         self.fail_if_corrupted(key)?;
@@ -327,6 +339,39 @@ impl SessionRegistry {
             session.status = status;
             Ok(())
         })
+    }
+
+    /// Update the model that should be used for future turns in this session.
+    pub fn set_model(&self, key: &SessionKey, model: String) -> Result<SessionInfo> {
+        self.update_session(key, move |session| {
+            session.set_model(model);
+            Ok(())
+        })?;
+        self.get_info(key)
+    }
+
+    /// Update the runtime model and thinking override together.
+    pub fn set_model_and_thinking(
+        &self,
+        key: &SessionKey,
+        model: String,
+        thinking: Option<String>,
+    ) -> Result<SessionInfo> {
+        self.update_session(key, move |session| {
+            session.set_model(model);
+            session.set_thinking(thinking);
+            Ok(())
+        })?;
+        self.get_info(key)
+    }
+
+    /// Update the thinking level override used for future turns in this session.
+    pub fn set_thinking(&self, key: &SessionKey, thinking: Option<String>) -> Result<SessionInfo> {
+        self.update_session(key, move |session| {
+            session.set_thinking(thinking);
+            Ok(())
+        })?;
+        self.get_info(key)
     }
 
     /// Archive a session without deleting or clearing its history.
@@ -467,6 +512,7 @@ mod tests {
         SessionConfig {
             label: Some("test".to_string()),
             model: "gpt-4".to_string(),
+            thinking: None,
         }
     }
 
@@ -477,9 +523,11 @@ mod tests {
             status: SessionStatus::Idle,
             label: Some("poisoned".to_string()),
             model: "gpt-4".to_string(),
+            thinking: None,
             created_at: 1,
             updated_at: 2,
             archived_at: None,
+            thread_binding: None,
             messages: vec![
                 SessionMessage::structured(
                     MessageRole::Tool,
@@ -1105,6 +1153,7 @@ mod tests {
             SessionConfig {
                 label: Some("persistent".to_string()),
                 model: "claude".to_string(),
+                thinking: None,
             },
         )
         .expect("create");
@@ -1144,6 +1193,7 @@ mod tests {
             SessionConfig {
                 label: Some("original".to_string()),
                 model: "gpt-4".to_string(),
+                thinking: None,
             },
         )
         .expect("first create");
@@ -1158,6 +1208,7 @@ mod tests {
                 SessionConfig {
                     label: Some("impostor".to_string()),
                     model: "claude".to_string(),
+                    thinking: None,
                 },
             )
             .expect_err("duplicate should fail");

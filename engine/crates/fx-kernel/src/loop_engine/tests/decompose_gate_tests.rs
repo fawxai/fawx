@@ -2,7 +2,10 @@ use super::*;
 use crate::act::ToolResult;
 use crate::budget::BudgetConfig;
 use async_trait::async_trait;
-use fx_decompose::{AggregationStrategy, ComplexityHint, DecompositionPlan, SubGoal};
+use fx_decompose::{
+    AggregationStrategy, ComplexityHint, DecompositionPlan, GoTPreset, GraphOfOperationsSpec,
+    SubGoal,
+};
 use fx_llm::{
     CompletionRequest, CompletionResponse, ContentBlock, ProviderError, ToolCall, ToolDefinition,
 };
@@ -24,6 +27,7 @@ impl ToolExecutor for PassiveToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -109,6 +113,7 @@ fn unroutable_gate_engine(config: BudgetConfig) -> LoopEngine {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -135,11 +140,7 @@ fn sub_goal(description: &str, tools: &[&str], hint: Option<ComplexityHint>) -> 
 }
 
 fn plan(sub_goals: Vec<SubGoal>) -> DecompositionPlan {
-    DecompositionPlan {
-        sub_goals,
-        strategy: AggregationStrategy::Parallel,
-        truncated_from: None,
-    }
+    DecompositionPlan::standard(sub_goals, AggregationStrategy::Parallel)
 }
 
 // --- Batch detection tests (1-5) ---
@@ -286,6 +287,59 @@ async fn batch_gate_skips_direct_route_when_executor_cannot_materialize_calls() 
 }
 
 #[tokio::test]
+async fn decompose_gate_blocks_when_every_sub_goal_is_below_budget_floor() {
+    let config = BudgetConfig {
+        max_llm_calls: 8,
+        max_tool_invocations: 8,
+        max_tokens: 4_000,
+        max_cost_cents: 100,
+        max_wall_time_ms: 40_000,
+        ..BudgetConfig::default()
+    };
+    let mut engine = gate_engine(config);
+    let llm = TextLlm;
+    let p = plan(vec![
+        sub_goal("inspect kernel loop", &[], None),
+        sub_goal("inspect swift transcript", &[], None),
+        sub_goal("inspect api routing", &[], None),
+        sub_goal("inspect tests", &[], None),
+        sub_goal("inspect logging", &[], None),
+        sub_goal("inspect retry policy", &[], None),
+        sub_goal("inspect budget gates", &[], None),
+        sub_goal("inspect finalization", &[], None),
+    ]);
+    let decision = Decision::Decompose(p.clone());
+
+    let result = engine
+        .evaluate_decompose_gates(&p, &decision, &llm, &[])
+        .await;
+
+    let action = result
+        .expect("budget floor gate should fire")
+        .expect("gate should return action");
+    match action.next_step {
+        ActionNextStep::Continue(continuation) => {
+            assert!(continuation
+                .context_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Task decomposition results:")));
+            assert!(continuation
+                .context_message
+                .as_deref()
+                .is_some_and(|message| message
+                    .lines()
+                    .skip(1)
+                    .all(|line| line.contains("=> skipped (below floor)"))));
+        }
+        other => panic!("expected root synthesis continuation, got {other:?}"),
+    }
+    let signals = engine.signals.drain_all();
+    assert!(signals
+        .iter()
+        .any(|signal| signal.message == "decompose_budget_floor_gate"));
+}
+
+#[tokio::test]
 async fn child_engine_disables_decompose_when_sub_goal_declares_required_tools() {
     let config = BudgetConfig::default();
     let engine = gate_engine(config.clone());
@@ -360,6 +414,7 @@ fn internal_child_suppresses_public_event_bus_messages() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     });
     child.publish_stream_finished(StreamPhase::Reason);
 
@@ -388,6 +443,7 @@ async fn child_engine_scopes_tool_surface_to_required_tools() {
                     tool_name: call.name.clone(),
                     success: true,
                     output: "ok".to_string(),
+                    failure_class: None,
                 })
                 .collect())
         }
@@ -937,15 +993,14 @@ async fn sequential_strategy_excludes_complexity_floor() {
     let config = BudgetConfig::default();
     let mut engine = gate_engine(config);
     let llm = TextLlm;
-    let p = DecompositionPlan {
-        sub_goals: vec![
+    let p = DecompositionPlan::standard(
+        vec![
             sub_goal("a", &["tool_a"], Some(ComplexityHint::Trivial)),
             sub_goal("b", &["tool_b"], Some(ComplexityHint::Trivial)),
             sub_goal("c", &["tool_c"], Some(ComplexityHint::Trivial)),
         ],
-        strategy: AggregationStrategy::Sequential,
-        truncated_from: None,
-    };
+        AggregationStrategy::Sequential,
+    );
     let decision = Decision::Decompose(p.clone());
 
     let _result = engine
@@ -962,3 +1017,54 @@ async fn sequential_strategy_excludes_complexity_floor() {
 }
 
 // --- estimate_plan_cost unit tests ---
+
+#[tokio::test]
+async fn got_plan_still_runs_cost_gate() {
+    let config = BudgetConfig {
+        max_cost_cents: 6,
+        ..BudgetConfig::default()
+    };
+    let mut engine = gate_engine(config);
+    let llm = TextLlm;
+    let p = DecompositionPlan::graph_of_thoughts(GraphOfOperationsSpec::Preset {
+        name: GoTPreset::GraphOfThought,
+        branches: Some(3),
+        keep: None,
+        refine_iterations: None,
+        target_score: None,
+        criteria: "reasoning quality".to_string(),
+    });
+    let decision = Decision::Decompose(p.clone());
+
+    let result = engine
+        .evaluate_decompose_gates(&p, &decision, &llm, &[])
+        .await;
+
+    assert!(result.is_some(), "GoT plans should still hit the cost gate");
+    let signals = engine.signals.drain_all();
+    assert!(signals.iter().any(|s| s.message == "decompose_cost_gate"));
+    assert!(!signals
+        .iter()
+        .any(|s| s.message == "decompose_batch_detected"));
+    assert!(!signals
+        .iter()
+        .any(|s| s.message == "decompose_complexity_floor"));
+}
+
+#[test]
+fn estimate_plan_cost_uses_got_lower_bound() {
+    let cost = estimate_plan_cost(&DecompositionPlan::graph_of_thoughts(
+        GraphOfOperationsSpec::Preset {
+            name: GoTPreset::GraphOfThought,
+            branches: Some(3),
+            keep: None,
+            refine_iterations: None,
+            target_score: None,
+            criteria: "reasoning quality".to_string(),
+        },
+    ));
+
+    assert_eq!(cost.llm_calls, 8);
+    assert_eq!(cost.tool_invocations, 0);
+    assert_eq!(cost.cost_cents, 16);
+}

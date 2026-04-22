@@ -8,25 +8,87 @@ Fawx is a local-first agentic engine. It runs on your machine, calls LLMs for re
 
 **1,800+ tests. 34 crates. WASM skill plugins. macOS and iOS apps.**
 
+## Key Features
+
+- **Local-first** — your data never leaves your machine (except to the LLM provider you choose)
+- **50+ built-in tools** — file editing, shell, git, memory, Python, web browsing, and more
+- **WASM skill plugins** — extend capabilities with sandboxed WebAssembly modules
+- **Multiple frontends** — TUI, HTTP API, macOS/iOS apps, Telegram
+- **Immutable safety kernel** — capability gates, tripwires, and atomic ripcord rollback
+- **Multi-provider LLM support** — Anthropic, OpenAI, OpenRouter, Fireworks, and local models
+- **Semantic memory** — persistent key-value store with embeddings and decay
+
+
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+  - [Updating](#updating)
+- [What It Does](#what-it-does)
+- [Architecture](#architecture)
+- [Built-in Tools](#built-in-tools)
+- [WASM Skills](#wasm-skills)
+- [LLM Providers](#llm-providers)
+- [Security](#security)
+- [Configuration](#configuration)
+- [Development](#development)
+- [Project Structure](#project-structure)
+- [Roadmap](#roadmap)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
 ---
+
+## Requirements
+
+- **Rust** (stable) — install via [rustup.rs](https://rustup.rs/)
+- **macOS** (Apple Silicon or Intel) or **Linux**
+- An API key from at least one [supported LLM provider](#llm-providers)
+- **wasm32-wasip1 target** (optional, for building WASM skills) — `rustup target add wasm32-wasip1`
 
 ## Quick Start
 
 ```bash
-# Build
+# Check prerequisites
+rustc --version && cargo --version  # requires Rust stable
+
+# Clone and build (first build takes ~2 minutes)
 git clone https://github.com/fawxai/fawx.git
 cd fawx && cargo build --release
 
 # Configure (interactive wizard)
 ./target/release/fawx setup
 
-# Run
+# Run the server
 ./target/release/fawx serve
+
+# In another terminal, start chatting
+./target/release/fawx chat
+
+# Stop the server when you're done
+./target/release/fawx stop
+
+# See all available commands
+./target/release/fawx --help
 ```
 
-Bring your own API key (Anthropic, OpenAI, or local models). Fawx never sends data anywhere except the LLM provider you choose.
+> **Tip:** Add Fawx to your PATH so `fawx` works from anywhere:
+> ```bash
+> echo 'export PATH="$HOME/fawx/target/release:$PATH"' >> ~/.zshrc
+> ```
 
----
+Bring your own API key (Anthropic, OpenAI, OpenRouter, Fireworks, or local models). Fawx never sends data anywhere except the LLM provider you choose. You can also connect via the macOS/iOS app, the HTTP API, or Telegram.
+
+### Updating
+
+```bash
+cd fawx && git pull && cargo build --release
+```
+
+Your configuration and data in `~/.fawx/` are preserved across updates.
+
 
 ## What It Does
 
@@ -48,23 +110,24 @@ Fawx: [search_text] Searching for TODO patterns...
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                  Shells                      │
-│  TUI  ·  HTTP API  ·  macOS/iOS  ·  Telegram│
-├─────────────────────────────────────────────┤
-│              Agentic Loop                    │
-│  perceive → plan → act → synthesize         │
-├──────────┬──────────────┬───────────────────┤
-│  Kernel  │    Tools     │    Loadable       │
-│ (safety) │ (13 builtin) │  (WASM skills)    │
-│          │              │                   │
-│ cap gate │ file, shell  │ web search, fetch │
-│ tripwire │ memory, git  │ weather, vision   │
-│ ripcord  │ config, node │ tts, scheduler    │
-├──────────┴──────────────┴───────────────────┤
-│  LLM Providers  ·  Memory  ·  Embeddings    │
-│  Claude · OpenAI · Local (llama.cpp)        │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                      Shells                      │
+│   TUI  ·  HTTP API  ·  macOS/iOS  ·  Telegram    │
+├──────────────────────────────────────────────────┤
+│                   Agentic Loop                   │
+│      perceive → plan → act → synthesize          │
+├──────────────┬───────────────┬────────────────────┤
+│    Kernel    │     Tools     │     Loadable       │
+│   (safety)   │ (50+ builtin) │   (WASM skills)    │
+│              │               │                    │
+│   cap gate   │  file, shell  │  web search, fetch │
+│   tripwire   │  memory, git  │  weather, vision   │
+│   ripcord    │  config, node │  tts, scheduler    │
+├──────────────┴───────────────┴────────────────────┤
+│   LLM Providers  ·  Memory  ·  Embeddings        │
+│   Claude · OpenAI · OpenRouter · Fireworks        │
+│   Local (llama.cpp)                               │
+└──────────────────────────────────────────────────┘
 ```
 
 ### Kernel (immutable at runtime)
@@ -94,16 +157,25 @@ WASM skills extend Fawx's capabilities. Each skill runs in a sandboxed WebAssemb
 | Category | Tools |
 |----------|-------|
 | **Files** | `read_file`, `write_file`, `edit_file`, `list_directory`, `search_text` |
-| **Shell** | `run_command`, `exec_background`, `exec_status` |
+| **Shell** | `run_command`, `exec_background`, `exec_status`, `exec_kill` |
 | **Memory** | `memory_write`, `memory_read`, `memory_list`, `memory_delete`, `memory_search` |
-| **Git** | `git_status`, `git_diff`, `git_commit` |
-| **Agent** | `spawn_agent`, `subagent_status`, `self_info`, `current_time` |
+| **Git** | `git_status`, `git_diff`, `git_checkpoint`, `git_branch_create`, `git_branch_switch`, `git_branch_delete`, `git_merge`, `git_revert`, `git_push`, `github_pr_create` |
+| **Transactions** | `begin_transaction`, `stage_file`, `commit_transaction`, `rollback_transaction` |
+| **Scratchpad** | `scratchpad_add`, `scratchpad_update`, `scratchpad_remove`, `scratchpad_list` |
+| **Journal** | `journal_write`, `journal_search`, `recall_session_context` |
+| **Python** | `python_run`, `python_install`, `python_venvs` |
+| **Scheduler** | `cron_add`, `cron_list`, `cron_get`, `cron_remove`, `cron_run`, `cron_history` |
+| **Config** | `config_get`, `config_set`, `fawx_status`, `fawx_restart` |
+| **Browser** | `web_fetch`, `web_search`, `web_screenshot` |
+| **Agent** | `spawn_agent`, `subagent_status`, `decompose`, `self_info`, `kernel_manifest`, `update_session_memory`, `current_time`, `notify` |
 
 ---
 
 ## WASM Skills
 
 Skills are Rust crates compiled to WebAssembly. The recommended local-dev workflow is `fawx skill build <project>`: it builds the project for `wasm32-wasip1`, installs it into `~/.fawx/skills/`, and signs it when a signing key is present.
+
+Shared skill/host contracts live in `fx-protocol`, including structured failure classes and HTTP envelopes used when a WASM skill needs to return more than prose across the ABI boundary.
 
 ```rust
 #[no_mangle]
@@ -150,6 +222,8 @@ Available skills: [web search](https://github.com/fawxai/skill-brave-search) · 
 |----------|------|-----------|----------|----------|
 | Anthropic Claude | API key, setup token | ✓ | ✓ | ✓ |
 | OpenAI (GPT, Codex) | API key, OAuth PKCE | ✓ | ✓ | ✓ |
+| OpenRouter | API key | ✓ | ✓ | — |
+| Fireworks | API key | ✓ | ✓ | ✓ |
 | Local (llama.cpp) | None | ✓ | ✓ | — |
 
 Provider fallback with health tracking: if the primary provider fails, Fawx routes to the next healthy provider automatically.
@@ -184,6 +258,7 @@ model = "claude-sonnet-4-20250514"
 [server]
 host = "127.0.0.1"
 port = 8400
+data_dir = "~/.fawx/data"  # conversations, memory, journals
 
 [memory]
 enabled = true
@@ -203,6 +278,12 @@ Run `fawx setup` for an interactive configuration wizard.
 ```bash
 # Run all tests
 cargo test --workspace
+
+# Run tests for a single crate
+cargo test -p fx-kernel
+
+# Run a specific test by name
+cargo test -p fx-tools test_edit_file
 
 # Lint (zero warnings enforced)
 cargo clippy --workspace --tests -- -D warnings
@@ -231,7 +312,8 @@ fawx/
 │   ├── fx-telemetry/        # Opt-in telemetry with consent persistence
 │   ├── fx-api/              # HTTP API, SSE streaming, handlers
 │   ├── fx-cli/              # Engine binary, headless mode
-│   └── ...                  # 20+ more crates
+│   └── ...                  # ~24 more crates
+├── skills/                  # Built-in WASM skill sources
 ├── app/                     # macOS and iOS native app (Swift)
 ├── docs/                    # Architecture, specs, design decisions
 └── scripts/                 # Build and deployment
@@ -247,6 +329,30 @@ See [docs/roadmap.html](docs/roadmap.html) for the full roadmap. Current priorit
 2. **Attachments** for images, files, and PDFs in the GUI
 3. **OS-level enforcement** via Landlock, seccomp, network namespaces
 4. **Signal flywheel** for earned autonomy through behavioral telemetry
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `Error: no API key configured` | Run `fawx setup` or set the key directly in `~/.fawx/config.toml` under the provider section. |
+| `Address already in use (port 8400)` | Another Fawx instance is running. Stop it with `fawx stop` or change the port in config. |
+| `Skill loaded but status: invalid` | The skill is not signed. Run `fawx keys generate` then `fawx sign <skill>`, and restart the server. |
+| `wasm32-wasip1 target not found` | Run `rustup target add wasm32-wasip1` before building skills. |
+| Config changes not taking effect | Restart the server with `fawx restart` or via the `fawx_restart` tool. |
+
+---
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request. Run the full test and lint suite before opening a PR:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --tests -- -D warnings
+cargo fmt --all -- --check
+```
 
 ---
 

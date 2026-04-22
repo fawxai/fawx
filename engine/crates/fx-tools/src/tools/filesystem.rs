@@ -1,5 +1,6 @@
 use super::{
-    canonicalize_existing_or_parent, parse_args, to_tool_result, validate_path, ToolRegistry,
+    canonicalize_existing_or_parent, parse_args, to_tool_result, tool_failure_from_io,
+    validate_path, ToolFailure, ToolRegistry,
 };
 use crate::tool_trait::{Tool, ToolContext};
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 
 const MAX_RECURSION_DEPTH: usize = 5;
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
+const MAX_SEARCH_CONTEXT_LINES: usize = 5;
 
 pub(super) fn register_tools(registry: &mut ToolRegistry, context: &Arc<ToolContext>) {
     registry.register(ReadFileTool::new(context));
@@ -285,14 +287,20 @@ impl Tool for SearchTextTool {
         ToolDefinition {
             name: self.name().to_string(),
             description:
-                "Search text in files and return file:line matches. Supports `~` to reference the home directory."
+                "Search text in files and return file:line matches. Supports `~` to reference the home directory. Search results are pointers, not full evidence; set `context_lines` when the surrounding code is needed for review or analysis."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
-                    "file_glob": { "type": "string" }
+                    "file_glob": { "type": "string" },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_SEARCH_CONTEXT_LINES,
+                        "description": "Number of surrounding lines to include for each match. Defaults to 0. Use 1-3 for focused code review so file:line pointers are grounded before answering."
+                    }
                 },
                 "required": ["pattern"]
             }),
@@ -373,6 +381,7 @@ struct SearchTextArgs {
     pattern: String,
     path: Option<String>,
     file_glob: Option<String>,
+    context_lines: Option<usize>,
 }
 
 struct EditPlan {
@@ -382,15 +391,18 @@ struct EditPlan {
 }
 
 impl ToolContext {
-    pub(crate) fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ReadFileArgs = parse_args(args)?;
+    pub(crate) fn handle_read_file(&self, args: &serde_json::Value) -> Result<String, ToolFailure> {
+        let parsed: ReadFileArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         let path = self.resolve_read_path(&parsed.path)?;
         let content = self.read_utf8_file(&path, Some(self.config.max_read_size))?;
         render_read_output(&content, parsed.offset, parsed.limit)
     }
 
-    pub(crate) fn handle_write_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: WriteFileArgs = parse_args(args)?;
+    pub(crate) fn handle_write_file(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, ToolFailure> {
+        let parsed: WriteFileArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         let path = self.resolve_tool_path(&parsed.path)?;
         if let Some(message) = self.apply_write_policy(&path, &parsed.content)? {
             return Ok(message);
@@ -403,8 +415,8 @@ impl ToolContext {
         ))
     }
 
-    pub(crate) fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: EditFileArgs = parse_args(args)?;
+    pub(crate) fn handle_edit_file(&self, args: &serde_json::Value) -> Result<String, ToolFailure> {
+        let parsed: EditFileArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         validate_edit_args(&parsed)?;
         let path = self.resolve_tool_path(&parsed.path)?;
         let content = self.read_utf8_file(&path, Some(self.config.max_file_size))?;
@@ -421,8 +433,11 @@ impl ToolContext {
         ))
     }
 
-    pub(crate) fn handle_list_directory(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: ListDirectoryArgs = parse_args(args)?;
+    pub(crate) fn handle_list_directory(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, ToolFailure> {
+        let parsed: ListDirectoryArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         let path = self.resolve_read_path(&parsed.path)?;
         if parsed.recursive.unwrap_or(false) {
             return self.list_recursive(&path, 0);
@@ -430,22 +445,26 @@ impl ToolContext {
         self.list_flat(&path)
     }
 
-    pub(crate) fn handle_search_text(&self, args: &serde_json::Value) -> Result<String, String> {
-        let parsed: SearchTextArgs = parse_args(args)?;
+    pub(crate) fn handle_search_text(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<String, ToolFailure> {
+        let parsed: SearchTextArgs = parse_args(args).map_err(ToolFailure::permanent)?;
         let root = self.resolve_search_root(parsed.path.as_deref())?;
         let mut results = Vec::new();
         self.search_path(&root, &parsed, &mut results)?;
         Ok(results.join("\n"))
     }
 
-    fn jailed_path(&self, requested: &str) -> Result<PathBuf, String> {
+    fn jailed_path(&self, requested: &str) -> Result<PathBuf, ToolFailure> {
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(requested));
         }
-        validate_path(&self.working_dir, requested)
+        let working_dir = self.working_dir();
+        validate_path(&working_dir, requested)
     }
 
-    fn validated_existing_entry(&self, path: &Path) -> Result<Option<PathBuf>, String> {
+    fn validated_existing_entry(&self, path: &Path) -> Result<Option<PathBuf>, ToolFailure> {
         if !self.config.jail_to_working_dir {
             return Ok(Some(path.to_path_buf()));
         }
@@ -453,25 +472,26 @@ impl ToolContext {
             return canonicalize_existing_or_parent(path).map(Some);
         }
         let requested = path.to_string_lossy().to_string();
-        match validate_path(&self.working_dir, &requested) {
+        let working_dir = self.working_dir();
+        match validate_path(&working_dir, &requested) {
             Ok(validated) => Ok(Some(validated)),
             Err(_) => Ok(None),
         }
     }
 
-    fn resolve_tool_path(&self, requested: &str) -> Result<PathBuf, String> {
+    fn resolve_tool_path(&self, requested: &str) -> Result<PathBuf, ToolFailure> {
         let expanded = expand_tilde(requested);
         let expanded_str = expanded
             .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("home directory path is not valid UTF-8"))?;
         self.jailed_path(expanded_str)
     }
 
-    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf, String> {
+    fn resolve_read_path(&self, requested: &str) -> Result<PathBuf, ToolFailure> {
         let expanded = expand_tilde(requested);
         let expanded_str = expanded
             .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("home directory path is not valid UTF-8"))?;
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(expanded_str));
         }
@@ -481,41 +501,48 @@ impl ToolContext {
         self.jailed_path(expanded_str)
     }
 
-    fn resolve_observation_path(&self, requested: &str) -> Result<PathBuf, String> {
+    fn resolve_observation_path(&self, requested: &str) -> Result<PathBuf, ToolFailure> {
         let requested_path = Path::new(requested);
+        let working_dir = self.working_dir();
         let candidate = if requested_path.is_absolute() {
             requested_path.to_path_buf()
         } else {
-            self.working_dir.join(requested_path)
+            working_dir.join(requested_path)
         };
         canonicalize_existing_or_parent(&candidate)
     }
 
-    fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, String> {
-        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    fn read_utf8_file(&self, path: &Path, size_limit: Option<u64>) -> Result<String, ToolFailure> {
+        let metadata = fs::metadata(path).map_err(tool_failure_from_io)?;
         if size_limit.is_some_and(|limit| metadata.len() > limit) {
-            return Err("file exceeds maximum allowed size".to_string());
+            return Err(ToolFailure::permanent("file exceeds maximum allowed size"));
         }
-        let bytes = fs::read(path).map_err(|error| error.to_string())?;
-        String::from_utf8(bytes).map_err(|_| "file appears to be binary".to_string())
+        let bytes = fs::read(path).map_err(tool_failure_from_io)?;
+        String::from_utf8(bytes).map_err(|_| ToolFailure::permanent("file appears to be binary"))
     }
 
-    fn apply_write_policy(&self, _path: &Path, content: &str) -> Result<Option<String>, String> {
+    fn apply_write_policy(
+        &self,
+        _path: &Path,
+        content: &str,
+    ) -> Result<Option<String>, ToolFailure> {
         self.check_max_file_size(content.len())?;
         Ok(None)
     }
 
-    fn check_max_file_size(&self, len: usize) -> Result<(), String> {
+    fn check_max_file_size(&self, len: usize) -> Result<(), ToolFailure> {
         if (len as u64) > self.config.max_file_size {
-            return Err("content exceeds maximum allowed size".to_string());
+            return Err(ToolFailure::permanent(
+                "content exceeds maximum allowed size",
+            ));
         }
         Ok(())
     }
 
-    fn list_flat(&self, path: &Path) -> Result<String, String> {
+    fn list_flat(&self, path: &Path) -> Result<String, ToolFailure> {
         let mut lines = Vec::new();
-        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(path).map_err(tool_failure_from_io)? {
+            let entry = entry.map_err(tool_failure_from_io)?;
             let kind = entry_kind(&entry.path())?;
             lines.push(format!("[{kind}] {}", entry.file_name().to_string_lossy()));
         }
@@ -523,13 +550,13 @@ impl ToolContext {
         Ok(lines.join("\n"))
     }
 
-    fn list_recursive(&self, path: &Path, depth: usize) -> Result<String, String> {
+    fn list_recursive(&self, path: &Path, depth: usize) -> Result<String, ToolFailure> {
         if depth > MAX_RECURSION_DEPTH {
             return Ok(String::new());
         }
         let mut lines = Vec::new();
-        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(path).map_err(tool_failure_from_io)? {
+            let entry = entry.map_err(tool_failure_from_io)?;
             let entry_path = entry.path();
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 if self.is_ignored_directory(name) && entry_path.is_dir() {
@@ -559,20 +586,21 @@ impl ToolContext {
         self.config.search_exclude.iter().any(|item| item == name)
     }
 
-    fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, String> {
-        let default_root = self.working_dir.to_string_lossy().to_string();
+    fn resolve_search_root(&self, requested: Option<&str>) -> Result<PathBuf, ToolFailure> {
+        let working_dir = self.working_dir();
+        let default_root = working_dir.to_string_lossy().to_string();
         let requested = requested.unwrap_or(&default_root);
         let expanded = expand_tilde(requested);
         let expanded_str = expanded
             .to_str()
-            .ok_or_else(|| "home directory path is not valid UTF-8".to_string())?;
+            .ok_or_else(|| ToolFailure::permanent("home directory path is not valid UTF-8"))?;
         if !self.config.jail_to_working_dir {
             return canonicalize_existing_or_parent(Path::new(expanded_str));
         }
         if self.config.allow_outside_workspace_reads {
             return self.resolve_observation_path(expanded_str);
         }
-        validate_path(&self.working_dir, expanded_str)
+        validate_path(&working_dir, expanded_str)
     }
 
     fn search_path(
@@ -580,7 +608,7 @@ impl ToolContext {
         root: &Path,
         args: &SearchTextArgs,
         out: &mut Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ToolFailure> {
         if out.len() >= MAX_SEARCH_MATCHES {
             return Ok(());
         }
@@ -597,12 +625,12 @@ impl ToolContext {
         dir: &Path,
         args: &SearchTextArgs,
         out: &mut Vec<String>,
-    ) -> Result<(), String> {
-        for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+    ) -> Result<(), ToolFailure> {
+        for entry in fs::read_dir(dir).map_err(tool_failure_from_io)? {
             if out.len() >= MAX_SEARCH_MATCHES {
                 break;
             }
-            let entry_path = entry.map_err(|error| error.to_string())?.path();
+            let entry_path = entry.map_err(tool_failure_from_io)?.path();
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 if self.is_ignored_directory(name) && entry_path.is_dir() {
                     continue;
@@ -625,48 +653,76 @@ impl ToolContext {
         file: &Path,
         args: &SearchTextArgs,
         out: &mut Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ToolFailure> {
         if !matches_glob(file, args.file_glob.as_deref()) {
             return Ok(());
         }
-        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(file).map_err(tool_failure_from_io)?;
         if metadata.len() > self.config.max_read_size {
             return Ok(());
         }
         let mut bytes = Vec::new();
-        let mut reader = fs::File::open(file).map_err(|error| error.to_string())?;
+        let mut reader = fs::File::open(file).map_err(tool_failure_from_io)?;
         reader
             .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
+            .map_err(tool_failure_from_io)?;
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(_) => return Ok(()),
         };
-        for (index, line) in text.lines().enumerate() {
+        let context_lines = args
+            .context_lines
+            .unwrap_or_default()
+            .min(MAX_SEARCH_CONTEXT_LINES);
+        let lines = text.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
             if out.len() >= MAX_SEARCH_MATCHES {
                 break;
             }
             if line.contains(&args.pattern) {
-                out.push(format!("{}:{}:{}", file.display(), index + 1, line));
+                out.push(render_search_match(file, &lines, index, context_lines));
             }
         }
         Ok(())
     }
 }
 
-fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+fn render_search_match(file: &Path, lines: &[&str], index: usize, context_lines: usize) -> String {
+    let line_number = index + 1;
+    let matched_line = lines.get(index).copied().unwrap_or_default();
+    let mut rendered = format!("{}:{}:{}", file.display(), line_number, matched_line);
+    if context_lines == 0 {
+        return rendered;
     }
-    fs::write(path, content.as_bytes()).map_err(|error| error.to_string())
+
+    let start = index.saturating_sub(context_lines);
+    let end = (index + context_lines + 1).min(lines.len());
+    for (line_index, line) in lines[start..end].iter().enumerate() {
+        let actual_line_number = start + line_index + 1;
+        let marker = if actual_line_number == line_number {
+            ">"
+        } else {
+            " "
+        };
+        rendered.push('\n');
+        rendered.push_str(&format!("{marker} {actual_line_number} | {line}"));
+    }
+    rendered
 }
 
-fn validate_edit_args(args: &EditFileArgs) -> Result<(), String> {
+fn write_text_file(path: &Path, content: &str) -> Result<(), ToolFailure> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(tool_failure_from_io)?;
+    }
+    fs::write(path, content.as_bytes()).map_err(tool_failure_from_io)
+}
+
+fn validate_edit_args(args: &EditFileArgs) -> Result<(), ToolFailure> {
     if args.old_text.is_empty() {
-        return Err("old_text must not be empty".to_string());
+        return Err(ToolFailure::permanent("old_text must not be empty"));
     }
     if args.old_text == args.new_text {
-        return Err("old_text and new_text must differ".to_string());
+        return Err(ToolFailure::permanent("old_text and new_text must differ"));
     }
     Ok(())
 }
@@ -675,7 +731,7 @@ fn render_read_output(
     content: &str,
     offset: Option<usize>,
     limit: Option<usize>,
-) -> Result<String, String> {
+) -> Result<String, ToolFailure> {
     validate_line_window(offset, limit)?;
     if offset.is_none() && limit.is_none() {
         return Ok(content.to_string());
@@ -696,12 +752,12 @@ fn render_read_output(
     ))
 }
 
-fn validate_line_window(offset: Option<usize>, limit: Option<usize>) -> Result<(), String> {
+fn validate_line_window(offset: Option<usize>, limit: Option<usize>) -> Result<(), ToolFailure> {
     if offset == Some(0) {
-        return Err("offset must be at least 1".to_string());
+        return Err(ToolFailure::permanent("offset must be at least 1"));
     }
     if limit == Some(0) {
-        return Err("limit must be at least 1".to_string());
+        return Err(ToolFailure::permanent("limit must be at least 1"));
     }
     Ok(())
 }
@@ -743,25 +799,25 @@ fn plan_exact_edit(
     content: &str,
     old_text: &str,
     new_text: &str,
-) -> Result<EditPlan, String> {
+) -> Result<EditPlan, ToolFailure> {
     let matches = count_exact_matches(content, old_text);
     if matches == 0 {
-        return Err(format!(
+        return Err(ToolFailure::permanent(format!(
             "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
             path.display()
-        ));
+        )));
     }
     if matches > 1 {
-        return Err(format!(
+        return Err(ToolFailure::permanent(format!(
             "Found {matches} matches for old_text in {}. Please provide more context to uniquely identify the target.",
             path.display()
-        ));
+        )));
     }
     let start = content.find(old_text).ok_or_else(|| {
-        format!(
+        ToolFailure::permanent(format!(
             "Could not find the exact text in {}. The old_text must match exactly including all whitespace and newlines.",
             path.display()
-        )
+        ))
     })?;
     let (start_line, end_line) = line_span(content, start, old_text);
     Ok(EditPlan {
@@ -801,8 +857,8 @@ fn replace_exact_range(content: &str, start: usize, old_text: &str, new_text: &s
     updated
 }
 
-fn entry_kind(path: &Path) -> Result<&'static str, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+fn entry_kind(path: &Path) -> Result<&'static str, ToolFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(tool_failure_from_io)?;
     let kind = if metadata.file_type().is_dir() {
         "dir"
     } else if metadata.file_type().is_symlink() {

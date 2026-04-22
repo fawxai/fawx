@@ -1,4 +1,6 @@
-use crate::act::{ContinuationToolScope, ProceedUnderConstraints, TurnCommitment};
+use crate::act::{
+    ContinuationToolScope, FinalizeResponse, ProceedUnderConstraints, TurnCommitment,
+};
 use crate::decide::Decision;
 
 pub(super) fn commitment_tool_scope(
@@ -8,6 +10,7 @@ pub(super) fn commitment_tool_scope(
         Some(TurnCommitment::ProceedUnderConstraints(commitment)) => {
             commitment.allowed_tools.clone()
         }
+        Some(TurnCommitment::FinalizeResponse(_)) => Some(ContinuationToolScope::NoTools),
         Some(TurnCommitment::NeedsDirection(_)) | None => None,
     }
 }
@@ -27,6 +30,12 @@ pub(super) fn turn_commitment_metadata(commitment: &TurnCommitment) -> serde_jso
             "question": commitment.question,
             "blocking_choice": commitment.blocking_choice,
         }),
+        TurnCommitment::FinalizeResponse(commitment) => serde_json::json!({
+            "variant": "finalize_response",
+            "reason": commitment.reason,
+            "success_target": commitment.success_target,
+            "allowed_tools": render_tool_scope_label(&ContinuationToolScope::NoTools),
+        }),
     }
 }
 
@@ -38,7 +47,13 @@ pub(super) fn render_turn_commitment_directive(commitment: &TurnCommitment) -> S
             );
             directive.push_str(&format!("Committed goal: {}\n", commitment.goal));
             directive.push_str(
-                "Required behavior:\n- Continue with concrete action instead of reopening broad research or re-verifying already-established facts.\n- Stay within the committed tool surface.\n- Ask the user one concise blocking question only if you cannot proceed within these constraints.\n",
+                "Required behavior:\n- Continue with concrete action instead of reopening broad research or re-verifying already-established facts.\n",
+            );
+            if commitment.allowed_tools.is_some() {
+                directive.push_str("- Stay within the committed tool surface.\n");
+            }
+            directive.push_str(
+                "- Ask the user one concise blocking question only if you cannot proceed within these constraints.\n",
             );
             if let Some(scope) = &commitment.allowed_tools {
                 directive.push_str(&format!(
@@ -71,12 +86,17 @@ pub(super) fn render_turn_commitment_directive(commitment: &TurnCommitment) -> S
             "A blocking decision remains for this turn.\nBlocking choice: {}\nQuestion to ask: {}\nAsk exactly one concise question and stop after asking it. Do not continue broad research or implementation until the user answers.",
             commitment.blocking_choice, commitment.question
         ),
+        TurnCommitment::FinalizeResponse(commitment) => format!(
+            "You are in the final-response phase for this turn.\nReason: {}\nRequired behavior:\n- Do not call tools; no tools are available in this phase.\n- Answer directly from the gathered evidence and prior tool results.\n- Produce one consolidated final response.\nSuccess target: {}",
+            commitment.reason, commitment.success_target
+        ),
     }
 }
 
 pub(super) fn render_tool_scope_label(scope: &ContinuationToolScope) -> String {
     match scope {
         ContinuationToolScope::Full => "full tool surface".to_string(),
+        ContinuationToolScope::NoTools => "no tools; final response only".to_string(),
         ContinuationToolScope::MutationOnly => {
             "mutation-only tool surface (side-effect-capable tools only)".to_string()
         }
@@ -119,7 +139,10 @@ fn decision_execution_goal(decision: &Decision) -> String {
 fn constrained_execution_success_target(scope: &ContinuationToolScope) -> String {
     match scope {
         ContinuationToolScope::Full => {
-            "Continue making concrete progress on the active task without reopening broad research."
+            "Use the current tool evidence to either complete the user's request or take the next concrete execution step. Do not stop at a progress-only summary.".to_string()
+        }
+        ContinuationToolScope::NoTools => {
+            "Produce the final response from gathered evidence without calling any tools."
                 .to_string()
         }
         ContinuationToolScope::MutationOnly => {
@@ -137,16 +160,20 @@ pub(super) fn tool_continuation_turn_commitment(
     decision: &Decision,
     next_tool_scope: Option<&ContinuationToolScope>,
 ) -> Option<TurnCommitment> {
-    let allowed_tools = next_tool_scope
+    let scope = next_tool_scope
         .cloned()
-        .filter(|scope| !matches!(scope, ContinuationToolScope::Full))?;
+        .unwrap_or(ContinuationToolScope::Full);
+    let allowed_tools = match &scope {
+        ContinuationToolScope::Full => None,
+        _ => Some(scope.clone()),
+    };
     Some(TurnCommitment::ProceedUnderConstraints(
         ProceedUnderConstraints {
             goal: decision_execution_goal(decision),
-            success_target: Some(constrained_execution_success_target(&allowed_tools)),
+            success_target: Some(constrained_execution_success_target(&scope)),
             unsupported_items: Vec::new(),
             assumptions: Vec::new(),
-            allowed_tools: Some(allowed_tools),
+            allowed_tools,
         },
     ))
 }
@@ -164,6 +191,16 @@ pub(super) fn tool_continuation_artifact_write_target(
             Some(requested_artifact_target.to_string())
         }
         Some(ContinuationToolScope::Only(_)) => None,
-        Some(ContinuationToolScope::Full) | None => None,
+        Some(ContinuationToolScope::Full | ContinuationToolScope::NoTools) | None => None,
     }
+}
+
+pub(super) fn final_response_turn_commitment(
+    reason: impl Into<String>,
+    success_target: impl Into<String>,
+) -> TurnCommitment {
+    TurnCommitment::FinalizeResponse(FinalizeResponse {
+        reason: reason.into(),
+        success_target: success_target.into(),
+    })
 }

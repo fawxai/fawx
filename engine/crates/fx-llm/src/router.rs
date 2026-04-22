@@ -1,14 +1,15 @@
 //! LLM routing logic for both legacy fallback strategies and model-provider routing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::join_all;
 use fx_core::error::LlmError;
+use fx_core::signals::{LoopStep, Signal, SignalKind};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::provider::{CompletionStream, LlmProvider as CompletionProvider};
+use crate::provider::{CompletionStream, DiscoveredModel, LlmProvider as CompletionProvider};
 use crate::streaming::StreamCallback;
 use crate::types::{CompletionRequest, CompletionResponse, LlmError as ProviderLlmError};
 use crate::LlmProvider;
@@ -18,8 +19,15 @@ use crate::LlmProvider;
 pub struct ModelRouter {
     providers: HashMap<String, Arc<dyn CompletionProvider>>,
     active_model: Option<String>,
-    model_to_provider: HashMap<String, String>,
+    models: HashMap<String, RegisteredModel>,
     provider_auth_methods: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegisteredModel {
+    provider_name: String,
+    display_name: Option<String>,
+    recommended: bool,
 }
 
 impl ModelRouter {
@@ -45,12 +53,19 @@ impl ModelRouter {
         let auth_method = auth_method.into();
         let supported_models = provider.supported_models();
 
-        for model in supported_models {
-            self.model_to_provider.insert(model, provider_name.clone());
-        }
-
         self.provider_auth_methods
             .insert(provider_name.clone(), auth_method);
+        self.replace_provider_models(
+            &provider_name,
+            supported_models
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect(),
+        );
         self.providers.insert(provider_name, provider);
     }
 
@@ -66,12 +81,12 @@ impl ModelRouter {
     }
 
     fn resolve_model(&self, model: &str) -> Result<String, RouterError> {
-        if self.model_to_provider.contains_key(model) {
+        if self.models.contains_key(model) {
             return Ok(model.to_string());
         }
 
         let mut prefix_matches = self
-            .model_to_provider
+            .models
             .keys()
             .filter(|candidate| candidate.starts_with(model));
 
@@ -93,7 +108,9 @@ impl ModelRouter {
 
     /// Return the provider for a model identifier, if registered.
     pub fn provider_for_model(&self, model: &str) -> Option<&str> {
-        self.model_to_provider.get(model).map(String::as_str)
+        self.models
+            .get(model)
+            .map(|model| model.provider_name.as_str())
     }
 
     /// Return the provider for the active model, if any.
@@ -120,16 +137,27 @@ impl ModelRouter {
 
     /// List all available models across all registered providers.
     pub fn available_models(&self) -> Vec<ModelInfo> {
-        build_model_infos(
-            &self.model_to_provider,
-            &self.providers,
-            &self.provider_auth_methods,
-        )
+        build_model_infos(&self.models, &self.providers, &self.provider_auth_methods)
     }
 
     /// Fetch available models from all registered providers dynamically.
     pub async fn fetch_available_models(&self) -> Vec<ModelInfo> {
         fetch_available_models_from_catalog(self.provider_catalog()).await
+    }
+
+    pub fn replace_provider_models(&mut self, provider_name: &str, models: Vec<DiscoveredModel>) {
+        self.models
+            .retain(|_, model| model.provider_name != provider_name);
+        for model in models {
+            self.models.insert(
+                model.id,
+                RegisteredModel {
+                    provider_name: provider_name.to_string(),
+                    display_name: model.display_name,
+                    recommended: model.recommended,
+                },
+            );
+        }
     }
 
     pub fn context_window_for_model(&self, model: &str) -> Result<usize, RouterError> {
@@ -162,9 +190,16 @@ impl ModelRouter {
             .map_err(|error| ProviderLlmError::Config(error.to_string()))?;
 
         request.model = resolved_model;
-        if !provider.capabilities().supports_temperature {
+        let capabilities = provider.capabilities();
+        if !capabilities.supports_temperature {
             request.temperature = None;
         }
+        request.prompt_cache = capabilities
+            .prompt_cache
+            .normalize_policy(request.prompt_cache);
+        request.cache_affinity = capabilities
+            .prompt_cache_affinity
+            .normalize_affinity(request.cache_affinity);
         Ok((provider, request))
     }
 
@@ -213,10 +248,11 @@ impl ModelRouter {
     ) -> Result<(String, Arc<dyn CompletionProvider>), RouterError> {
         let resolved_model = self.resolve_model(model)?;
         let provider_name = self
-            .model_to_provider
+            .models
             .get(&resolved_model)
+            .map(|model| model.provider_name.clone())
             .ok_or_else(|| RouterError::ModelNotFound(resolved_model.clone()))?;
-        let provider = self.providers.get(provider_name).cloned().ok_or_else(|| {
+        let provider = self.providers.get(&provider_name).cloned().ok_or_else(|| {
             RouterError::ProviderError(ProviderLlmError::Provider(format!(
                 "provider '{provider_name}' was not registered"
             )))
@@ -236,27 +272,39 @@ pub async fn fetch_available_models_from_catalog(
     catalog: Vec<ProviderCatalogEntry>,
 ) -> Vec<ModelInfo> {
     let fetches = catalog.into_iter().map(|entry| async move {
-        (
-            entry.provider_name,
-            entry.auth_method,
-            fetch_provider_models(entry.provider.as_ref()).await,
-        )
+        let provider = entry.provider;
+        let models = fetch_provider_models(provider.as_ref()).await;
+        (entry.provider_name, entry.auth_method, provider, models)
     });
     let mut model_entries = BTreeMap::new();
 
-    for (provider_name, auth_method, model_ids) in join_all(fetches).await {
-        add_provider_models(&mut model_entries, &provider_name, &auth_method, model_ids);
+    for (provider_name, auth_method, provider, models) in join_all(fetches).await {
+        add_provider_models(
+            &mut model_entries,
+            &provider_name,
+            &auth_method,
+            provider.as_ref(),
+            models,
+        );
     }
 
     model_entries.into_values().collect()
 }
 
-async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<String> {
-    match provider.list_models().await {
+async fn fetch_provider_models(provider: &dyn CompletionProvider) -> Vec<DiscoveredModel> {
+    match provider.list_discovered_models().await {
         Ok(models) => models,
         Err(error) => {
-            warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using static fallback");
-            provider.supported_models()
+            warn!(provider = provider.name(), error = %error, "failed to fetch provider models; using registered fallback");
+            provider
+                .supported_models()
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    id,
+                    display_name: None,
+                    recommended: true,
+                })
+                .collect()
         }
     }
 }
@@ -265,30 +313,59 @@ fn add_provider_models(
     model_entries: &mut BTreeMap<String, ModelInfo>,
     provider_name: &str,
     auth_method: &str,
-    model_ids: Vec<String>,
+    provider: &dyn CompletionProvider,
+    models: Vec<DiscoveredModel>,
 ) {
-    for model_id in model_ids {
+    for model in models {
+        let thinking_levels = provider
+            .thinking_levels(&model.id)
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect();
         model_entries
-            .entry(model_id.clone())
+            .entry(model.id.clone())
             .or_insert_with(|| ModelInfo {
-                model_id,
+                model_id: model.id,
                 provider_name: provider_name.to_string(),
                 auth_method: auth_method.to_string(),
+                display_name: model.display_name,
+                recommended: model.recommended,
+                thinking_levels,
             });
     }
 }
 
 fn build_model_infos(
-    model_to_provider: &HashMap<String, String>,
+    models_by_id: &HashMap<String, RegisteredModel>,
     providers: &HashMap<String, Arc<dyn CompletionProvider>>,
     provider_auth_methods: &HashMap<String, String>,
 ) -> Vec<ModelInfo> {
-    let mut models = model_to_provider
+    let mut models = models_by_id
         .iter()
-        .map(|(model_id, provider_name)| ModelInfo {
-            model_id: model_id.clone(),
-            provider_name: provider_name.clone(),
-            auth_method: provider_auth_method(providers, provider_auth_methods, provider_name),
+        .map(|(model_id, registered_model)| {
+            let thinking_levels = providers
+                .get(&registered_model.provider_name)
+                .map(|provider| {
+                    provider
+                        .thinking_levels(model_id)
+                        .iter()
+                        .map(|level| (*level).to_string())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["off".to_string()]);
+
+            ModelInfo {
+                model_id: model_id.clone(),
+                provider_name: registered_model.provider_name.clone(),
+                auth_method: provider_auth_method(
+                    providers,
+                    provider_auth_methods,
+                    &registered_model.provider_name,
+                ),
+                display_name: registered_model.display_name.clone(),
+                recommended: registered_model.recommended,
+                thinking_levels,
+            }
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
@@ -304,6 +381,12 @@ pub struct ModelInfo {
     pub provider_name: String,
     /// Auth method category (`subscription`, `api_key`, etc.).
     pub auth_method: String,
+    /// Optional provider-supplied display name.
+    pub display_name: Option<String>,
+    /// Whether the provider marks this model as recommended.
+    pub recommended: bool,
+    /// User-facing thinking levels supported by this concrete model.
+    pub thinking_levels: Vec<String>,
 }
 
 /// Errors produced by model routing operations.
@@ -366,6 +449,7 @@ pub enum RoutingStrategy {
 pub struct LlmRouter {
     local: Option<Box<dyn LlmProvider>>,
     cloud: Option<Box<dyn LlmProvider>>,
+    fallback_signals: Mutex<Vec<Signal>>,
 }
 
 impl LlmRouter {
@@ -386,7 +470,11 @@ impl LlmRouter {
                 "LlmRouter requires at least one provider".to_string(),
             ));
         }
-        Ok(Self { local, cloud })
+        Ok(Self {
+            local,
+            cloud,
+            fallback_signals: Mutex::new(Vec::new()),
+        })
     }
 
     /// Generate completion using the specified routing strategy.
@@ -412,6 +500,16 @@ impl LlmRouter {
         }
     }
 
+    #[must_use = "drained fallback signals are cleared and will be lost if ignored"]
+    pub fn take_fallback_signals(&self) -> Vec<Signal> {
+        std::mem::take(
+            &mut *self
+                .fallback_signals
+                .lock()
+                .expect("llm router fallback_signals lock"),
+        )
+    }
+
     /// Try local provider first, fall back to cloud.
     async fn try_local_then_cloud(
         &self,
@@ -427,7 +525,15 @@ impl LlmRouter {
                 Err(e) => {
                     warn!("Local generation failed: {}, trying cloud fallback", e);
                     if let Some(ref cloud) = self.cloud {
-                        cloud.generate(prompt, max_tokens).await
+                        let result = cloud.generate(prompt, max_tokens).await?;
+                        self.emit_provider_fallback_signal(
+                            "local",
+                            local.model_name(),
+                            "cloud",
+                            cloud.model_name(),
+                            e.to_string(),
+                        );
+                        Ok(result)
                     } else {
                         Err(LlmError::Inference(
                             "Local failed and no cloud fallback available".to_string(),
@@ -458,7 +564,15 @@ impl LlmRouter {
                 Err(e) => {
                     warn!("Cloud generation failed: {}, trying local fallback", e);
                     if let Some(ref local) = self.local {
-                        local.generate(prompt, max_tokens).await
+                        let result = local.generate(prompt, max_tokens).await?;
+                        self.emit_provider_fallback_signal(
+                            "cloud",
+                            cloud.model_name(),
+                            "local",
+                            local.model_name(),
+                            e.to_string(),
+                        );
+                        Ok(result)
                     } else {
                         Err(LlmError::Inference(
                             "Cloud failed and no local fallback available".to_string(),
@@ -502,6 +616,33 @@ impl LlmRouter {
             count += 1;
         }
         count
+    }
+
+    fn emit_provider_fallback_signal(
+        &self,
+        from_provider: &str,
+        from_model: &str,
+        to_provider: &str,
+        to_model: &str,
+        reason: String,
+    ) {
+        let signal = Signal::new(
+            LoopStep::Act,
+            SignalKind::ProviderFallback,
+            "router fell back to a secondary provider",
+            serde_json::json!({
+                "from_provider": from_provider,
+                "from_model": from_model,
+                "to_provider": to_provider,
+                "to_model": to_model,
+                "reason": reason,
+            }),
+            Signal::now_ms(),
+        );
+        self.fallback_signals
+            .lock()
+            .expect("llm router fallback_signals lock")
+            .push(signal);
     }
 }
 
@@ -591,6 +732,15 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cloud response");
+        let signals = router.take_fallback_signals();
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.kind, SignalKind::ProviderFallback);
+        assert_eq!(signal.metadata["from_provider"], "local");
+        assert_eq!(signal.metadata["from_model"], "local");
+        assert_eq!(signal.metadata["to_provider"], "cloud");
+        assert_eq!(signal.metadata["to_model"], "cloud");
+        assert_eq!(signal.metadata["reason"], "Inference failed: local failed");
     }
 
     #[tokio::test]
@@ -605,6 +755,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "cloud response");
+        assert!(router.take_fallback_signals().is_empty());
     }
 
     #[tokio::test]
@@ -619,6 +770,7 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "local response");
+        assert!(router.take_fallback_signals().is_empty());
     }
 
     #[tokio::test]
@@ -632,6 +784,36 @@ mod tests {
 
         // LocalOnly with no local provider should fail
         assert!(result.is_err());
+        assert!(router.take_fallback_signals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_local_first_primary_success_emits_no_fallback_signal() {
+        let local = Box::new(MockProvider::new_success("local", "local response"));
+        let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
+
+        let router = LlmRouter::new(Some(local), Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalFirst)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "local response");
+        assert!(router.take_fallback_signals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_local_first_without_local_uses_cloud_without_fallback_signal() {
+        let cloud = Box::new(MockProvider::new_success("cloud", "cloud response"));
+
+        let router = LlmRouter::new(None, Some(cloud)).unwrap();
+        let result = router
+            .generate("test", 512, RoutingStrategy::LocalFirst)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "cloud response");
+        assert!(router.take_fallback_signals().is_empty());
     }
 
     #[tokio::test]
@@ -667,9 +849,13 @@ mod model_router_tests {
     use std::sync::{Arc, Mutex};
 
     use crate::provider::{
-        CompletionStream, LlmProvider as CompletionProvider, ProviderCapabilities,
+        CompletionStream, LlmProvider as CompletionProvider, PromptCacheAffinityCapability,
+        PromptCacheCapability, ProviderCapabilities,
     };
-    use crate::types::{CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message};
+    use crate::types::{
+        CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message,
+        PromptCacheAffinity, PromptCachePolicy,
+    };
 
     #[derive(Debug)]
     struct MockCompletionProvider {
@@ -682,6 +868,8 @@ mod model_router_tests {
         thinking_levels: &'static [&'static str],
         captured_models: Arc<Mutex<Vec<String>>>,
         captured_temperatures: Arc<Mutex<Vec<Option<f32>>>>,
+        captured_prompt_caches: Option<Arc<Mutex<Vec<PromptCachePolicy>>>>,
+        captured_cache_affinities: Option<Arc<Mutex<Vec<Option<PromptCacheAffinity>>>>>,
         capabilities: ProviderCapabilities,
         list_models_delay_ms: u64,
     }
@@ -706,6 +894,8 @@ mod model_router_tests {
                 thinking_levels: &["off"],
                 captured_models,
                 captured_temperatures,
+                captured_prompt_caches: None,
+                captured_cache_affinities: None,
                 capabilities,
                 list_models_delay_ms: 0,
             }
@@ -735,6 +925,22 @@ mod model_router_tests {
             self.thinking_levels = thinking_levels;
             self
         }
+
+        fn with_prompt_cache_capture(
+            mut self,
+            captured_prompt_caches: Arc<Mutex<Vec<PromptCachePolicy>>>,
+        ) -> Self {
+            self.captured_prompt_caches = Some(captured_prompt_caches);
+            self
+        }
+
+        fn with_cache_affinity_capture(
+            mut self,
+            captured_cache_affinities: Arc<Mutex<Vec<Option<PromptCacheAffinity>>>>,
+        ) -> Self {
+            self.captured_cache_affinities = Some(captured_cache_affinities);
+            self
+        }
     }
 
     #[async_trait]
@@ -748,6 +954,18 @@ mod model_router_tests {
                 .lock()
                 .unwrap()
                 .push(request.temperature);
+            if let Some(captured_prompt_caches) = &self.captured_prompt_caches {
+                captured_prompt_caches
+                    .lock()
+                    .unwrap()
+                    .push(request.prompt_cache);
+            }
+            if let Some(captured_cache_affinities) = &self.captured_cache_affinities {
+                captured_cache_affinities
+                    .lock()
+                    .unwrap()
+                    .push(request.cache_affinity);
+            }
 
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -768,6 +986,18 @@ mod model_router_tests {
                 .lock()
                 .unwrap()
                 .push(request.temperature);
+            if let Some(captured_prompt_caches) = &self.captured_prompt_caches {
+                captured_prompt_caches
+                    .lock()
+                    .unwrap()
+                    .push(request.prompt_cache);
+            }
+            if let Some(captured_cache_affinities) = &self.captured_cache_affinities {
+                captured_cache_affinities
+                    .lock()
+                    .unwrap()
+                    .push(request.cache_affinity);
+            }
 
             Ok(Box::pin(stream::empty()))
         }
@@ -813,11 +1043,9 @@ mod model_router_tests {
         CompletionRequest {
             model: model.to_string(),
             messages: vec![Message::user("hello")],
-            tools: Vec::new(),
             temperature,
             max_tokens: Some(256),
-            system_prompt: None,
-            thinking: None,
+            ..Default::default()
         }
     }
 
@@ -834,6 +1062,8 @@ mod model_router_tests {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
+            prompt_cache: Default::default(),
+            prompt_cache_affinity: Default::default(),
         }
     }
 
@@ -1274,6 +1504,8 @@ mod model_router_tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             },
         );
 
@@ -1291,6 +1523,135 @@ mod model_router_tests {
     }
 
     #[tokio::test]
+    async fn complete_strips_prompt_cache_when_provider_does_not_support_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let prompt_caches = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-4o"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_prompt_cache_capture(Arc::clone(&prompt_caches));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-4o").unwrap();
+        let mut request = request_with_model("ignored");
+        request.prompt_cache = PromptCachePolicy::Ephemeral;
+
+        let result = router.complete(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            prompt_caches.lock().unwrap().clone(),
+            vec![PromptCachePolicy::Disabled]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_prompt_cache_when_provider_supports_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let prompt_caches = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "anthropic",
+            vec!["claude-sonnet-4-5"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            ProviderCapabilities {
+                supports_temperature: true,
+                requires_streaming: false,
+                prompt_cache: PromptCacheCapability::AnthropicEphemeral,
+                prompt_cache_affinity: Default::default(),
+            },
+        )
+        .with_prompt_cache_capture(Arc::clone(&prompt_caches));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("claude-sonnet-4-5").unwrap();
+        let mut request = request_with_model("ignored");
+        request.prompt_cache = PromptCachePolicy::Ephemeral;
+
+        let result = router.complete(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            prompt_caches.lock().unwrap().clone(),
+            vec![PromptCachePolicy::Ephemeral]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_strips_cache_affinity_when_provider_does_not_support_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let cache_affinities = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "generic",
+            vec!["model"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            default_capabilities(),
+        )
+        .with_cache_affinity_capture(Arc::clone(&cache_affinities));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("model").unwrap();
+        let mut request = request_with_model("ignored");
+        request.cache_affinity = PromptCacheAffinity::new("sess-123");
+
+        let result = router.complete(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(cache_affinities.lock().unwrap().clone(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_cache_affinity_when_provider_supports_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let cache_affinities = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockCompletionProvider::new(
+            "openai",
+            vec!["gpt-5.4"],
+            "ok",
+            Arc::clone(&calls),
+            Arc::clone(&temperatures),
+            ProviderCapabilities {
+                supports_temperature: true,
+                requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: PromptCacheAffinityCapability::OpenAiPromptCacheKey,
+            },
+        )
+        .with_cache_affinity_capture(Arc::clone(&cache_affinities));
+
+        let mut router = ModelRouter::new();
+        router.register_provider(Box::new(provider));
+        router.set_active("gpt-5.4").unwrap();
+        let mut request = request_with_model("ignored");
+        request.cache_affinity = PromptCacheAffinity::new("sess-123");
+
+        let result = router.complete(request).await;
+
+        assert!(result.is_ok());
+        let captured = cache_affinities.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].as_ref().map(PromptCacheAffinity::as_str),
+            Some("sess-123")
+        );
+    }
+
+    #[tokio::test]
     async fn complete_stream_strips_temperature_when_provider_does_not_support_it() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let temperatures = Arc::new(Mutex::new(Vec::new()));
@@ -1303,6 +1664,8 @@ mod model_router_tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             },
         );
 
@@ -1363,6 +1726,8 @@ mod thinking_level_tests {
             ProviderCapabilities {
                 supports_temperature: false,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }

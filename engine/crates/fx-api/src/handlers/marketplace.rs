@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use crate::skill_manifests::{update_skill_capabilities, SkillManifestError};
+use crate::skill_manifests::{
+    load_skill_settings, update_skill_capabilities, update_skill_settings,
+    ResolvedSkillSettingValue, ResolvedSkillSettings, SkillManifestError, SkillSettingUpdate,
+};
 use crate::state::HttpState;
 use crate::types::ErrorBody;
 use axum::extract::{Json, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use fx_marketplace::{InstallResult, MarketplaceError, SkillEntry};
+use fx_skills::manifest::SkillSettingsManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -63,6 +67,39 @@ pub struct UpdateSkillPermissionsResponse {
     pub restart_required: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SkillSettingValueResponse {
+    pub key: String,
+    pub value: Option<String>,
+    pub is_secret: bool,
+    pub is_configured: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SkillSettingsResponse {
+    pub skill_name: String,
+    pub schema: SkillSettingsManifest,
+    pub values: Vec<SkillSettingValueResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SkillSettingInput {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UpdateSkillSettingsRequest {
+    #[serde(default)]
+    pub values: Vec<SkillSettingInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UpdateSkillSettingsResponse {
+    pub updated: bool,
+    pub settings: SkillSettingsResponse,
+}
+
 pub async fn handle_search_skills(
     State(state): State<HttpState>,
     Query(params): Query<SearchQuery>,
@@ -106,6 +143,49 @@ pub async fn handle_update_skill_permissions(
         name,
         capabilities,
         restart_required: true,
+    }))
+}
+
+pub async fn handle_get_skill_settings(
+    State(state): State<HttpState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<SkillSettingsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let settings = load_skill_settings(&state.data_dir, &name)
+        .map_err(skill_manifest_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: format!("Skill '{name}' does not declare any settings"),
+                }),
+            )
+        })?;
+
+    Ok(Json(SkillSettingsResponse::from(settings)))
+}
+
+pub async fn handle_update_skill_settings(
+    State(state): State<HttpState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<UpdateSkillSettingsRequest>,
+) -> Result<Json<UpdateSkillSettingsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let settings = update_skill_settings(
+        &state.data_dir,
+        &name,
+        &request
+            .values
+            .into_iter()
+            .map(|value| SkillSettingUpdate {
+                key: value.key,
+                value: value.value,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(skill_manifest_error)?;
+
+    Ok(Json(UpdateSkillSettingsResponse {
+        updated: true,
+        settings: SkillSettingsResponse::from(settings),
     }))
 }
 
@@ -231,6 +311,27 @@ impl From<InstallResult> for InstallSkillResponse {
             version: result.version,
             size_bytes: result.size_bytes,
             installed: true,
+        }
+    }
+}
+
+impl From<ResolvedSkillSettingValue> for SkillSettingValueResponse {
+    fn from(value: ResolvedSkillSettingValue) -> Self {
+        Self {
+            key: value.key,
+            value: value.value,
+            is_secret: value.is_secret,
+            is_configured: value.is_configured,
+        }
+    }
+}
+
+impl From<ResolvedSkillSettings> for SkillSettingsResponse {
+    fn from(settings: ResolvedSkillSettings) -> Self {
+        Self {
+            skill_name: settings.skill_name,
+            schema: settings.schema,
+            values: settings.values.into_iter().map(Into::into).collect(),
         }
     }
 }

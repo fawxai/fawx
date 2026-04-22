@@ -36,6 +36,7 @@ pub mod context_manager;
 pub mod conversation_compactor;
 pub mod decide;
 pub mod event_bus;
+pub mod execution_root;
 pub mod input;
 mod kernel_blind;
 pub mod loop_engine;
@@ -49,6 +50,7 @@ pub mod proposal_gate;
 pub mod reason;
 pub mod rollback;
 pub mod scoped_tool_executor;
+mod signal_summarizer;
 pub mod signals;
 pub mod streaming;
 pub mod system_prompt;
@@ -58,8 +60,8 @@ pub mod watchdog;
 pub mod yield_primitive;
 
 pub use act::{
-    cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy, TokenUsage,
-    ToolCacheStats, ToolCacheability, ToolResult,
+    cancelled_result, is_cancelled, timed_out_result, ActionResult, ConcurrencyPolicy,
+    FailureClass, TokenUsage, ToolCacheStats, ToolCacheability, ToolResult,
 };
 pub use authority::{
     ApprovalScope, AuthorityCoordinator, AuthorityDecision, AuthorityEffect,
@@ -70,6 +72,7 @@ pub use cancellation::CancellationToken;
 pub use channels::{ChannelRegistry, HttpChannel, ResponseRouter, TuiChannel};
 pub use decide::Decision;
 pub use event_bus::{CompletionEvent, EventBus, Observer, TaskResult};
+pub use execution_root::{ExecutionRoot, SharedExecutionRoot};
 pub use fx_decompose::{
     AggregationStrategy, DecompositionPlan, SubGoal, SubGoalOutcome, SubGoalResult,
 };
@@ -85,7 +88,13 @@ pub use process_registry::{
     ListEntry, ProcessConfig, ProcessRegistry, ProcessStatus, SpawnResult, StatusResult,
 };
 pub use proposal_gate::{is_tier3_path, ProposalGateExecutor, ProposalGateState};
-pub use signals::{LoopStep, Signal, SignalCollector, SignalKind};
-pub use streaming::{ErrorCategory, Phase, StreamCallback, StreamEvent};
+pub use signals::{
+    ControlPlaneDecisionKind, LoopStep, Signal, SignalCollector, SignalKind, SignalSeverity,
+    SignalToolClassification,
+};
+pub use streaming::{
+    ErrorCategory, Phase, StreamCallback, StreamEvent, StreamToolProgressClass,
+    StreamToolProgressOutcome, TranscriptTurnPhase,
+};
 pub use types::LoopError;
 pub use yield_primitive::{WakeCondition, WakeReason, YieldHandle, YieldRequest, YieldWaker};

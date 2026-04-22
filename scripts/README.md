@@ -4,7 +4,7 @@ This directory contains the public-promotion guard and the H2.4 spec contract va
 
 ## Public Promotion Guard
 
-Use this from a promotion branch that is based on `public/main` after cherry-picking only OSS-safe commits.
+Use this from a promotion branch that starts at `public/main` after cherry-picking only OSS-safe commits.
 
 ### Run Locally
 
@@ -12,12 +12,22 @@ Python 3.11+ is required for the guard and its regression tests because `check_p
 
 - Fetch the public base ref if needed:
   - `git fetch public main`
+- Create a fresh promotion branch from the public base:
+  - `git switch -c promote/<name> public/main`
 - Run the guard:
   - `scripts/check-public-promotion`
 - Run the guard regression tests:
   - `python3 -m unittest scripts/tests/test_check_public_promotion.py`
 
-The guard compares the current branch against `public/main`, fails on blocked or non-allowlisted paths, scans added lines for private markers, and checks a few public invariants before you open a public PR.
+The guard compares the current branch against `public/main`, fails on blocked or non-allowlisted paths, scans promoted added lines for private markers across the repo, and checks a few public invariants before you open a public PR.
+
+Treat the guard as mandatory before any public promotion PR. Promotion branches stay fail-closed:
+
+- Start every promotion from `public/main`, not from `dev`, `main`, or a private feature branch.
+- App-inclusive promotions are limited to the reviewed app slice defined in `scripts/check-public-promotion.toml`.
+- That reviewed slice intentionally uses globs for already-audited directories; new files inside those globs still go through repo-wide marker scanning and normal promotion review.
+- Still-private app surfaces remain blocked explicitly, including the app shell/project files, assets/resources, services, platform-specific views, Ripcord UI, unresolved shared views, and non-reviewed app tests/UI tests.
+- Any new app path outside that reviewed slice must stay off the promotion branch until a follow-up policy PR adds it to the allowlist.
 
 ## H2.4 Spec Contract Validator
 

@@ -96,12 +96,13 @@ impl Tool for ProposeImprovementTool {
     }
 
     async fn execute(&self, call: &ToolCall, _cancel: Option<&CancellationToken>) -> ToolResult {
+        let working_dir = self.context.working_dir();
         let output = match &self.context.improvement {
             Some(state) if state.config.enabled => {
                 crate::improvement_tools::handle_propose_improvement(
                     state,
                     &call.arguments,
-                    &self.context.working_dir,
+                    &working_dir,
                 )
                 .await
             }

@@ -600,6 +600,7 @@ impl ToolExecutor for SizedToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: words(self.output_words),
+                failure_class: None,
             })
             .collect())
     }
@@ -630,6 +631,7 @@ impl ToolExecutor for FailingToolRoundExecutor {
                 tool_name: call.name.clone(),
                 success: false,
                 output: "permission denied".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -1113,6 +1115,57 @@ async fn compact_if_needed_skips_flush_when_none() {
 
     assert!(has_compaction_marker(compacted.as_ref()));
     assert!(compacted.len() < messages.len());
+}
+
+#[tokio::test]
+async fn run_cycle_emits_context_overflow_signal_when_perceive_compacts_history() {
+    let executor: Arc<dyn ToolExecutor> = Arc::new(SizedToolExecutor { output_words: 20 });
+    let mut engine = engine_with(
+        ContextCompactor::new(2_048, 256),
+        executor,
+        compaction_config(),
+    );
+    let llm = RecordingLlm::ok(vec![text_response("done")]);
+
+    let result = engine
+        .run_cycle(
+            snapshot_with_history(large_history(10, 60), "summarize"),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+    let signals = match result {
+        LoopResult::Complete { signals, .. }
+        | LoopResult::BudgetExhausted { signals, .. }
+        | LoopResult::Incomplete { signals, .. }
+        | LoopResult::UserStopped { signals, .. }
+        | LoopResult::Error { signals, .. } => signals,
+    };
+
+    let overflow = signals
+        .iter()
+        .find(|signal| {
+            signal.step == LoopStep::Perceive && signal.kind == SignalKind::ContextOverflow
+        })
+        .expect("context overflow signal");
+
+    assert_eq!(overflow.metadata["scope"], "perceive");
+    assert!(
+        overflow.metadata["messages_before"]
+            .as_u64()
+            .expect("messages_before")
+            > overflow.metadata["messages_after"]
+                .as_u64()
+                .expect("messages_after")
+    );
+    assert!(
+        overflow.metadata["tokens_before"]
+            .as_u64()
+            .expect("tokens_before")
+            > overflow.metadata["tokens_after"]
+                .as_u64()
+                .expect("tokens_after")
+    );
 }
 
 #[tokio::test]
@@ -1961,6 +2014,7 @@ async fn concurrent_decompose_children_each_compact_independently() {
             },
         ],
         strategy: AggregationStrategy::Parallel,
+        reasoning_mode: fx_decompose::ReasoningMode::Standard,
         truncated_from: None,
     };
     let llm = RecordingLlm::new(vec![Ok(text_response("a")), Ok(text_response("b"))]);

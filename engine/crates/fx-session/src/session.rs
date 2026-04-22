@@ -2,6 +2,7 @@
 
 use crate::types::{
     MessageRole, SessionConfig, SessionInfo, SessionKey, SessionKind, SessionStatus,
+    SessionThreadBinding,
 };
 use fx_llm::{ContentBlock, Message, Usage};
 use serde::de::Deserializer;
@@ -476,6 +477,9 @@ pub struct Session {
     pub label: Option<String>,
     /// Model identifier.
     pub model: String,
+    /// Optional per-session thinking level override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// Unix epoch seconds at creation.
     pub created_at: u64,
     /// Unix epoch seconds of last activity.
@@ -483,6 +487,9 @@ pub struct Session {
     /// Unix epoch seconds when the session was archived, if archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<u64>,
+    /// Optional workspace/worktree binding for thread-first shells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_binding: Option<SessionThreadBinding>,
     /// Ordered conversation messages.
     pub messages: Vec<SessionMessage>,
     /// Persistent memory that survives compaction.
@@ -500,9 +507,11 @@ impl Session {
             status: SessionStatus::Active,
             label: config.label,
             model: config.model,
+            thinking: config.thinking,
             created_at: now,
             updated_at: now,
             archived_at: None,
+            thread_binding: None,
             messages: Vec::new(),
             memory: SessionMemory::default(),
         }
@@ -567,6 +576,21 @@ impl Session {
         self.updated_at = current_epoch_secs();
     }
 
+    pub fn set_thread_binding(&mut self, thread_binding: Option<SessionThreadBinding>) {
+        self.thread_binding = thread_binding;
+        self.updated_at = current_epoch_secs();
+    }
+
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = model.into();
+        self.updated_at = current_epoch_secs();
+    }
+
+    pub fn set_thinking(&mut self, thinking: Option<String>) {
+        self.thinking = thinking;
+        self.updated_at = current_epoch_secs();
+    }
+
     /// Remove all recorded messages and update the timestamp.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
@@ -593,9 +617,11 @@ impl Session {
             title: self.compute_title(),
             preview: self.compute_preview(),
             model: self.model.clone(),
+            thinking: self.thinking.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             archived_at: self.archived_at,
+            thread_binding: self.thread_binding.clone(),
             message_count: self.messages.len(),
         }
     }
@@ -921,6 +947,7 @@ mod tests {
         SessionConfig {
             label: Some("test-session".to_string()),
             model: "gpt-4".to_string(),
+            thinking: None,
         }
     }
 
@@ -1306,6 +1333,7 @@ mod tests {
             SessionConfig {
                 label: None,
                 model: "claude".to_string(),
+                thinking: None,
             },
         );
         session.archived_at = Some(321);
@@ -1345,6 +1373,7 @@ mod tests {
             Some(Usage {
                 input_tokens: 17,
                 output_tokens: 25,
+                ..Default::default()
             }),
         );
 
@@ -1750,6 +1779,7 @@ mod tests {
             Some(Usage {
                 input_tokens: 44,
                 output_tokens: 55,
+                ..Default::default()
             }),
         );
 

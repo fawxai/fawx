@@ -1,6 +1,7 @@
 use super::test_fixtures::*;
 use super::*;
-use crate::budget::{BudgetConfig, BudgetTracker, DepthMode};
+use crate::act::{ToolExecutor, ToolResult};
+use crate::budget::{BudgetConfig, BudgetTracker, DepthMode, TerminationConfig};
 use crate::cancellation::CancellationToken;
 use crate::context_manager::ContextCompactor;
 use fx_llm::{CompletionResponse, ToolCall};
@@ -194,7 +195,7 @@ async fn single_pass_completes_even_when_budget_tight() {
 
 #[tokio::test]
 async fn forced_synthesis_turn_strips_tools_and_appends_directive() {
-    let engine = build_engine_with_executor(
+    let mut engine = build_engine_with_executor(
         Arc::new(StubToolExecutor),
         budget_config_with_llm_calls(5, 2),
         0,
@@ -203,7 +204,9 @@ async fn forced_synthesis_turn_strips_tools_and_appends_directive() {
     let llm = RecordingLlm::ok(vec![text_response("synthesized")]);
     let messages = vec![Message::user("hello")];
 
-    let result = engine.forced_synthesis_turn(&llm, &messages).await;
+    let result = engine
+        .forced_synthesis_turn(&llm, &messages, CycleStream::disabled())
+        .await;
     let requests = llm.requests();
 
     assert_eq!(result.as_deref(), Some("synthesized"));
@@ -220,14 +223,14 @@ async fn forced_synthesis_turn_strips_tools_and_appends_directive() {
         requests[0]
             .system_prompt
             .as_deref()
-            .is_some_and(|prompt| prompt.contains("Your tool budget is exhausted")),
-        "forced synthesis should append the budget-exhausted directive to the system prompt"
+            .is_some_and(|prompt| prompt.contains("Tool execution is closed for this turn")),
+        "forced synthesis should append the terminal synthesis directive to the system prompt"
     );
 }
 
 #[tokio::test]
 async fn forced_synthesis_turn_hoists_system_messages_into_system_prompt() {
-    let engine = build_engine_with_executor(
+    let mut engine = build_engine_with_executor(
         Arc::new(StubToolExecutor),
         budget_config_with_llm_calls(5, 2),
         0,
@@ -239,7 +242,9 @@ async fn forced_synthesis_turn_hoists_system_messages_into_system_prompt() {
         Message::user("hello"),
     ];
 
-    let result = engine.forced_synthesis_turn(&llm, &messages).await;
+    let result = engine
+        .forced_synthesis_turn(&llm, &messages, CycleStream::disabled())
+        .await;
     let requests = llm.requests();
 
     assert_eq!(result.as_deref(), Some("synthesized"));
@@ -397,8 +402,41 @@ async fn decompose_depth_cap_prevents_infinite_recursion_end_to_end() {
 // 3. Tool friction → escalation (repeated tool failures)
 // =========================================================================
 
-/// When all tool calls fail repeatedly, the loop should not retry until
-/// budget is gone. It should synthesize a response from the failed results.
+#[derive(Debug, Default)]
+struct NumberedFailureToolExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for NumberedFailureToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| {
+                let digits: String = call.id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+                let suffix = if digits.is_empty() { "0" } else { &digits };
+                ToolResult {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    success: false,
+                    output: format!(
+                        "read failed at /tmp/build-{suffix}/artifact-{suffix}.log with pid {suffix}"
+                    ),
+                    failure_class: None,
+                }
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<fx_llm::ToolDefinition> {
+        vec![read_file_def()]
+    }
+}
+
+/// When a tool fails and the model reports the blocker instead of asking for
+/// more tools, the same-turn tool transaction can finish without a root detour.
 #[tokio::test]
 async fn repeated_tool_failures_synthesize_without_infinite_retry() {
     let mut engine = build_engine_with_executor(
@@ -410,7 +448,6 @@ async fn repeated_tool_failures_synthesize_without_infinite_retry() {
 
     let llm = ScriptedLlm::ok(vec![
         tool_use_response(vec![read_file_call("call-1")]),
-        text_response("I was unable to read the file due to an error."),
         text_response("I was unable to read the file due to an error."),
     ]);
 
@@ -425,11 +462,9 @@ async fn repeated_tool_failures_synthesize_without_infinite_retry() {
             iterations,
             ..
         } => {
-            // Tool failure synthesis now feeds the next root reasoning
-            // pass instead of finalizing directly.
             assert_eq!(
-                *iterations, 2,
-                "expected root continuation after tool synthesis: got {iterations}"
+                *iterations, 1,
+                "tool-continuation blocker response should finish in the same turn: got {iterations}"
             );
             assert!(
                 response.contains("unable to read") || response.contains("error"),
@@ -479,6 +514,156 @@ async fn tool_friction_caps_at_max_iterations() {
         }
         other => panic!("expected Complete or Error, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn repeated_malformed_tool_failures_inject_guidance_then_trip_circuit_breaker() {
+    fn malformed_write_file_call(id: &str, raw_arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "write_file".to_string(),
+            arguments: fx_llm::parse_tool_arguments_object(raw_arguments),
+        }
+    }
+
+    let mut engine =
+        build_engine_with_executor(Arc::new(StubToolExecutor), BudgetConfig::default(), 0, 10);
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![malformed_write_file_call(
+            "call-1",
+            "{\"path\":\"/tmp/a.txt\",\"content\":\"unterminated",
+        )]),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-2",
+            "{\"path\":\"/tmp/b.txt\",\"content\":\"still broken",
+        )]),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-3",
+            "{\"path\":\"/tmp/c.txt\",\"content\":\"missing brace\"",
+        )]),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-4",
+            "{\"path\":\"/tmp/d.txt\",\"content\":\"missing quote}",
+        )]),
+        tool_use_response(vec![malformed_write_file_call(
+            "call-5",
+            "{\"path\":\"/tmp/e.txt\",\"content\":\"still missing quote}",
+        )]),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("write a file"), &llm)
+        .await
+        .expect("run_cycle should not panic");
+
+    match &result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            iterations,
+            ..
+        } => {
+            assert_eq!(
+                *iterations, 1,
+                "same-turn breaker should stop the transaction without a root detour"
+            );
+            assert!(
+                reason.contains("repeated tool failure circuit breaker tripped"),
+                "unexpected reason: {reason}"
+            );
+            let partial = partial_response
+                .as_deref()
+                .expect("circuit breaker should preserve a partial response");
+            assert!(
+                partial.contains("write_file"),
+                "partial should name the tool"
+            );
+            assert!(
+                partial.contains("valid JSON"),
+                "partial should explain the malformed JSON failure: {partial}"
+            );
+        }
+        other => panic!("expected Incomplete, got: {other:?}"),
+    }
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 4, "unexpected request count");
+    let combined_prompt = completion_request_to_prompt(&requests[3]);
+    assert!(
+        combined_prompt.contains("Repeated tool failure circuit breaker"),
+        "expected repeated-failure guidance in the next reasoning pass: {combined_prompt}"
+    );
+    assert!(
+        combined_prompt.contains("write_file"),
+        "guidance should identify the failing tool: {combined_prompt}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_non_malformed_failures_use_dedicated_streak_limit() {
+    let config = BudgetConfig {
+        max_consecutive_failures: 9,
+        termination: TerminationConfig {
+            max_repeated_failure_streak: 2,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine =
+        build_engine_with_executor(Arc::new(NumberedFailureToolExecutor), config, 0, 10);
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![read_file_call("call-1")]),
+        tool_use_response(vec![read_file_call("call-2")]),
+        tool_use_response(vec![read_file_call("call-3")]),
+        tool_use_response(vec![read_file_call("call-4")]),
+    ]);
+
+    let result = engine
+        .run_cycle(test_snapshot("read the logs"), &llm)
+        .await
+        .expect("run_cycle should not panic");
+
+    match &result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            iterations,
+            ..
+        } => {
+            assert_eq!(
+                *iterations, 1,
+                "same-turn breaker should stop the transaction without a root detour"
+            );
+            assert!(
+                reason.contains("repeated tool failure circuit breaker tripped"),
+                "unexpected reason: {reason}"
+            );
+            let partial = partial_response
+                .as_deref()
+                .expect("circuit breaker should preserve a partial response");
+            assert!(
+                partial.contains("read_file"),
+                "partial should name the tool"
+            );
+            assert!(
+                partial.contains("read failed at"),
+                "partial should include the failing tool output: {partial}"
+            );
+        }
+        other => panic!("expected Incomplete, got: {other:?}"),
+    }
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3, "unexpected request count");
+    let combined_prompt = completion_request_to_prompt(&requests[2]);
+    assert!(
+        combined_prompt.contains("Repeated tool failure circuit breaker"),
+        "expected repeated-failure guidance in the next reasoning pass: {combined_prompt}"
+    );
+    assert!(
+        combined_prompt.contains("read_file"),
+        "guidance should identify the failing tool: {combined_prompt}"
+    );
 }
 
 // =========================================================================

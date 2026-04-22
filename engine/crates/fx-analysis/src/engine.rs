@@ -132,6 +132,13 @@ fn signal_kind_values() -> Vec<&'static str> {
             SignalKind::Trace
             | SignalKind::Thinking
             | SignalKind::Friction
+            | SignalKind::Retry
+            | SignalKind::Timeout
+            | SignalKind::Cost
+            | SignalKind::ContextOverflow
+            | SignalKind::MemoryHit
+            | SignalKind::MemoryMiss
+            | SignalKind::ProviderFallback
             | SignalKind::Success
             | SignalKind::Blocked
             | SignalKind::Performance
@@ -150,6 +157,13 @@ fn signal_kind_values() -> Vec<&'static str> {
         SignalKind::Trace,
         SignalKind::Thinking,
         SignalKind::Friction,
+        SignalKind::Retry,
+        SignalKind::Timeout,
+        SignalKind::Cost,
+        SignalKind::ContextOverflow,
+        SignalKind::MemoryHit,
+        SignalKind::MemoryMiss,
+        SignalKind::ProviderFallback,
         SignalKind::Success,
         SignalKind::Blocked,
         SignalKind::Performance,
@@ -194,6 +208,8 @@ impl<'a> AnalysisEngine<'a> {
             temperature: None,
             max_tokens: Some(4096),
             system_prompt: Some(ANALYSIS_SYSTEM_PROMPT.to_string()),
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -416,18 +432,14 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                ..Default::default()
             }
         }
     }
 
     fn mk_signal(step: LoopStep, kind: SignalKind, message: &str, timestamp_ms: u64) -> Signal {
-        Signal {
-            step,
-            kind,
-            message: message.to_string(),
-            metadata: json!({}),
-            timestamp_ms,
-        }
+        Signal::new(step, kind, message.to_string(), json!({}), timestamp_ms)
     }
 
     fn mk_session_signal(session_id: &str, signal: Signal) -> SessionSignal {
@@ -497,6 +509,19 @@ mod tests {
                 "signal kind label '{label}' must be snake_case"
             );
         }
+    }
+
+    #[test]
+    fn signal_kind_values_include_operational_signal_kinds() {
+        let values = signal_kind_values();
+
+        assert!(values.contains(&SignalKind::Retry.to_label()));
+        assert!(values.contains(&SignalKind::Timeout.to_label()));
+        assert!(values.contains(&SignalKind::Cost.to_label()));
+        assert!(values.contains(&SignalKind::ContextOverflow.to_label()));
+        assert!(values.contains(&SignalKind::MemoryHit.to_label()));
+        assert!(values.contains(&SignalKind::MemoryMiss.to_label()));
+        assert!(values.contains(&SignalKind::ProviderFallback.to_label()));
     }
 
     #[test]
@@ -642,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn analysis_with_no_signals_returns_empty_findings_without_llm_call() {
         let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "empty-session").expect("store");
+        let store = SignalStore::open(tmp.path(), "empty-session").expect("store");
 
         let provider = MockCompletionProvider::success("gpt-4o", Vec::new());
 
@@ -656,8 +681,8 @@ mod tests {
     #[tokio::test]
     async fn analysis_uses_tool_calls_and_returns_findings() {
         let tmp = TempDir::new().expect("tempdir");
-        let store_a = SignalStore::new(tmp.path(), "session-a").expect("store a");
-        let store_b = SignalStore::new(tmp.path(), "session-b").expect("store b");
+        let store_a = SignalStore::open(tmp.path(), "session-a").expect("store a");
+        let store_b = SignalStore::open(tmp.path(), "session-b").expect("store b");
         store_a
             .persist(&[mk_signal(
                 LoopStep::Act,
@@ -696,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn analysis_propagates_provider_errors() {
         let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "error-session").expect("store");
+        let store = SignalStore::open(tmp.path(), "error-session").expect("store");
         store
             .persist(&[mk_signal(LoopStep::Act, SignalKind::Friction, "failure", 1)])
             .expect("persist");
@@ -716,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn analysis_returns_parse_error_for_invalid_tool_payload() {
         let tmp = TempDir::new().expect("tempdir");
-        let store = SignalStore::new(tmp.path(), "parse-session").expect("store");
+        let store = SignalStore::open(tmp.path(), "parse-session").expect("store");
         store
             .persist(&[mk_signal(LoopStep::Act, SignalKind::Friction, "failure", 1)])
             .expect("persist");

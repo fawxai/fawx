@@ -9,15 +9,18 @@ use crate::lifecycle::{current_time_millis, hash_string, SignatureStatus, SkillR
 use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
-use fx_kernel::act::ToolCacheability;
+use fx_core::tool_routing::{RouteAuthMode, ToolReadinessSummary, ToolRoutingSummary};
+use fx_kernel::act::{ToolCacheability, ToolExecutionDiagnostics, ToolResult};
 use fx_kernel::cancellation::CancellationToken;
-use fx_kernel::ToolAuthoritySurface;
+use fx_kernel::{FailureClass, ToolAuthoritySurface};
 use fx_llm::{ToolCall, ToolDefinition};
+use fx_protocol::StructuredFailure;
 use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
 use fx_skills::manifest::{SkillManifest, SkillToolAuthoritySurface, SkillToolManifest};
 use fx_skills::runtime::SkillRuntime;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +53,7 @@ pub struct WasmSkill {
     manifest: SkillManifest,
     runtime: Arc<Mutex<SkillRuntime>>,
     credential_provider: Option<Arc<dyn CredentialProvider>>,
+    execution_diagnostics: Arc<Mutex<HashMap<String, ToolExecutionDiagnostics>>>,
 }
 
 pub struct LoadedWasmArtifact {
@@ -89,6 +93,7 @@ impl WasmSkill {
             manifest,
             runtime: Arc::new(Mutex::new(runtime)),
             credential_provider,
+            execution_diagnostics: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -244,6 +249,135 @@ impl WasmSkill {
         }
         Ok(serde_json::Value::Object(object).to_string())
     }
+
+    async fn execute_wasm_output(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Option<Result<String, SkillError>> {
+        if !self.handles_tool(tool_name) {
+            return None;
+        }
+
+        let input = match self.encode_runtime_input(tool_name, arguments) {
+            Ok(input) => input,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let skill_name = self.manifest.name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let capabilities = self.manifest.capabilities.clone();
+        let credential_provider = self.credential_provider.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let host_api = Box::new(LiveHostApi::new(LiveHostApiConfig {
+                skill_name: &skill_name,
+                input: input.clone(),
+                storage_quota: None,
+                capabilities,
+                credential_provider,
+            }));
+            let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            rt.invoke_with_host_api(&skill_name, &input, host_api)
+        })
+        .await;
+
+        let mapped = match result {
+            Ok(inner) => {
+                inner.map_err(|e| format!("WASM skill '{}' failed: {e}", self.manifest.name))
+            }
+            Err(join_err) => Err(format!("WASM task panicked: {join_err}")),
+        };
+
+        Some(mapped)
+    }
+
+    fn capture_wasm_diagnostics(
+        &self,
+        tool_call_id: &str,
+        diagnostics: Option<ToolExecutionDiagnostics>,
+    ) {
+        let Some(diagnostics) = diagnostics else {
+            return;
+        };
+        self.execution_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(tool_call_id.to_string(), diagnostics);
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StructuredWasmFailureCarrier {
+    #[serde(rename = "__fawx_failure")]
+    failure: Option<StructuredFailure>,
+}
+
+fn parse_structured_wasm_failure(output: &str) -> Option<StructuredFailure> {
+    serde_json::from_str::<StructuredWasmFailureCarrier>(output)
+        .ok()
+        .and_then(|carrier| carrier.failure)
+}
+
+pub(crate) fn manifest_routing_tools(
+    manifest: &SkillManifest,
+    credential_provider: Option<&dyn CredentialProvider>,
+) -> Vec<ToolRoutingSummary> {
+    manifest
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            tool.routing.clone().map(|metadata| ToolRoutingSummary {
+                tool_name: tool.name.clone(),
+                readiness: routing_readiness(
+                    manifest.name.as_str(),
+                    &metadata,
+                    credential_provider,
+                ),
+                metadata,
+            })
+        })
+        .collect()
+}
+
+fn routing_readiness(
+    skill_name: &str,
+    metadata: &fx_core::tool_routing::ToolRoutingMetadata,
+    credential_provider: Option<&dyn CredentialProvider>,
+) -> ToolReadinessSummary {
+    match &metadata.auth_mode {
+        RouteAuthMode::None => ToolReadinessSummary {
+            available: true,
+            ready: true,
+            readiness_reason: None,
+        },
+        RouteAuthMode::CredentialRequired { key } => {
+            let ready = credential_provider
+                .map(|provider| provider_has_credential(provider, skill_name, key))
+                .unwrap_or(false);
+            ToolReadinessSummary {
+                available: true,
+                ready,
+                readiness_reason: if ready {
+                    None
+                } else {
+                    Some("required credential not configured".to_string())
+                },
+            }
+        }
+    }
+}
+
+fn provider_has_credential(provider: &dyn CredentialProvider, skill_name: &str, key: &str) -> bool {
+    provider
+        .get_credential(&skill_scoped_credential_key(skill_name, key))
+        .is_some()
+        || provider.get_credential(key).is_some()
+}
+
+fn skill_scoped_credential_key(skill_name: &str, key: &str) -> String {
+    format!("skill:{skill_name}:{key}")
 }
 
 fn extract_legacy_input(value: serde_json::Value) -> String {
@@ -325,6 +459,10 @@ impl Skill for WasmSkill {
             .collect()
     }
 
+    fn routing_tools(&self) -> Vec<ToolRoutingSummary> {
+        manifest_routing_tools(&self.manifest, self.credential_provider.as_deref())
+    }
+
     fn cacheability(&self, _tool_name: &str) -> ToolCacheability {
         // WASM skills may have arbitrary side effects we can't predict.
         ToolCacheability::NeverCache
@@ -346,45 +484,44 @@ impl Skill for WasmSkill {
         &self,
         tool_name: &str,
         arguments: &str,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Option<Result<String, SkillError>> {
-        if !self.handles_tool(tool_name) {
-            return None;
-        }
+        self.execute_wasm_output(tool_name, arguments, cancel).await
+    }
 
-        let input = match self.encode_runtime_input(tool_name, arguments) {
-            Ok(input) => input,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let skill_name = self.manifest.name.clone();
-        let runtime = Arc::clone(&self.runtime);
-        let capabilities = self.manifest.capabilities.clone();
-        let credential_provider = self.credential_provider.clone();
-
-        // Run WASM execution on a blocking thread to keep the async
-        // executor free for other tasks.
-        let result = tokio::task::spawn_blocking(move || {
-            let host_api = Box::new(LiveHostApi::new(LiveHostApiConfig {
-                skill_name: &skill_name,
-                input: input.clone(),
-                storage_quota: None,
-                capabilities,
-                credential_provider,
-            }));
-            let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
-            rt.invoke_with_host_api(&skill_name, &input, host_api)
-        })
-        .await;
-
-        let mapped = match result {
-            Ok(inner) => {
-                inner.map_err(|e| format!("WASM skill '{}' failed: {e}", self.manifest.name))
+    async fn execute_tool_result(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<ToolResult> {
+        let output = self
+            .execute_wasm_output(tool_name, arguments, cancel)
+            .await?;
+        Some(match output {
+            Ok(output) => {
+                if let Some(failure) = parse_structured_wasm_failure(&output) {
+                    self.capture_wasm_diagnostics(
+                        tool_call_id,
+                        failure.diagnostics.map(ToolExecutionDiagnostics::Http),
+                    );
+                    ToolResult::failure(tool_call_id, tool_name, failure.message, failure.class)
+                } else {
+                    ToolResult::success(tool_call_id, tool_name, output)
+                }
             }
-            Err(join_err) => Err(format!("WASM task panicked: {join_err}")),
-        };
+            Err(error) => {
+                ToolResult::failure(tool_call_id, tool_name, error, FailureClass::Unknown)
+            }
+        })
+    }
 
-        Some(mapped)
+    fn take_execution_diagnostics(&self, tool_call_id: &str) -> Option<ToolExecutionDiagnostics> {
+        self.execution_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(tool_call_id)
     }
 }
 
@@ -767,8 +904,18 @@ fn read_skill_directories(skills_dir: &Path) -> Result<Vec<std::fs::DirEntry>, S
 mod tests {
     use super::*;
     use crate::test_support::invocable_wasm_bytes;
+    use fx_core::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolRoutingMetadata,
+    };
+    use fx_kernel::act::{HttpDiagnostics, ToolExecutionDiagnostics};
+    use fx_protocol::{FailureClass as ProtocolFailureClass, StructuredFailure};
     use fx_skills::loader::SkillLoader;
-    use fx_skills::manifest::SkillManifest;
+    use fx_skills::manifest::{
+        SkillManifest, SkillToolAuthoritySurface, SkillToolManifest, SkillToolParameterManifest,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use zeroize::Zeroizing;
 
     fn test_manifest(name: &str) -> SkillManifest {
         SkillManifest {
@@ -779,6 +926,8 @@ mod tests {
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         }
     }
@@ -790,6 +939,87 @@ mod tests {
         loader
             .load(&wasm, &manifest, None)
             .expect("load test skill")
+    }
+
+    fn load_wasm_skill(
+        manifest: &SkillManifest,
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> WasmSkill {
+        load_wasm_skill_from_bytes(manifest, &invocable_wasm_bytes(), credential_provider)
+    }
+
+    fn load_wasm_skill_from_bytes(
+        manifest: &SkillManifest,
+        wasm_bytes: &[u8],
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> WasmSkill {
+        let loader = SkillLoader::new(vec![]);
+        let loaded = loader
+            .load(wasm_bytes, manifest, None)
+            .expect("load test skill");
+        WasmSkill::new(loaded, credential_provider).expect("create")
+    }
+
+    fn test_tool_manifest(name: &str, routing: Option<ToolRoutingMetadata>) -> SkillToolManifest {
+        SkillToolManifest {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            authority_surface: Some(SkillToolAuthoritySurface::Network),
+            routing,
+            direct_utility: false,
+            trigger_patterns: vec![],
+            parameters: vec![],
+        }
+    }
+
+    fn required_string_parameter(name: &str, description: &str) -> SkillToolParameterManifest {
+        SkillToolParameterManifest {
+            name: name.to_string(),
+            kind: "string".to_string(),
+            description: description.to_string(),
+            required: true,
+        }
+    }
+
+    fn output_only_wasm(output: &str) -> Vec<u8> {
+        let bytes = output
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        format!(
+            r#"
+            (module
+                (import "host_api_v1" "set_output" (func $set_output (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{bytes}")
+                (func (export "run")
+                    (call $set_output (i32.const 0) (i32.const {})))
+            )
+        "#,
+            output.len()
+        )
+        .into_bytes()
+    }
+
+    #[derive(Debug, Default)]
+    struct MockCredentialProvider {
+        credentials: HashMap<String, String>,
+    }
+
+    impl MockCredentialProvider {
+        fn with_credential(mut self, key: &str, value: &str) -> Self {
+            self.credentials.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl CredentialProvider for MockCredentialProvider {
+        fn get_credential(&self, key: &str) -> Option<Zeroizing<String>> {
+            self.credentials
+                .get(key)
+                .map(|value| Zeroizing::new(value.clone()))
+        }
     }
 
     #[test]
@@ -810,34 +1040,13 @@ mod tests {
     #[test]
     fn wasm_skill_exposes_manifest_declared_tools() {
         let mut manifest = test_manifest("browser");
-        manifest.tools = vec![
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_search".to_string(),
-                description: "Search".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                direct_utility: false,
-                trigger_patterns: Vec::new(),
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "query".to_string(),
-                    kind: "string".to_string(),
-                    description: "Search query".to_string(),
-                    required: true,
-                }],
-            },
-            fx_skills::manifest::SkillToolManifest {
-                name: "web_fetch".to_string(),
-                description: "Fetch".to_string(),
-                authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-                direct_utility: false,
-                trigger_patterns: Vec::new(),
-                parameters: vec![],
-            },
-        ];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut web_search = test_tool_manifest("web_search", None);
+        web_search.description = "Search".to_string();
+        web_search.parameters = vec![required_string_parameter("query", "Search query")];
+        let mut web_fetch = test_tool_manifest("web_fetch", None);
+        web_fetch.description = "Fetch".to_string();
+        manifest.tools = vec![web_search, web_fetch];
+        let skill = load_wasm_skill(&manifest, None);
 
         let defs = skill.tool_definitions();
         assert_eq!(defs.len(), 2);
@@ -849,24 +1058,11 @@ mod tests {
     #[test]
     fn wasm_skill_reports_manifest_authority_surface() {
         let mut manifest = test_manifest("browser");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "web_search".to_string(),
-            description: "Search".to_string(),
-            authority_surface: Some(fx_skills::manifest::SkillToolAuthoritySurface::Network),
-            direct_utility: false,
-            trigger_patterns: Vec::new(),
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "query".to_string(),
-                kind: "string".to_string(),
-                description: "Search query".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut web_search = test_tool_manifest("web_search", None);
+        web_search.description = "Search".to_string();
+        web_search.parameters = vec![required_string_parameter("query", "Search query")];
+        manifest.tools = vec![web_search];
+        let skill = load_wasm_skill(&manifest, None);
         let call = ToolCall {
             id: "call_1".to_string(),
             name: "web_search".to_string(),
@@ -879,27 +1075,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wasm_skill_surfaces_only_route_capable_tools() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![
+            test_tool_manifest(
+                "web_fetch",
+                Some(ToolRoutingMetadata {
+                    resource_kinds: vec![ResourceKind::GenericUrl],
+                    operations: vec![RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+            ),
+            test_tool_manifest("web_search", None),
+        ];
+        let skill = load_wasm_skill(&manifest, None);
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert_eq!(routing[0].tool_name, "web_fetch");
+        assert!(routing[0].readiness.ready);
+    }
+
+    #[test]
+    fn wasm_skill_marks_credential_backed_routes_not_ready_without_credential() {
+        let mut manifest = test_manifest("github");
+        let mut view_pr = test_tool_manifest(
+            "view_pr",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GitHubPullRequest],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::CredentialRequired {
+                    key: "github_token".to_string(),
+                },
+                artifact_strategy: ArtifactStrategy::DirectFetch,
+                fallback_rank: 10,
+            }),
+        );
+        view_pr.description = "View pull request".to_string();
+        manifest.tools = vec![view_pr];
+        let skill = load_wasm_skill(&manifest, None);
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert!(routing[0].readiness.available);
+        assert!(!routing[0].readiness.ready);
+        assert_eq!(
+            routing[0].readiness.readiness_reason.as_deref(),
+            Some("required credential not configured")
+        );
+    }
+
+    #[test]
+    fn wasm_skill_marks_credential_backed_routes_ready_with_scoped_or_global_credential() {
+        let mut manifest = test_manifest("github");
+        let mut view_pr = test_tool_manifest(
+            "view_pr",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GitHubPullRequest],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::CredentialRequired {
+                    key: "github_token".to_string(),
+                },
+                artifact_strategy: ArtifactStrategy::DirectFetch,
+                fallback_rank: 10,
+            }),
+        );
+        view_pr.description = "View pull request".to_string();
+        manifest.tools = vec![view_pr];
+        let provider = MockCredentialProvider::default()
+            .with_credential("skill:github:github_token", "scoped_token");
+        let skill = load_wasm_skill(&manifest, Some(Arc::new(provider)));
+
+        let routing = skill.routing_tools();
+        assert_eq!(routing.len(), 1);
+        assert!(routing[0].readiness.ready);
+        assert_eq!(routing[0].readiness.readiness_reason, None);
+    }
+
+    #[test]
+    fn wasm_skill_preserves_probe_first_artifact_strategy() {
+        let mut manifest = test_manifest("browser");
+        manifest.tools = vec![test_tool_manifest(
+            "web_screenshot",
+            Some(ToolRoutingMetadata {
+                resource_kinds: vec![ResourceKind::GenericUrl],
+                operations: vec![RouteOperation::Fetch],
+                auth_mode: RouteAuthMode::None,
+                artifact_strategy: ArtifactStrategy::ProbeFirst,
+                fallback_rank: 100,
+            }),
+        )];
+        let skill = load_wasm_skill(&manifest, None);
+
+        let routing = skill.routing_tools();
+        assert_eq!(
+            routing[0].metadata.artifact_strategy,
+            ArtifactStrategy::ProbeFirst
+        );
+    }
+
     #[tokio::test]
     async fn wasm_skill_named_tool_uses_declared_schema_instead_of_legacy_input_wrapper() {
         let mut manifest = test_manifest("weather");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "weather".to_string(),
-            description: "Weather".to_string(),
-            authority_surface: None,
-            direct_utility: true,
-            trigger_patterns: vec!["weather".to_string(), "forecast".to_string()],
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "location".to_string(),
-                kind: "string".to_string(),
-                description: "City or location".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut weather = test_tool_manifest("weather", None);
+        weather.description = "Weather".to_string();
+        weather.authority_surface = None;
+        weather.direct_utility = true;
+        weather.trigger_patterns = vec!["weather".to_string(), "forecast".to_string()];
+        weather.parameters = vec![required_string_parameter("location", "City or location")];
+        manifest.tools = vec![weather];
+        let skill = load_wasm_skill(&manifest, None);
 
         let defs = skill.tool_definitions();
         assert_eq!(defs[0].name, "weather");
@@ -920,24 +1208,12 @@ mod tests {
     #[test]
     fn single_manifest_tool_keeps_structured_arguments_without_tool_wrapper() {
         let mut manifest = test_manifest("calculator");
-        manifest.tools = vec![fx_skills::manifest::SkillToolManifest {
-            name: "calculate".to_string(),
-            description: "Calculate".to_string(),
-            authority_surface: None,
-            direct_utility: false,
-            trigger_patterns: Vec::new(),
-            parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                name: "expression".to_string(),
-                kind: "string".to_string(),
-                description: "Expression".to_string(),
-                required: true,
-            }],
-        }];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut calculate = test_tool_manifest("calculate", None);
+        calculate.description = "Calculate".to_string();
+        calculate.authority_surface = None;
+        calculate.parameters = vec![required_string_parameter("expression", "Expression")];
+        manifest.tools = vec![calculate];
+        let skill = load_wasm_skill(&manifest, None);
 
         let encoded = skill
             .encode_runtime_input("calculate", r#"{"expression":"2 + 2"}"#)
@@ -951,39 +1227,16 @@ mod tests {
     #[test]
     fn multi_tool_manifest_inserts_explicit_tool_name_for_runtime_routing() {
         let mut manifest = test_manifest("canvas");
-        manifest.tools = vec![
-            fx_skills::manifest::SkillToolManifest {
-                name: "render_table".to_string(),
-                description: "Render table".to_string(),
-                authority_surface: None,
-                direct_utility: false,
-                trigger_patterns: Vec::new(),
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "headers".to_string(),
-                    kind: "string".to_string(),
-                    description: "Headers".to_string(),
-                    required: true,
-                }],
-            },
-            fx_skills::manifest::SkillToolManifest {
-                name: "render_chart".to_string(),
-                description: "Render chart".to_string(),
-                authority_surface: None,
-                direct_utility: false,
-                trigger_patterns: Vec::new(),
-                parameters: vec![fx_skills::manifest::SkillToolParameterManifest {
-                    name: "data".to_string(),
-                    kind: "string".to_string(),
-                    description: "Data".to_string(),
-                    required: true,
-                }],
-            },
-        ];
-        let loader = SkillLoader::new(vec![]);
-        let loaded = loader
-            .load(&invocable_wasm_bytes(), &manifest, None)
-            .expect("load test skill");
-        let skill = WasmSkill::new(loaded, None).expect("create");
+        let mut render_table = test_tool_manifest("render_table", None);
+        render_table.description = "Render table".to_string();
+        render_table.authority_surface = None;
+        render_table.parameters = vec![required_string_parameter("headers", "Headers")];
+        let mut render_chart = test_tool_manifest("render_chart", None);
+        render_chart.description = "Render chart".to_string();
+        render_chart.authority_surface = None;
+        render_chart.parameters = vec![required_string_parameter("data", "Data")];
+        manifest.tools = vec![render_table, render_chart];
+        let skill = load_wasm_skill(&manifest, None);
 
         let encoded = skill
             .encode_runtime_input("render_table", r#"{"headers":"Name,Score"}"#)
@@ -1019,6 +1272,58 @@ mod tests {
         assert!(output.is_ok(), "expected Ok, got: {output:?}");
         // The test WASM always outputs "ok"
         assert_eq!(output.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn wasm_skill_parses_structured_failure_output_and_preserves_diagnostics() {
+        let manifest = test_manifest("github");
+        let wasm = output_only_wasm(
+            r#"{"success":false,"error":"Sign in to GitHub.","__fawx_failure":{"class":"auth_required","message":"Sign in to GitHub.","diagnostics":{"status_code":401,"headers":{"www-authenticate":"Bearer realm=\"GitHub\""},"body_snippet":"{\"message\":\"Requires authentication\"}","body_truncated":false,"binary_body":false}}}"#,
+        );
+        let skill = load_wasm_skill_from_bytes(&manifest, &wasm, None);
+
+        let result = skill
+            .execute_tool_result("call-1", "github", r#"{"input":""}"#, None)
+            .await
+            .expect("tool result");
+        assert!(!result.success);
+        assert_eq!(
+            result.failure_classification(),
+            Some(FailureClass::AuthRequired)
+        );
+        assert_eq!(result.output, "Sign in to GitHub.");
+
+        let diagnostics = skill
+            .take_execution_diagnostics("call-1")
+            .expect("diagnostics");
+        assert_eq!(
+            diagnostics,
+            ToolExecutionDiagnostics::Http(HttpDiagnostics {
+                status_code: Some(401),
+                headers: std::collections::BTreeMap::from([(
+                    "www-authenticate".to_string(),
+                    "Bearer realm=\"GitHub\"".to_string(),
+                )]),
+                transport_error: None,
+                body_snippet: Some("{\"message\":\"Requires authentication\"}".to_string()),
+                body_truncated: false,
+                binary_body: false,
+            })
+        );
+        assert!(skill.take_execution_diagnostics("call-1").is_none());
+    }
+
+    #[test]
+    fn structured_failure_boundary_round_trips_all_failure_classes() {
+        for class in ProtocolFailureClass::ALL {
+            let wrapped = serde_json::json!({
+                "__fawx_failure": StructuredFailure::new(class, format!("class={}", class.as_str()), None),
+            });
+            let parsed =
+                parse_structured_wasm_failure(&wrapped.to_string()).expect("structured failure");
+            assert_eq!(parsed.class, class);
+            assert_eq!(parsed.message, format!("class={}", class.as_str()));
+        }
     }
 
     #[tokio::test]

@@ -13,14 +13,15 @@ use std::time::Duration;
 use crate::provider::{
     insert_bearer_authorization, insert_header_value, null_loop_harness,
     resolve_loop_harness_from_profiles, CompletionStream, LlmProvider, LoopHarness, LoopModelMatch,
-    LoopModelProfile, LoopPromptOverlayContext, ProviderCapabilities, StaticLoopModelProfile,
+    LoopModelProfile, LoopPromptOverlayContext, PromptCacheCapability, ProviderCapabilities,
+    StaticLoopModelProfile,
 };
 use crate::sse::{SseFrame, SseFramer};
 use crate::streaming::{collect_completion_stream, StreamCallback};
 use crate::thinking::valid_thinking_levels;
 use crate::types::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmError, Message, MessageRole,
-    StreamChunk, ThinkingConfig, ToolCall, ToolUseDelta, Usage,
+    PromptCachePolicy, StreamChunk, ThinkingConfig, ToolCall, ToolDefinition, ToolUseDelta, Usage,
 };
 use crate::validation::validate_tool_message_sequence;
 
@@ -117,6 +118,26 @@ fn anthropic_messages_loop_harness(model: &str) -> &'static dyn LoopHarness {
         model,
         null_loop_harness(),
     )
+}
+
+fn validate_anthropic_tool_schema(tool: &ToolDefinition) -> Result<(), LlmError> {
+    let Some(parameters) = tool.parameters.as_object() else {
+        return Err(LlmError::Config(format!(
+            "Anthropic tool `{}` input_schema must be a JSON object",
+            tool.name
+        )));
+    };
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if parameters.contains_key(keyword) {
+            return Err(LlmError::Config(format!(
+                "Anthropic tool `{}` input_schema cannot use top-level `{keyword}`; move conditional requirements into runtime validation or a provider-compatible schema",
+                tool.name
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Anthropic auth mode — determines how credentials are sent.
@@ -329,20 +350,17 @@ impl AnthropicProvider {
         }
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<AnthropicRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
+        // The router already resolved the selected model against the provider's
+        // live catalog. A second check against this client's startup snapshot
+        // can reject newly discovered models after the picker has accepted them.
+        for tool in &request.tools {
+            validate_anthropic_tool_schema(tool)?;
+        }
 
         let mut system_prompt = request.system_prompt.clone();
 
@@ -366,13 +384,21 @@ impl AnthropicProvider {
             messages.push(self.map_message_to_anthropic(message)?);
         }
 
+        let cache_tools = request.prompt_cache.wants_ephemeral() && !request.tools.is_empty();
+        let last_tool_index = request.tools.len().saturating_sub(1);
         let tools = request
             .tools
             .iter()
-            .map(|tool| AnthropicTool {
+            .enumerate()
+            .map(|(index, tool)| AnthropicTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 input_schema: tool.parameters.clone(),
+                // Anthropic cache breakpoints cache the prefix up to this block.
+                // Marking the final tool covers the stable tool schema without
+                // spending one breakpoint per loaded tool.
+                cache_control: (cache_tools && index == last_tool_index)
+                    .then(anthropic_ephemeral_cache_control),
             })
             .collect::<Vec<_>>();
 
@@ -396,7 +422,7 @@ impl AnthropicProvider {
                 Some(AnthropicThinking::Adaptive { .. }) => request.max_tokens.unwrap_or(16_000),
                 None => request.max_tokens.unwrap_or(4096),
             },
-            system: self.build_system_value(system_prompt),
+            system: self.build_system_value(system_prompt, request.prompt_cache),
             stream,
             thinking,
             output_config,
@@ -412,16 +438,24 @@ impl AnthropicProvider {
     ///
     /// For setup tokens, Anthropic requires the Claude Code identity as the
     /// first content block in an array format. For API keys, a plain string.
-    fn build_system_value(&self, prompt: Option<String>) -> Option<serde_json::Value> {
+    fn build_system_value(
+        &self,
+        prompt: Option<String>,
+        prompt_cache: PromptCachePolicy,
+    ) -> Option<serde_json::Value> {
+        let use_ephemeral_cache = prompt_cache.wants_ephemeral();
         if matches!(self.auth_mode, AnthropicAuthMode::SetupToken(_)) {
             let mut blocks =
                 vec![serde_json::json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY})];
             if let Some(text) = prompt {
                 if !text.is_empty() {
-                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                    blocks.push(anthropic_system_text_block(text, use_ephemeral_cache));
                 }
             }
             Some(serde_json::Value::Array(blocks))
+        } else if use_ephemeral_cache {
+            prompt
+                .map(|text| serde_json::Value::Array(vec![anthropic_system_text_block(text, true)]))
         } else {
             prompt.map(serde_json::Value::String)
         }
@@ -504,10 +538,7 @@ impl AnthropicProvider {
         CompletionResponse {
             content,
             tool_calls,
-            usage: body.usage.map(|usage| Usage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            }),
+            usage: body.usage.map(anthropic_usage_to_usage),
             stop_reason: body.stop_reason,
         }
     }
@@ -649,19 +680,13 @@ impl AnthropicProvider {
         vec![StreamChunk {
             delta_content: None,
             tool_use_deltas: Vec::new(),
-            usage: Some(Usage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            }),
+            usage: Some(anthropic_usage_to_usage(usage)),
             stop_reason: None,
         }]
     }
 
     fn handle_message_delta(event: AnthropicStreamEvent) -> Vec<StreamChunk> {
-        let usage = event.usage.map(|u| Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        });
+        let usage = event.usage.map(anthropic_usage_to_usage);
         let stop_reason = event.delta.and_then(|d| d.stop_reason);
         if usage.is_none() && stop_reason.is_none() {
             return Vec::new();
@@ -882,6 +907,8 @@ impl LlmProvider for AnthropicProvider {
         ProviderCapabilities {
             supports_temperature: true,
             requires_streaming: false,
+            prompt_cache: PromptCacheCapability::AnthropicEphemeral,
+            prompt_cache_affinity: Default::default(),
         }
     }
 
@@ -1044,6 +1071,21 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+fn anthropic_ephemeral_cache_control() -> AnthropicCacheControl {
+    AnthropicCacheControl {
+        cache_type: "ephemeral".to_string(),
+        ttl: "1h".to_string(),
+    }
+}
+
+fn anthropic_system_text_block(text: String, cache_control: bool) -> serde_json::Value {
+    let mut block = serde_json::json!({"type": "text", "text": text});
+    if cache_control {
+        block["cache_control"] = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
+    }
+    block
+}
+
 #[derive(Debug, Serialize)]
 struct AnthropicRequestBody {
     model: String,
@@ -1094,6 +1136,15 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
+    ttl: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,12 +1220,25 @@ struct AnthropicResponseBody {
     usage: Option<AnthropicUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct AnthropicUsage {
     #[serde(default)]
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+}
+
+fn anthropic_usage_to_usage(usage: AnthropicUsage) -> Usage {
+    Usage::with_prompt_cache(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1487,6 +1551,8 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(256),
             system_prompt: Some("System prelude".to_string()),
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1500,6 +1566,90 @@ mod tests {
         assert_eq!(serialized["system"], "System prelude\nFollow policy");
         assert_eq!(serialized["tools"].as_array().unwrap().len(), 1);
         assert_eq!(serialized["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn anthropic_ephemeral_prompt_cache_marks_only_stable_blocks() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-3-7-sonnet".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message::user("volatile user prompt")],
+            tools: vec![
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                },
+                ToolDefinition {
+                    name: "search".to_string(),
+                    description: "Search docs".to_string(),
+                    parameters: json!({"type":"object","properties":{"query":{"type":"string"}}}),
+                },
+            ],
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+            system_prompt: Some("Stable system prelude".to_string()),
+            prompt_cache: PromptCachePolicy::Ephemeral,
+            cache_affinity: None,
+            thinking: None,
+        };
+
+        let body = provider.build_request_body(&request, false).unwrap();
+        let serialized = serde_json::to_value(body).unwrap();
+
+        assert_eq!(
+            serialized["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(serialized["system"][0]["cache_control"]["ttl"], "1h");
+        assert!(serialized["tools"][0].get("cache_control").is_none());
+        assert_eq!(serialized["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(serialized["tools"][1]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            serialized["messages"][0]["content"][0]["text"],
+            "volatile user prompt"
+        );
+        assert!(serialized["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn test_build_request_body_rejects_top_level_schema_combinators() {
+        let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
+            .unwrap()
+            .with_supported_models(vec!["claude-3-7-sonnet".to_string()]);
+
+        let request = CompletionRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: vec![ToolDefinition {
+                name: "decompose".to_string(),
+                description: "Plan the task".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "allOf": [{"required": ["got_criteria"]}]
+                }),
+            }],
+            temperature: Some(0.2),
+            max_tokens: Some(256),
+            system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
+            thinking: None,
+        };
+
+        let error = provider
+            .build_request_body(&request, false)
+            .expect_err("top-level allOf should be rejected");
+
+        assert!(
+            matches!(error, LlmError::Config(message) if message.contains("decompose") && message.contains("top-level `allOf`"))
+        );
     }
 
     #[tokio::test]
@@ -1523,6 +1673,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(256),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1553,6 +1705,7 @@ mod tests {
             usage: Some(AnthropicUsage {
                 input_tokens: 12,
                 output_tokens: 34,
+                ..Default::default()
             }),
         };
 
@@ -1674,6 +1827,7 @@ mod tests {
             usage: Some(AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 11,
+                ..Default::default()
             }),
         };
         let payload = r#"
@@ -1837,23 +1991,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_rejects_unsupported_model() {
+    fn test_build_request_allows_model_outside_startup_snapshot() {
         let provider = AnthropicProvider::new("http://localhost:9999", "test-key")
             .unwrap()
             .with_supported_models(vec!["claude-3-5-sonnet".to_string()]);
 
         let request = CompletionRequest {
-            model: "claude-3-haiku".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
             messages: vec![Message::user("hi")],
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(64),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
         let result = provider.build_request_body(&request, false);
-        assert!(matches!(result, Err(LlmError::UnsupportedModel(_))));
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2054,7 +2210,10 @@ mod tests {
             .expect("provider");
 
         let system = provider
-            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .build_system_value(
+                Some("Follow the user's instructions.".to_string()),
+                PromptCachePolicy::Disabled,
+            )
             .expect("system");
 
         assert_eq!(
@@ -2072,7 +2231,10 @@ mod tests {
             AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
 
         let system = provider
-            .build_system_value(Some("Follow the user's instructions.".to_string()))
+            .build_system_value(
+                Some("Follow the user's instructions.".to_string()),
+                PromptCachePolicy::Disabled,
+            )
             .expect("system");
 
         assert_eq!(system, json!("Follow the user's instructions."));
@@ -2083,7 +2245,9 @@ mod tests {
         let provider = AnthropicProvider::new("http://localhost:9999", "sk-ant-oat01-test-token")
             .expect("provider");
 
-        let system = provider.build_system_value(None).expect("system");
+        let system = provider
+            .build_system_value(None, PromptCachePolicy::Disabled)
+            .expect("system");
         assert_eq!(
             system,
             json!([{"type": "text", "text": CLAUDE_CODE_SYSTEM_IDENTITY}])
@@ -2096,7 +2260,7 @@ mod tests {
             .expect("provider");
 
         let system = provider
-            .build_system_value(Some(String::new()))
+            .build_system_value(Some(String::new()), PromptCachePolicy::Disabled)
             .expect("system");
         assert_eq!(
             system,
@@ -2109,7 +2273,9 @@ mod tests {
         let provider =
             AnthropicProvider::new("http://localhost:9999", "test-key").expect("provider");
 
-        assert!(provider.build_system_value(None).is_none());
+        assert!(provider
+            .build_system_value(None, PromptCachePolicy::Disabled)
+            .is_none());
     }
 
     #[test]
@@ -2160,6 +2326,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(1024),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Adaptive {
                 effort: "adaptive".to_string(),
             }),
@@ -2185,6 +2353,8 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Enabled {
                 budget_tokens: 5000,
             }),
@@ -2218,6 +2388,8 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(1024),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2287,6 +2459,8 @@ mod tests {
             temperature: None,
             max_tokens: None, // defaults to 4096, which is < 10000
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Enabled {
                 budget_tokens: 10000,
             }),
@@ -2319,6 +2493,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(8192),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Enabled {
                 budget_tokens: 500_000,
             }),
@@ -2359,6 +2535,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(20000),
             system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Enabled {
                 budget_tokens: 5000,
             }),
@@ -2391,6 +2569,7 @@ mod tests {
             usage: Some(AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                ..Default::default()
             }),
         };
 
@@ -2419,6 +2598,7 @@ mod tests {
             usage: Some(AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                ..Default::default()
             }),
         };
 
@@ -2434,6 +2614,29 @@ mod tests {
             "only the text block should remain"
         );
         assert!(mapped.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn anthropic_usage_preserves_prompt_cache_accounting() {
+        let response = AnthropicResponseBody {
+            content: vec![AnthropicContentBlock::Text {
+                text: "cached response".to_string(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_input_tokens: 70,
+                cache_creation_input_tokens: 30,
+            }),
+        };
+
+        let mapped = AnthropicProvider::parse_completion_response(response);
+        let usage = mapped.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cached_input_tokens, 70);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
     }
 
     #[test]

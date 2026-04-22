@@ -44,6 +44,8 @@ fn text_request(model: &str, prompt: &str) -> CompletionRequest {
         temperature: Some(0.0),
         max_tokens: Some(256),
         system_prompt: None,
+        prompt_cache: Default::default(),
+        cache_affinity: None,
         thinking: None,
     }
 }
@@ -56,6 +58,8 @@ fn tool_request(model: &str, prompt: &str) -> CompletionRequest {
         temperature: Some(0.0),
         max_tokens: Some(256),
         system_prompt: None,
+        prompt_cache: Default::default(),
+        cache_affinity: None,
         thinking: None,
     }
 }
@@ -68,6 +72,8 @@ fn thinking_text_request(prompt: &str) -> CompletionRequest {
         temperature: None, // required when thinking is enabled
         max_tokens: Some(4096),
         system_prompt: None,
+        prompt_cache: Default::default(),
+        cache_affinity: None,
         thinking: Some(ThinkingConfig::Enabled {
             budget_tokens: 2000,
         }),
@@ -82,6 +88,8 @@ fn thinking_tool_request(prompt: &str) -> CompletionRequest {
         temperature: None,
         max_tokens: Some(4096),
         system_prompt: None,
+        prompt_cache: Default::default(),
+        cache_affinity: None,
         thinking: Some(ThinkingConfig::Enabled {
             budget_tokens: 2000,
         }),

@@ -33,12 +33,15 @@ pub async fn handle_config_set(
     State(state): State<HttpState>,
     Json(request): Json<ConfigSetRequest>,
 ) -> HandlerResult<Json<Value>> {
-    let app = state.app.lock().await;
-    let manager = app.config_manager().ok_or_else(config_manager_missing)?;
-    let mut guard = manager.lock().map_err(config_lock_error)?;
-    guard
-        .set(&request.key, &request.value)
-        .map_err(bad_request)?;
+    {
+        let app = state.app.lock().await;
+        let manager = app.config_manager().ok_or_else(config_manager_missing)?;
+        let mut guard = manager.lock().map_err(config_lock_error)?;
+        guard
+            .set(&request.key, &request.value)
+            .map_err(bad_request)?;
+    }
+    reload_runtime_config_state(&state).await?;
     Ok(Json(serde_json::json!({
         "updated": request.key,
         "value": request.value,
@@ -50,8 +53,8 @@ pub async fn handle_config_patch(
     Json(request): Json<ConfigPatchRequest>,
 ) -> HandlerResult<Json<ConfigPatchResponse>> {
     let changes = parse_patch_changes(request.changes).map_err(bad_request)?;
-    apply_changes(&state.data_dir, &changes).map_err(internal_error)?;
-    reload_config_manager(&state).await?;
+    apply_changes(&state.data_dir, &changes).map_err(config_apply_error)?;
+    reload_runtime_config_state(&state).await?;
 
     let changed_keys = changes
         .into_iter()
@@ -86,8 +89,8 @@ pub async fn handle_apply_config_preset(
     let current = current_config_value(&state).await?;
     let diff = preset_diff_entries(&current, &changes);
 
-    apply_changes(&state.data_dir, &changes).map_err(internal_error)?;
-    reload_config_manager(&state).await?;
+    apply_changes(&state.data_dir, &changes).map_err(config_apply_error)?;
+    reload_runtime_config_state(&state).await?;
 
     let changed_keys = diff.into_iter().map(|entry| entry.key).collect::<Vec<_>>();
     Ok(Json(ApplyConfigPresetResponse {
@@ -193,13 +196,29 @@ async fn current_config_value(state: &HttpState) -> HandlerResult<Value> {
         .map_err(|error| internal_error(format!("failed to serialize config: {error}")))
 }
 
-async fn reload_config_manager(state: &HttpState) -> HandlerResult<()> {
-    let Some(manager) = config_manager_handle(state).await else {
-        return Ok(());
-    };
+async fn reload_runtime_config_state(state: &HttpState) -> HandlerResult<()> {
+    if let Some(manager) = config_manager_handle(state).await {
+        let mut guard = manager.lock().map_err(config_lock_error)?;
+        guard.reload().map_err(internal_error)?;
+    }
 
-    let mut guard = manager.lock().map_err(config_lock_error)?;
-    guard.reload().map_err(internal_error)
+    let (active_model, thinking, models, max_history) = {
+        let mut app = state.app.lock().await;
+        app.reload_config()
+            .map_err(|error| internal_error(format!("failed to reload runtime config: {error}")))?;
+        (
+            app.active_model().to_owned(),
+            app.thinking_level(),
+            app.available_models(),
+            app.max_history(),
+        )
+    };
+    state
+        .shared
+        .update_model(&active_model, &thinking, models, max_history)
+        .await;
+    state.session_engines.clear().await;
+    Ok(())
 }
 
 async fn config_manager_handle(state: &HttpState) -> Option<ConfigManagerHandle> {
@@ -207,12 +226,40 @@ async fn config_manager_handle(state: &HttpState) -> Option<ConfigManagerHandle>
     app.config_manager()
 }
 
-fn apply_changes(data_dir: &FsPath, changes: &[ConfigValueChange]) -> Result<(), String> {
-    let mut document = read_config_document(data_dir)?;
-    for change in changes {
-        apply_change(&mut document, change)?;
+#[derive(Debug)]
+enum ConfigApplyError {
+    Invalid(String),
+    Persist(String),
+}
+
+fn config_apply_error(error: ConfigApplyError) -> (StatusCode, Json<ErrorBody>) {
+    match error {
+        ConfigApplyError::Invalid(error) => bad_request(error),
+        ConfigApplyError::Persist(error) => internal_error(error),
     }
-    write_config_document(data_dir, document)
+}
+
+fn apply_changes(data_dir: &FsPath, changes: &[ConfigValueChange]) -> Result<(), ConfigApplyError> {
+    let document = candidate_config_document(data_dir, changes)?;
+    write_config_document(data_dir, document).map_err(ConfigApplyError::Persist)
+}
+
+fn candidate_config_document(
+    data_dir: &FsPath,
+    changes: &[ConfigValueChange],
+) -> Result<DocumentMut, ConfigApplyError> {
+    let mut document = read_config_document(data_dir).map_err(ConfigApplyError::Persist)?;
+    for change in changes {
+        apply_change(&mut document, change).map_err(ConfigApplyError::Invalid)?;
+    }
+    validate_config_document(&document)?;
+    Ok(document)
+}
+
+fn validate_config_document(document: &DocumentMut) -> Result<(), ConfigApplyError> {
+    FawxConfig::from_toml_str(&document.to_string())
+        .map(|_| ())
+        .map_err(ConfigApplyError::Invalid)
 }
 
 fn apply_change(document: &mut DocumentMut, change: &ConfigValueChange) -> Result<(), String> {

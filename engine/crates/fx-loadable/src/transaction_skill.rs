@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use fx_core::self_modify::SelfModifyConfig;
 use fx_kernel::act::ToolCacheability;
 use fx_kernel::cancellation::CancellationToken;
+use fx_kernel::{ExecutionRoot, SharedExecutionRoot};
 use fx_llm::ToolDefinition;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -24,7 +25,7 @@ use crate::skill::{Skill, SkillError};
 pub struct TransactionSkill {
     store: Arc<Mutex<TransactionStore>>,
     config: SelfModifyConfig,
-    work_dir: PathBuf,
+    execution_root: SharedExecutionRoot,
 }
 
 #[derive(Deserialize)]
@@ -63,11 +64,22 @@ impl TransactionSkill {
     ///   allowed (policy disabled). Callers should pass the real config from
     ///   the application configuration rather than using `SelfModifyConfig::default()`.
     pub fn new(work_dir: PathBuf, self_modify: Option<SelfModifyConfig>) -> Self {
+        Self::with_execution_root(Arc::new(ExecutionRoot::new(work_dir)), self_modify)
+    }
+
+    pub fn with_execution_root(
+        execution_root: SharedExecutionRoot,
+        self_modify: Option<SelfModifyConfig>,
+    ) -> Self {
         Self {
             store: Arc::new(Mutex::new(TransactionStore::new())),
             config: self_modify.unwrap_or_default(),
-            work_dir,
+            execution_root,
         }
+    }
+
+    fn work_dir(&self) -> PathBuf {
+        self.execution_root.current()
     }
 
     async fn handle_begin(&self, arguments: &str) -> Result<String, SkillError> {
@@ -86,7 +98,7 @@ impl TransactionSkill {
     async fn handle_stage(&self, arguments: &str) -> Result<String, SkillError> {
         let args: StageArgs =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;
-        let path = self.work_dir.join(&args.path);
+        let path = self.work_dir().join(&args.path);
         let mut store = self.store.lock().await;
         // Iteration hardcoded to 0 — see comment in handle_begin.
         store
@@ -101,13 +113,14 @@ impl TransactionSkill {
     async fn handle_commit(&self, arguments: &str) -> Result<String, SkillError> {
         let args: CommitArgs =
             serde_json::from_str(arguments).map_err(|e| format!("Invalid arguments: {e}"))?;
+        let work_dir = self.work_dir();
         let mut store = self.store.lock().await;
         let count = executor::commit(
             &mut store,
             args.tx_id,
-            Some(&self.work_dir),
+            Some(&work_dir),
             &self.config,
-            &self.work_dir,
+            &work_dir,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -236,6 +249,10 @@ fn rollback_transaction_definition() -> ToolDefinition {
 impl Skill for TransactionSkill {
     fn name(&self) -> &str {
         "transaction_skill"
+    }
+
+    fn description(&self) -> &str {
+        "Stage multi-file edits and commit or roll them back as one transaction."
     }
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {

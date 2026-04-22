@@ -1,13 +1,18 @@
+use crate::handlers::git_exec::{run_git, run_git_output, GitError, GitOutput};
+use crate::handlers::sessions::require_session_registry;
+use crate::handlers::workspace_catalog::{
+    load_targeted_workspace_catalog, resolve_selection_execution_root,
+    resolve_session_execution_root, resolve_workspace_dir, WorkspaceSelection,
+};
 use crate::handlers::HandlerResult;
 use crate::state::HttpState;
-use crate::types::ErrorBody;
+use crate::types::{ErrorBody, WorkspaceScope, WorktreeSummary};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use fx_session::{SessionError, SessionKey};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 const DEFAULT_LOG_LIMIT: usize = 20;
 
@@ -25,9 +30,34 @@ pub struct GitFileStatus {
     pub staged: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+pub struct GitTargetQuery {
+    pub session_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub worktree_id: Option<String>,
+    #[serde(rename = "workspace_path", default)]
+    pub workspace_scope: WorkspaceScope,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct GitLogQuery {
     pub limit: Option<usize>,
+    pub session_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub worktree_id: Option<String>,
+    #[serde(rename = "workspace_path", default)]
+    pub workspace_scope: WorkspaceScope,
+}
+
+impl GitLogQuery {
+    fn target(&self) -> GitTargetQuery {
+        GitTargetQuery {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            worktree_id: self.worktree_id.clone(),
+            workspace_scope: self.workspace_scope.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -90,37 +120,11 @@ struct GitDiffSummary {
     deletions: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitOutput {
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitError {
-    message: String,
-}
-
-impl GitError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for GitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for GitError {}
-
 pub async fn handle_git_status(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
 ) -> HandlerResult<Json<GitStatusResponse>> {
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let output = run_git(["status", "--porcelain=v1", "--branch"], &cwd)
         .await
         .map_err(internal_error)?;
@@ -138,7 +142,7 @@ pub async fn handle_git_log(
             commits: Vec::new(),
         }));
     }
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query.target()).await?;
     let limit_arg = format!("-{limit}");
     let output = run_git(
         ["log", "--oneline", "--format=%H|%h|%s|%an|%aI", &limit_arg],
@@ -152,8 +156,9 @@ pub async fn handle_git_log(
 
 pub async fn handle_git_diff(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
 ) -> HandlerResult<Json<GitDiffResponse>> {
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let diff = run_git(["diff"], &cwd).await.map_err(internal_error)?;
     let stat = run_git(["diff", "--stat"], &cwd)
         .await
@@ -163,10 +168,11 @@ pub async fn handle_git_diff(
 
 pub async fn handle_git_stage(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
     Json(request): Json<GitStageRequest>,
 ) -> HandlerResult<Json<GitStageResponse>> {
     validate_paths(&request.paths).map_err(bad_request)?;
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let paths = request.paths;
     if paths.is_empty() {
         run_git(["add", "-A"], &cwd).await.map_err(bad_request)?;
@@ -197,10 +203,11 @@ pub struct GitUnstageResponse {
 
 pub async fn handle_git_unstage(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
     Json(request): Json<GitUnstageRequest>,
 ) -> HandlerResult<Json<GitUnstageResponse>> {
     validate_paths(&request.paths).map_err(bad_request)?;
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let paths = request.paths;
     if paths.is_empty() {
         run_git(["reset", "HEAD"], &cwd)
@@ -234,8 +241,9 @@ pub struct GitPullResponse {
 
 pub async fn handle_git_pull(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
 ) -> HandlerResult<Json<GitPullResponse>> {
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     match run_git_output(["pull"], &cwd).await {
         Ok(output) => Ok(Json(pull_response_from_output(&output))),
         Err(error) => {
@@ -277,8 +285,9 @@ pub struct GitFetchResponse {
 
 pub async fn handle_git_fetch(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
 ) -> HandlerResult<Json<GitFetchResponse>> {
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let output = run_git_output(["fetch"], &cwd).await.map_err(bad_request)?;
     let summary = if output.stderr.trim().is_empty() {
         "Already up to date.".to_string()
@@ -293,6 +302,7 @@ pub async fn handle_git_fetch(
 
 pub async fn handle_git_commit(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
     Json(request): Json<GitCommitRequest>,
 ) -> HandlerResult<Json<GitCommitResponse>> {
     let message = request.message.trim().to_string();
@@ -301,7 +311,7 @@ pub async fn handle_git_commit(
             "commit message must not be empty",
         )));
     }
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     let output = run_git_output(["commit", "-m", message.as_str()], &cwd)
         .await
         .map_err(bad_request)?;
@@ -319,8 +329,9 @@ pub async fn handle_git_commit(
 
 pub async fn handle_git_push(
     State(state): State<HttpState>,
+    Query(query): Query<GitTargetQuery>,
 ) -> HandlerResult<Json<GitPushResponse>> {
-    let cwd = workspace_dir(&state).await;
+    let cwd = resolve_git_dir(&state, query).await?;
     match run_git_output(["push"], &cwd).await {
         Ok(output) => {
             let (remote, branch) = push_target(&cwd, &output).await.map_err(internal_error)?;
@@ -351,68 +362,6 @@ fn classify_push_error(message: &str) -> &'static str {
     } else {
         "Push failed. See details below."
     }
-}
-
-async fn workspace_dir(state: &HttpState) -> PathBuf {
-    if let Some(path) = configured_workspace_dir(state).await {
-        return path;
-    }
-    if let Some(parent) = state.data_dir.parent().filter(|path| is_git_repo(path)) {
-        return parent.to_path_buf();
-    }
-    match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(_) => state.data_dir.clone(),
-    }
-}
-
-async fn configured_workspace_dir(state: &HttpState) -> Option<PathBuf> {
-    let manager = {
-        let app = state.app.lock().await;
-        app.config_manager()
-    }?;
-    let guard = manager.lock().ok()?;
-    guard
-        .config()
-        .tools
-        .working_dir
-        .clone()
-        .or_else(|| guard.config().workspace.root.clone())
-}
-
-fn is_git_repo(path: &Path) -> bool {
-    path.join(".git").is_dir() || path.join(".git").is_file()
-}
-
-async fn run_git<I, S>(args: I, cwd: &Path) -> Result<String, GitError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Ok(run_git_output(args, cwd).await?.stdout)
-}
-
-async fn run_git_output<I, S>(args: I, cwd: &Path) -> Result<GitOutput, GitError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|error| GitError::new(format!("failed to run git: {error}")))?;
-    if output.status.success() {
-        return Ok(GitOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(GitError::new(format!("git error: {message}")))
 }
 
 fn validate_paths(paths: &[String]) -> Result<(), GitError> {
@@ -665,16 +614,126 @@ fn split_upstream_ref(upstream: &str) -> Result<(String, String), GitError> {
 }
 
 async fn current_branch(cwd: &Path) -> Result<String, GitError> {
-    let output = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|error| GitError::new(format!("failed to read current branch: {error}")))?;
-    if !output.status.success() {
-        return Err(GitError::new("failed to read current branch"));
+    Ok(run_git(["branch", "--show-current"], cwd)
+        .await?
+        .trim()
+        .to_string())
+}
+
+async fn resolve_git_dir(state: &HttpState, query: GitTargetQuery) -> HandlerResult<PathBuf> {
+    if let Some(session_id) = normalized_optional(query.session_id.as_deref()) {
+        return resolve_session_git_dir(state, session_id).await;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    if query.has_workspace_target() {
+        return resolve_workspace_git_dir(state, query).await;
+    }
+
+    resolve_workspace_dir(state)
+        .await
+        .map_err(|error| internal_error(GitError::new(error.to_string())))
+}
+
+async fn resolve_session_git_dir(state: &HttpState, session_id: &str) -> HandlerResult<PathBuf> {
+    let registry = require_session_registry(state)
+        .map_err(|(_, body)| bad_request(GitError::new(body.error.clone())))?;
+    let key = SessionKey::new(session_id)
+        .map_err(|_| bad_request(GitError::new("session id must not be empty")))?;
+    let session = registry.get_info(&key).map_err(map_session_error)?;
+    resolve_session_execution_root(state, &session)
+        .await
+        .map_err(|error| internal_error(GitError::new(error.to_string())))
+}
+
+async fn resolve_workspace_git_dir(
+    state: &HttpState,
+    query: GitTargetQuery,
+) -> HandlerResult<PathBuf> {
+    let targeted_catalog =
+        load_targeted_workspace_catalog(state, query.workspace_scope.requested_path())
+            .await
+            .map_err(|error| internal_error(GitError::new(error.to_string())))?;
+    let selection = match normalized_optional(query.workspace_id.as_deref()) {
+        Some(workspace_id) => targeted_catalog
+            .catalog
+            .selection(workspace_id)
+            .ok_or_else(|| {
+                bad_request(GitError::new(format!(
+                    "workspace not found: {workspace_id}"
+                )))
+            })?,
+        None => targeted_catalog
+            .catalog
+            .repository
+            .as_ref()
+            .map(WorkspaceSelection::Repository)
+            .ok_or_else(|| {
+                bad_request(GitError::new("git target requires a repository workspace"))
+            })?,
+    };
+    let selected_worktree = requested_worktree(&selection, query.worktree_id.as_deref())?;
+
+    if matches!(selection, WorkspaceSelection::General(_)) {
+        return Err(bad_request(GitError::new(
+            "general workspace does not have a git repository",
+        )));
+    }
+
+    resolve_selection_execution_root(
+        state,
+        &selection,
+        selected_worktree,
+        targeted_catalog.requested_root.as_deref(),
+    )
+    .await
+    .map_err(|error| internal_error(GitError::new(error.to_string())))
+}
+
+fn requested_worktree<'a>(
+    selection: &WorkspaceSelection<'a>,
+    worktree_id: Option<&str>,
+) -> HandlerResult<Option<&'a WorktreeSummary>> {
+    let Some(worktree_id) = normalized_optional(worktree_id) else {
+        return Ok(None);
+    };
+
+    match selection {
+        WorkspaceSelection::General(_) => Err(bad_request(GitError::new(
+            "general workspace does not have git worktrees",
+        ))),
+        WorkspaceSelection::Repository(workspace) => workspace
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .map(Some)
+            .ok_or_else(|| {
+                bad_request(GitError::new(format!("worktree not found: {worktree_id}")))
+            }),
+    }
+}
+
+fn normalized_optional(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+impl GitTargetQuery {
+    fn has_workspace_target(&self) -> bool {
+        normalized_optional(self.workspace_id.as_deref()).is_some()
+            || normalized_optional(self.worktree_id.as_deref()).is_some()
+            || self.workspace_scope.requested_path().is_some()
+    }
+}
+
+fn map_session_error(error: SessionError) -> (StatusCode, Json<ErrorBody>) {
+    match error {
+        SessionError::NotFound(id) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("session not found: {id}"),
+            }),
+        ),
+        other => bad_request(GitError::new(other.to_string())),
+    }
 }
 
 fn bad_request(error: GitError) -> (StatusCode, Json<ErrorBody>) {

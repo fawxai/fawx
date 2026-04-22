@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub(crate) mod auth_store;
 pub mod bundle;
 pub(crate) mod config_redaction;
@@ -20,6 +22,8 @@ pub(crate) mod sse;
 pub(crate) mod state;
 pub mod tailscale;
 pub mod telegram;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token;
 pub(crate) mod types;
 
@@ -52,11 +56,13 @@ pub use tailscale::is_tailscale_ip;
 pub use types::{
     ApiKeyRequest, ApiKeyResponse, AuthProviderDto, ContextInfoDto, ContextInfoSnapshotLike,
     DeleteProviderResponse, ErrorBody, ErrorRecordDto, HealthResponse, MessageRequest,
-    MessageResponse, ModelInfoDto, ModelSwitchDto, RecentErrorsResponse, SendToSessionRequest,
-    SendToSessionResponse, ServerRestartResponse, ServerStatusResponse, ServerStopResponse,
-    SetupAuthStatus, SetupStatusResponse, SetupTailscaleStatus, SetupTokenRequest,
-    SetupTokenResponse, SkillSummaryDto, StatusResponse, ThinkingAdjustedDto, ThinkingLevelDto,
-    VerifyRequest, VerifyResponse,
+    MessageResponse, ModelInfoDto, ModelSwitchDto, RecentErrorsResponse, RepositorySummary,
+    SendToSessionRequest, SendToSessionResponse, ServerRestartResponse, ServerStatusResponse,
+    ServerStopResponse, SetupAuthStatus, SetupStatusResponse, SetupTailscaleStatus,
+    SetupTokenRequest, SetupTokenResponse, SkillSummaryDto, StatusResponse, ThinkingAdjustedDto,
+    ThinkingLevelDto, ThreadKind, ThreadStatus, ThreadSummary, ThreadsResponse, VerifyRequest,
+    VerifyResponse, WorkspaceKind, WorkspaceSummary, WorkspacesResponse, WorktreeStatus,
+    WorktreeSummary, WorktreesResponse,
 };
 
 pub type SharedExperimentRegistry = Arc<Mutex<crate::experiment_registry::ExperimentRegistry>>;
@@ -147,6 +153,8 @@ pub async fn run(
         shared: Arc::clone(&shared),
         config_manager,
         session_registry,
+        session_runs: crate::state::SessionRunRegistry::default(),
+        session_engines: crate::state::SessionEnginePool::default(),
         start_time: Instant::now(),
         server_runtime,
         tailscale_ip: tailscale_ip.clone(),

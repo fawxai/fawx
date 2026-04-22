@@ -1,4 +1,5 @@
 use crate::runtime_info::{AuthorityRuntimeInfo, SkillInfo};
+use crate::tool_routing::ToolRoutingSummary;
 use fx_config::{CapabilityMode, PermissionsConfig, SandboxConfig};
 use serde::Serialize;
 
@@ -90,6 +91,8 @@ pub struct SelfModifyManifest {
 pub struct SkillManifest {
     pub name: String,
     pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing_tools: Vec<ToolRoutingSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +160,7 @@ pub fn build_kernel_manifest(sources: &ManifestSources<'_>) -> KernelManifest {
             .map(|skill| SkillManifest {
                 name: skill.name.clone(),
                 tools: skill.tool_names.clone(),
+                routing_tools: skill.routing_tools.clone(),
             })
             .collect(),
         workspace: WorkspaceManifest {
@@ -244,6 +248,10 @@ fn build_writable_roots(working_dir: &str, allow_paths: &[String]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_routing::{
+        ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolReadinessSummary,
+        ToolRoutingMetadata,
+    };
     use fx_config::{PermissionAction, PermissionPreset};
 
     struct TestFixture {
@@ -311,6 +319,7 @@ mod tests {
                     name: "builtin".to_string(),
                     description: Some("Built-in tools".to_string()),
                     tool_names: vec!["read_file".to_string(), "kernel_manifest".to_string()],
+                    routing_tools: Vec::new(),
                     capabilities: Vec::new(),
                     version: None,
                     source: None,
@@ -324,6 +333,21 @@ mod tests {
                     name: "web".to_string(),
                     description: None,
                     tool_names: vec!["web_search".to_string()],
+                    routing_tools: vec![ToolRoutingSummary {
+                        tool_name: "web_search".to_string(),
+                        metadata: ToolRoutingMetadata {
+                            resource_kinds: vec![ResourceKind::GenericUrl],
+                            operations: vec![RouteOperation::List],
+                            auth_mode: RouteAuthMode::None,
+                            artifact_strategy: ArtifactStrategy::DirectFetch,
+                            fallback_rank: 100,
+                        },
+                        readiness: ToolReadinessSummary {
+                            available: true,
+                            ready: true,
+                            readiness_reason: None,
+                        },
+                    }],
                     capabilities: vec!["search".to_string()],
                     version: None,
                     source: None,
@@ -398,6 +422,10 @@ mod tests {
         assert_eq!(
             manifest.tools[0].tools,
             vec!["read_file", "kernel_manifest"]
+        );
+        assert_eq!(
+            manifest.tools[1].routing_tools[0].metadata.resource_kinds,
+            vec![ResourceKind::GenericUrl]
         );
     }
 

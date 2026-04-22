@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Shared library surface for the Fawx CLI.
 //!
 //! The binary target (`src/main.rs`) keeps the CLI entrypoint. This library

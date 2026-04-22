@@ -24,18 +24,23 @@ Fawx's WASM skills system provides a secure, sandboxed environment for extending
    - `kv_get(key)` - Read from key-value storage
    - `kv_set(key, value)` - Write to key-value storage
 
-4. **Runtime**
+4. **Protocol Definitions** (`fx-protocol`)
+   - Shared Rust types for structured failures and HTTP envelopes that cross the string-only WASM ABI
+   - `StructuredFailure` lets a skill return typed failure classes such as `auth_required`, `not_found`, or `rate_limited`
+   - `HttpResponseEnvelope` preserves HTTP status, safe headers, body text, and transport errors for host-side classification
+
+5. **Runtime**
    - Loads and validates WASM modules
    - Links host functions via wasmtime
    - Enforces capability permissions
    - Manages execution lifecycle
 
-5. **Registry**
+6. **Registry**
    - Discovers installed skills from `~/.fawx/skills/`
    - Loads skills on demand
    - Provides metadata for agent planning
 
-6. **Cache**
+7. **Cache**
    - Caches compiled modules at `~/.fawx/cache/skills/`
    - Invalidates on WASM file hash change
    - Speeds up repeated skill loads
@@ -48,6 +53,7 @@ Skills declare required capabilities in their manifest:
 - `storage` - Persistent key-value storage
 - `notifications` - Send user notifications
 - `sensors` - Read sensor data (location, accelerometer, etc.)
+- `phone_actions` - Control phone functions (high privilege)
 
 Capabilities are enforced at runtime. Skills cannot access resources they haven't declared.
 
@@ -105,6 +111,7 @@ entry_point = "run"
 
 ```rust
 use serde::{Deserialize, Serialize};
+use fx_protocol::{FailureClass, StructuredFailure};
 
 #[derive(Deserialize)]
 struct Input {
@@ -152,6 +159,19 @@ pub extern "C" fn run() {
     
     set_output(&output_json);
 }
+```
+
+Skills that need to report a typed failure should serialize the shared protocol
+payload instead of returning a prose-only error string:
+
+```rust
+let failure = StructuredFailure::new(
+    FailureClass::InvalidRequest,
+    "expression must not be empty",
+    None,
+);
+let output_json = serde_json::to_string(&failure).unwrap();
+set_output(&output_json);
 ```
 
 ### Build And Install

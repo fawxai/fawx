@@ -4,11 +4,16 @@
 //! persists them to storage (redb), and exposes tool-friendly operations
 //! for listing, inspecting, and messaging across sessions.
 
+pub mod failed_turn;
 pub mod registry;
 pub mod session;
 pub mod store;
 pub mod types;
 
+pub use failed_turn::{
+    latest_failed_turn_diagnostic, render_failed_turn_diagnostic_text, FailedTurnDiagnostic,
+    FailedTurnSignal, FailedTurnStop, FailedTurnToolChainItem,
+};
 pub use registry::{SessionError, SessionRegistry};
 pub use session::{
     max_memory_items, max_memory_tokens, prune_unresolved_tool_history, render_content_blocks,
@@ -18,5 +23,5 @@ pub use session::{
 pub use store::SessionStore;
 pub use types::{
     InvalidSessionKey, MessageRole, SessionArchiveFilter, SessionConfig, SessionInfo, SessionKey,
-    SessionKind, SessionStatus,
+    SessionKind, SessionStatus, SessionThreadBinding,
 };

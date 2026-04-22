@@ -372,8 +372,8 @@ mod tests {
     }
 
     fn plan(count: usize, strategy: AggregationStrategy) -> DecompositionPlan {
-        DecompositionPlan {
-            sub_goals: (0..count)
+        DecompositionPlan::standard(
+            (0..count)
                 .map(|index| {
                     SubGoal::new(
                         format!("Goal {index}"),
@@ -384,8 +384,7 @@ mod tests {
                 })
                 .collect(),
             strategy,
-            truncated_from: None,
-        }
+        )
     }
 
     #[tokio::test]

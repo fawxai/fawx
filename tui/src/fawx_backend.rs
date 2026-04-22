@@ -34,9 +34,50 @@ pub struct EngineStatus {
 pub enum BackendEvent {
     Connected(EngineStatus),
     ConnectionError(String),
+    TextPreviewDelta(String),
+    WorkingNarrationDelta {
+        text: String,
+        voiceover_suppressed: bool,
+    },
+    TextReset,
     ToolUse {
         name: String,
         arguments: Value,
+    },
+    ActivityStart {
+        id: String,
+        title: Option<String>,
+        kind: Option<String>,
+    },
+    ActivityEnd {
+        id: String,
+    },
+    ActivityToolCallStart {
+        activity_id: String,
+        id: Option<String>,
+        name: Option<String>,
+    },
+    ActivityToolCallComplete {
+        activity_id: String,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Value,
+    },
+    ActivityToolResult {
+        activity_id: String,
+        id: Option<String>,
+        tool_name: Option<String>,
+        success: bool,
+        content: String,
+    },
+    ToolProgress {
+        activity_id: Option<String>,
+        id: Option<String>,
+        tool_name: Option<String>,
+        category: String,
+        target: Option<String>,
+        advances_slot: Option<String>,
+        outcome: String,
     },
     ToolResult {
         name: Option<String>,
@@ -44,6 +85,9 @@ pub enum BackendEvent {
         content: String,
     },
     TextDelta(String),
+    FinalAnswerDelta(String),
+    CompletedSummary(String),
+    TranscriptPhaseBoundary(TranscriptPhaseBoundary),
     Done {
         model: Option<String>,
         iterations: Option<u32>,
@@ -51,6 +95,30 @@ pub enum BackendEvent {
         output_tokens: Option<u64>,
     },
     StreamError(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranscriptPhaseBoundary {
+    CollectingWork,
+    ExecutingTools,
+    Summarizing,
+    Finalizing,
+    Completed,
+    Other(String),
+}
+
+impl TranscriptPhaseBoundary {
+    fn from_wire(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        match raw.to_ascii_lowercase().as_str() {
+            "collecting_work" => Self::CollectingWork,
+            "executing_tools" => Self::ExecutingTools,
+            "summarizing" => Self::Summarizing,
+            "finalizing" => Self::Finalizing,
+            "completed" => Self::Completed,
+            _ => Self::Other(raw),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,6 +152,91 @@ struct SseFrame {
 #[derive(Deserialize)]
 struct TextDeltaData {
     text: String,
+    #[serde(default)]
+    voiceover_suppressed: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CompletedSummaryData {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct PhaseBoundaryData {
+    phase: String,
+}
+
+/// Data payload for `activity_start` events.
+#[derive(Deserialize)]
+struct ActivityStartData {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Data payload for `activity_end` events.
+#[derive(Deserialize)]
+struct ActivityEndData {
+    id: String,
+}
+
+/// Data payload for `activity_tool_call_start` events.
+#[derive(Deserialize)]
+struct ActivityToolCallStartData {
+    #[serde(rename = "activity_id")]
+    activity_id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Data payload for `activity_tool_call_complete` events.
+#[derive(Deserialize)]
+struct ActivityToolCallCompleteData {
+    #[serde(rename = "activity_id")]
+    activity_id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// Data payload for `activity_tool_result` events.
+#[derive(Deserialize)]
+struct ActivityToolResultData {
+    #[serde(rename = "activity_id")]
+    activity_id: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    output: Option<Value>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Data payload for `tool_progress` events.
+#[derive(Deserialize)]
+struct ToolProgressData {
+    #[serde(default, rename = "activity_id")]
+    activity_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "tool_name")]
+    tool_name: Option<String>,
+    #[serde(rename = "class")]
+    category: String,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default, rename = "advances_slot")]
+    advances_slot: Option<String>,
+    outcome: String,
 }
 
 /// Data payload for `tool_call_start` events.
@@ -110,7 +263,7 @@ struct ToolResultData {
     #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
-    output: Option<String>,
+    output: Option<Value>,
     #[serde(default)]
     is_error: bool,
 }
@@ -518,6 +671,133 @@ fn handle_text_delta(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::
     Ok(())
 }
 
+fn handle_text_preview_delta(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: TextDeltaData = serde_json::from_str(data).context("decode text preview delta")?;
+    try_send(tx, BackendEvent::TextPreviewDelta(d.text));
+    Ok(())
+}
+
+fn handle_working_narration_delta(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+) -> anyhow::Result<()> {
+    let d: TextDeltaData = serde_json::from_str(data).context("decode working narration delta")?;
+    try_send(
+        tx,
+        BackendEvent::WorkingNarrationDelta {
+            text: d.text,
+            voiceover_suppressed: d.voiceover_suppressed.unwrap_or(false),
+        },
+    );
+    Ok(())
+}
+
+fn handle_text_reset(tx: &UnboundedSender<BackendEvent>) {
+    try_send(tx, BackendEvent::TextReset);
+}
+
+fn handle_final_answer_delta(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: TextDeltaData = serde_json::from_str(data).context("decode final_answer_delta")?;
+    try_send(tx, BackendEvent::FinalAnswerDelta(d.text));
+    Ok(())
+}
+
+fn handle_completed_summary(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: CompletedSummaryData = serde_json::from_str(data).context("decode completed_summary")?;
+    try_send(tx, BackendEvent::CompletedSummary(d.text));
+    Ok(())
+}
+
+fn handle_activity_start(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ActivityStartData = serde_json::from_str(data).context("decode activity_start")?;
+    try_send(
+        tx,
+        BackendEvent::ActivityStart {
+            id: d.id,
+            title: d.title,
+            kind: d.kind,
+        },
+    );
+    Ok(())
+}
+
+fn handle_activity_end(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ActivityEndData = serde_json::from_str(data).context("decode activity_end")?;
+    try_send(tx, BackendEvent::ActivityEnd { id: d.id });
+    Ok(())
+}
+
+fn handle_activity_tool_call_start(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+) -> anyhow::Result<()> {
+    let d: ActivityToolCallStartData =
+        serde_json::from_str(data).context("decode activity_tool_call_start")?;
+    try_send(
+        tx,
+        BackendEvent::ActivityToolCallStart {
+            activity_id: d.activity_id,
+            id: d.id,
+            name: d.name,
+        },
+    );
+    Ok(())
+}
+
+fn handle_activity_tool_call_complete(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+) -> anyhow::Result<()> {
+    let d: ActivityToolCallCompleteData =
+        serde_json::from_str(data).context("decode activity_tool_call_complete")?;
+    try_send(
+        tx,
+        BackendEvent::ActivityToolCallComplete {
+            activity_id: d.activity_id,
+            id: d.id,
+            name: d.name,
+            arguments: d.arguments,
+        },
+    );
+    Ok(())
+}
+
+fn handle_activity_tool_result(
+    data: &str,
+    tx: &UnboundedSender<BackendEvent>,
+) -> anyhow::Result<()> {
+    let d: ActivityToolResultData =
+        serde_json::from_str(data).context("decode activity_tool_result")?;
+    try_send(
+        tx,
+        BackendEvent::ActivityToolResult {
+            activity_id: d.activity_id,
+            id: d.id,
+            tool_name: d.tool_name,
+            success: !d.is_error,
+            content: value_to_display_string(d.output),
+        },
+    );
+    Ok(())
+}
+
+fn handle_tool_progress(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
+    let d: ToolProgressData = serde_json::from_str(data).context("decode tool_progress")?;
+    try_send(
+        tx,
+        BackendEvent::ToolProgress {
+            activity_id: d.activity_id,
+            id: d.id,
+            tool_name: d.tool_name,
+            category: d.category,
+            target: d.target,
+            advances_slot: d.advances_slot,
+            outcome: d.outcome,
+        },
+    );
+    Ok(())
+}
+
 fn handle_tool_call_start(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow::Result<()> {
     let d: ToolCallStartData = serde_json::from_str(data).context("decode tool_call_start")?;
     try_send(
@@ -569,10 +849,18 @@ fn handle_tool_result(data: &str, tx: &UnboundedSender<BackendEvent>) -> anyhow:
                 .filter(|name| !name.is_empty())
                 .or_else(|| d.id.filter(|id| !id.is_empty())),
             success: true,
-            content: d.output.unwrap_or_default(),
+            content: value_to_display_string(d.output),
         },
     );
     Ok(())
+}
+
+fn value_to_display_string(value: Option<Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text,
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
 }
 
 fn handle_done(
@@ -621,16 +909,44 @@ fn dispatch_sse_frame(
     };
 
     match sse.event_type.as_str() {
+        "text_preview_delta" => {
+            handle_text_preview_delta(&sse.data, tx)?;
+        }
+        "working_narration_delta" => {
+            handle_working_narration_delta(&sse.data, tx)?;
+        }
+        "text_reset" => handle_text_reset(tx),
         "text_delta" => {
             *saw_text_delta = true;
             handle_text_delta(&sse.data, tx)?;
         }
+        "final_answer_delta" => {
+            *saw_text_delta = true;
+            handle_final_answer_delta(&sse.data, tx)?;
+        }
+        "completed_summary" => handle_completed_summary(&sse.data, tx)?,
+        "activity_start" => handle_activity_start(&sse.data, tx)?,
+        "activity_end" => handle_activity_end(&sse.data, tx)?,
+        "activity_tool_call_start" => handle_activity_tool_call_start(&sse.data, tx)?,
+        "activity_tool_call_complete" => handle_activity_tool_call_complete(&sse.data, tx)?,
+        "activity_tool_result" => handle_activity_tool_result(&sse.data, tx)?,
+        "tool_progress" => handle_tool_progress(&sse.data, tx)?,
         "tool_call_start" => handle_tool_call_start(&sse.data, tx)?,
         "tool_call_complete" => handle_tool_call_complete(&sse.data, tx)?,
         "tool_result" => handle_tool_result(&sse.data, tx)?,
         "tool_error" => handle_tool_error(&sse.data, tx)?,
         "done" => handle_done(&sse.data, tx, *saw_text_delta)?,
-        "phase" => { /* Phase changes are informational; TUI doesn't need them yet. */ }
+        "phase" => {
+            /* Low-level loop phases are informational; transcript boundaries are handled below. */
+        }
+        "phase_boundary" => {
+            let d: PhaseBoundaryData =
+                serde_json::from_str(&sse.data).context("decode phase_boundary")?;
+            try_send(
+                tx,
+                BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::from_wire(d.phase)),
+            );
+        }
         "error" => handle_error(&sse.data, tx)?,
         other => tracing::debug!("ignoring unknown SSE event type: {other}"),
     }
@@ -886,6 +1202,170 @@ model = "gpt-4"
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dispatch_typed_activity_events_preserve_group_contract() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: working_narration_delta\ndata: {\"text\":\"I'm checking the files.\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("working narration should decode");
+        dispatch_sse_frame(
+            "event: activity_start\ndata: {\"id\":\"act-1\",\"title\":\"Read files\",\"kind\":\"tool\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("activity start should decode");
+        dispatch_sse_frame(
+            "event: activity_tool_call_complete\ndata: {\"activity_id\":\"act-1\",\"id\":\"call-1\",\"name\":\"read_file\",\"arguments\":{\"path\":\"tui/src/app.rs\"}}",
+            &tx,
+            &mut saw,
+        )
+        .expect("activity tool complete should decode");
+        dispatch_sse_frame(
+            "event: activity_tool_result\ndata: {\"activity_id\":\"act-1\",\"id\":\"call-1\",\"tool_name\":\"read_file\",\"output\":\"contents\",\"is_error\":false}",
+            &tx,
+            &mut saw,
+        )
+        .expect("activity tool result should decode");
+        dispatch_sse_frame(
+            "event: phase_boundary\ndata: {\"phase\":\"executing_tools\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("activity phase boundary should decode");
+        dispatch_sse_frame(
+            "event: phase_boundary\ndata: {\"phase\":\"summarizing\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("summary phase boundary should decode");
+        dispatch_sse_frame(
+            "event: completed_summary\ndata: {\"text\":\"Worked this turn: 1 file read.\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("completed summary should decode");
+        dispatch_sse_frame(
+            "event: phase_boundary\ndata: {\"phase\":\"finalizing\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("phase boundary should decode");
+        dispatch_sse_frame(
+            "event: final_answer_delta\ndata: {\"text\":\"Done.\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("final answer should decode");
+
+        assert!(matches!(
+            rx.try_recv().expect("narration"),
+            BackendEvent::WorkingNarrationDelta {
+                text,
+                voiceover_suppressed,
+            } if text == "I'm checking the files." && !voiceover_suppressed
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("activity start"),
+            BackendEvent::ActivityStart { id, title, kind }
+                if id == "act-1"
+                    && title.as_deref() == Some("Read files")
+                    && kind.as_deref() == Some("tool")
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("tool complete"),
+            BackendEvent::ActivityToolCallComplete { activity_id, id, name, arguments }
+                if activity_id == "act-1"
+                    && id.as_deref() == Some("call-1")
+                    && name.as_deref() == Some("read_file")
+                    && arguments["path"] == "tui/src/app.rs"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("tool result"),
+            BackendEvent::ActivityToolResult { activity_id, id, tool_name, success, content }
+                if activity_id == "act-1"
+                    && id.as_deref() == Some("call-1")
+                    && tool_name.as_deref() == Some("read_file")
+                    && success
+                    && content == "contents"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("activity phase boundary"),
+            BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::ExecutingTools)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("summary phase boundary"),
+            BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::Summarizing)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("completed summary"),
+            BackendEvent::CompletedSummary(text) if text == "Worked this turn: 1 file read."
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("phase boundary"),
+            BackendEvent::TranscriptPhaseBoundary(TranscriptPhaseBoundary::Finalizing)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("final answer"),
+            BackendEvent::FinalAnswerDelta(text) if text == "Done."
+        ));
+        assert!(saw);
+    }
+
+    #[test]
+    fn dispatch_working_narration_preserves_suppression_signal() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+        dispatch_sse_frame(
+            "event: working_narration_delta\ndata: {\"text\":\"I'm reading app.\",\"voiceover_suppressed\":true}",
+            &tx,
+            &mut saw,
+        )
+        .expect("suppressed working narration should decode");
+
+        assert!(matches!(
+            rx.try_recv().expect("suppressed narration"),
+            BackendEvent::WorkingNarrationDelta {
+                text,
+                voiceover_suppressed,
+            } if text == "I'm reading app." && voiceover_suppressed
+        ));
+    }
+
+    #[test]
+    fn dispatch_text_preview_stays_separate_from_working_narration() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut saw = false;
+
+        dispatch_sse_frame(
+            "event: text_preview_delta\ndata: {\"text\":\"Candidate final text\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("preview should decode");
+        dispatch_sse_frame(
+            "event: working_narration_delta\ndata: {\"text\":\"Committed work narration\"}",
+            &tx,
+            &mut saw,
+        )
+        .expect("working narration should decode");
+
+        assert!(matches!(
+            rx.try_recv().expect("preview"),
+            BackendEvent::TextPreviewDelta(text) if text == "Candidate final text"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("narration"),
+            BackendEvent::WorkingNarrationDelta {
+                text,
+                voiceover_suppressed,
+            } if text == "Committed work narration" && !voiceover_suppressed
+        ));
     }
 
     #[test]

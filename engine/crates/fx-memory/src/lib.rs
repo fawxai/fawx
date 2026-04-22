@@ -4,4 +4,4 @@ pub mod json_memory;
 pub mod signal_store;
 
 pub use json_memory::{DecayConfig, JsonFileMemory, JsonMemoryConfig};
-pub use signal_store::{SignalQuery, SignalStore};
+pub use signal_store::{SignalQuery, SignalSink, SignalStore};

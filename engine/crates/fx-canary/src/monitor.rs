@@ -1,6 +1,6 @@
 use crate::{
-    compute_ratios, current_epoch_secs, Canary, CanaryConfig, RollbackReason, RollbackTrigger,
-    SignalWindow, Verdict,
+    current_epoch_secs, Canary, CanaryConfig, DegradedDimension, HealthSnapshot, RollbackReason,
+    RollbackTrigger, SignalWindow, Verdict,
 };
 use fx_kernel::Signal;
 use std::sync::Arc;
@@ -64,16 +64,21 @@ impl CanaryMonitor {
         self.baseline_captured
     }
 
+    pub fn baseline(&self) -> Option<&HealthSnapshot> {
+        self.canary.baseline()
+    }
+
     fn capture_baseline_if_ready(&mut self) -> bool {
         if self.baseline_captured || self.total_cycles < self.min_cycles_for_baseline {
             return false;
         }
-        if (self.window.signals().len() as u64) < self.min_signals_for_baseline {
+
+        let snapshot = self.window.snapshot(self.window_seconds);
+        if snapshot.total_signals < self.min_signals_for_baseline {
             return false;
         }
 
-        self.canary
-            .capture_baseline(self.window.signals(), self.window_seconds);
+        self.canary.capture_baseline(snapshot);
         self.baseline_captured = true;
         self.cycles_since_eval = 0;
         tracing::info!("canary baseline captured");
@@ -86,19 +91,21 @@ impl CanaryMonitor {
         }
 
         self.cycles_since_eval = 0;
-        let verdict = self.canary.evaluate(self.window.signals());
-        self.handle_verdict(&verdict);
+        let current = self.window.snapshot(self.window_seconds);
+        let verdict = self.canary.evaluate(&current);
+        self.handle_verdict(&verdict, &current);
         Some(verdict)
     }
 
-    fn handle_verdict(&mut self, verdict: &Verdict) {
+    fn handle_verdict(&mut self, verdict: &Verdict, current: &HealthSnapshot) {
         match verdict {
             Verdict::Healthy => {}
-            Verdict::Warning { message } => self.log_warning(message),
+            Verdict::Warning { message, .. } => self.log_warning(message),
             Verdict::Degraded {
                 message,
+                degraded_dimensions,
                 rollback_recommended,
-            } => self.handle_degraded(message, *rollback_recommended),
+            } => self.handle_degraded(message, degraded_dimensions, *rollback_recommended, current),
         }
     }
 
@@ -106,7 +113,13 @@ impl CanaryMonitor {
         tracing::warn!(message = %message, "canary warning");
     }
 
-    fn handle_degraded(&mut self, message: &str, rollback_recommended: bool) {
+    fn handle_degraded(
+        &mut self,
+        message: &str,
+        degraded_dimensions: &[DegradedDimension],
+        rollback_recommended: bool,
+        current: &HealthSnapshot,
+    ) {
         tracing::error!(
             message = %message,
             rollback_recommended,
@@ -115,20 +128,25 @@ impl CanaryMonitor {
         if !rollback_recommended {
             return;
         }
-        let Some(reason) = self.rollback_reason(message) else {
+        let Some(reason) = self.rollback_reason(message, degraded_dimensions, current) else {
             tracing::error!("rollback recommended but no baseline available");
             return;
         };
         self.trigger_rollback(&reason);
     }
 
-    fn rollback_reason(&mut self, message: &str) -> Option<RollbackReason> {
+    fn rollback_reason(
+        &self,
+        message: &str,
+        degraded_dimensions: &[DegradedDimension],
+        current: &HealthSnapshot,
+    ) -> Option<RollbackReason> {
         let baseline = self.canary.baseline()?.clone();
-        let current = compute_ratios(self.window.signals());
         Some(RollbackReason {
             verdict_message: message.to_string(),
-            current_success_rate: current.success_rate,
-            baseline_success_rate: baseline.success_rate,
+            current_health: current.clone(),
+            baseline_health: baseline,
+            degraded_dimensions: degraded_dimensions.to_vec(),
             timestamp_epoch_secs: current_epoch_secs(),
         })
     }
@@ -182,13 +200,15 @@ mod tests {
     }
 
     fn mk_signal(kind: SignalKind) -> Signal {
-        Signal {
-            step: LoopStep::Act,
-            kind,
-            message: String::new(),
-            metadata: serde_json::json!({}),
-            timestamp_ms: current_epoch_secs() * 1_000,
-        }
+        let timestamp_ms = current_epoch_secs().saturating_mul(1_000);
+        let metadata = match kind {
+            SignalKind::Success | SignalKind::Friction => {
+                serde_json::json!({ "classification": "observation" })
+            }
+            SignalKind::Blocked | SignalKind::Retry => serde_json::json!({ "tool": "read_file" }),
+            _ => serde_json::json!({}),
+        };
+        Signal::new(LoopStep::Act, kind, String::new(), metadata, timestamp_ms)
     }
 
     #[test]
@@ -221,7 +241,12 @@ mod tests {
         assert!(monitor
             .on_cycle_complete(vec![success_signal(), success_signal()])
             .is_none());
-        let verdict = monitor.on_cycle_complete(vec![friction_signal(), friction_signal()]);
+        let verdict = monitor.on_cycle_complete(vec![
+            friction_signal(),
+            friction_signal(),
+            mk_signal(SignalKind::Retry),
+            mk_signal(SignalKind::Blocked),
+        ]);
 
         assert!(matches!(verdict, Some(Verdict::Degraded { .. })));
         assert_eq!(trigger.reasons.lock().expect("lock reasons").len(), 1);
@@ -237,14 +262,48 @@ mod tests {
             .take(20)
             .collect::<Vec<_>>();
         let current = std::iter::repeat_with(success_signal)
-            .take(10)
-            .chain(std::iter::repeat_with(friction_signal).take(5))
+            .take(20)
+            .chain(std::iter::repeat_with(|| mk_signal(SignalKind::Retry)).take(12))
             .collect::<Vec<_>>();
 
         assert!(monitor.on_cycle_complete(baseline).is_none());
         let verdict = monitor.on_cycle_complete(current);
 
         assert!(matches!(verdict, Some(Verdict::Warning { .. })));
+        assert!(trigger.reasons.lock().expect("lock reasons").is_empty());
+    }
+
+    #[test]
+    fn baseline_capture_reuses_health_vector() {
+        let mut monitor = CanaryMonitor::new(test_config(), None).with_intervals(1, 1);
+
+        assert!(monitor
+            .on_cycle_complete(vec![success_signal(), success_signal()])
+            .is_none());
+
+        let baseline = monitor.baseline().expect("baseline should be set");
+        assert_eq!(baseline.health.success_rate, Some(1.0));
+    }
+
+    #[test]
+    fn sparse_dimensions_do_not_trigger_rollback() {
+        let trigger = Arc::new(MockTrigger::default());
+        let mut monitor =
+            CanaryMonitor::new(test_config(), Some(trigger.clone())).with_intervals(1, 1);
+
+        let now_ms = current_epoch_secs().saturating_mul(1_000);
+        let trace = Signal::new(
+            LoopStep::Act,
+            SignalKind::Trace,
+            "noise",
+            serde_json::json!({}),
+            now_ms,
+        );
+
+        assert!(monitor.on_cycle_complete(vec![trace.clone()]).is_none());
+        let verdict = monitor.on_cycle_complete(vec![trace]);
+
+        assert_eq!(verdict, Some(Verdict::Healthy));
         assert!(trigger.reasons.lock().expect("lock reasons").is_empty());
     }
 }

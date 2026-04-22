@@ -2,12 +2,16 @@ use crate::startup::fawx_data_dir;
 use anyhow::anyhow;
 use chrono::{TimeZone, Utc};
 use clap::Args;
+use fx_memory::SignalStore;
 use fx_session::{
-    render_content_blocks_with_options, ContentRenderOptions, SessionInfo, SessionKey, SessionKind,
-    SessionMessage, SessionRegistry,
+    latest_failed_turn_diagnostic, render_content_blocks_with_options,
+    render_failed_turn_diagnostic_text, ContentRenderOptions, FailedTurnDiagnostic, SessionInfo,
+    SessionKey, SessionKind, SessionMessage, SessionRegistry,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+
+const FAILED_TURN_SIGNAL_DATA_MISSING_HINT: &str = "no failed terminal turn_stop signal was persisted; if this session failed, signal data may be incomplete because per-session signal persistence is best-effort";
 
 #[derive(Debug, Clone, Args)]
 pub struct ListArgs {
@@ -31,6 +35,18 @@ pub struct ExportArgs {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct FailedTurnArgs {
+    /// Session ID
+    pub id: String,
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// Override data directory (default: ~/.fawx)
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 struct SessionExport {
     info: SessionInfo,
@@ -50,8 +66,21 @@ pub fn run_export(args: &ExportArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+pub fn run_failed_turn(args: &FailedTurnArgs) -> anyhow::Result<i32> {
+    let data_dir = args.data_dir.clone().unwrap_or_else(fawx_data_dir);
+    let diagnostic = load_failed_turn_diagnostic_from(&data_dir, &args.id)?;
+    print_output(args.json, &diagnostic, || {
+        render_failed_turn_diagnostic_text(&diagnostic)
+    })?;
+    Ok(0)
+}
+
 fn session_db_path() -> PathBuf {
     fawx_data_dir().join("sessions.redb")
+}
+
+fn session_db_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("sessions.redb")
 }
 
 fn load_session_infos_from(
@@ -78,6 +107,20 @@ fn load_session_export_from(
     let info = registry.get_info(&key)?;
     let messages = registry.history(&key, limit.unwrap_or(info.message_count))?;
     Ok(SessionExport { info, messages })
+}
+
+fn load_failed_turn_diagnostic_from(
+    data_dir: &Path,
+    id: &str,
+) -> anyhow::Result<FailedTurnDiagnostic> {
+    let export = load_session_export_from(&session_db_path_in(data_dir), id, None)?;
+    let signals = SignalStore::read_session(data_dir, id)?;
+    latest_failed_turn_diagnostic(id, &export.messages, &signals)
+        .ok_or_else(|| {
+            anyhow!(
+                "failed-turn diagnostic not found for session: {id}; {FAILED_TURN_SIGNAL_DATA_MISSING_HINT}"
+            )
+        })
 }
 
 fn open_registry_from(db_path: &Path) -> anyhow::Result<Option<SessionRegistry>> {
@@ -281,6 +324,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::signals::{LoopStep, Signal, SignalKind};
     use fx_session::{
         MessageRole, Session, SessionConfig, SessionContentBlock, SessionMemory, SessionStatus,
         SessionStore,
@@ -310,6 +354,7 @@ mod tests {
                 SessionConfig {
                     label: label.map(ToString::to_string),
                     model: "gpt-4o-mini".to_string(),
+                    thinking: None,
                 },
             )
             .expect("create session");
@@ -323,9 +368,11 @@ mod tests {
             status: SessionStatus::Idle,
             label: Some("poisoned".to_string()),
             model: "gpt-4o-mini".to_string(),
+            thinking: None,
             created_at: 1,
             updated_at: 2,
             archived_at: None,
+            thread_binding: None,
             messages: vec![
                 SessionMessage::structured(
                     MessageRole::Tool,
@@ -358,6 +405,31 @@ mod tests {
         SessionStore::new(storage)
             .save(&poisoned_session(id))
             .expect("save poisoned session");
+    }
+
+    fn failed_terminal_signal(id: u64) -> Signal {
+        Signal::new(
+            LoopStep::Synthesize,
+            SignalKind::Trace,
+            "loop turn terminal status",
+            serde_json::json!({
+                "decision_kind": "turn_stop",
+                "decision": "failed",
+                "failed": true,
+                "result_kind": "incomplete",
+                "stop_reason": "tool synthesis did not produce a usable final response",
+                "iterations": 2,
+            }),
+            2_000 + id,
+        )
+        .with_id(id)
+    }
+
+    fn persist_signals(temp_dir: &TempDir, session_id: &str, signals: &[Signal]) {
+        SignalStore::open(temp_dir.path(), session_id)
+            .expect("open signal store")
+            .persist(signals)
+            .expect("persist signals");
     }
 
     #[test]
@@ -500,6 +572,86 @@ mod tests {
         assert!(rendered.contains("[tool_use:read_file#call_1]"));
         assert!(rendered.contains("[tool_result:call_1]"));
         assert!(rendered.contains("[tool]"));
+    }
+
+    #[test]
+    fn failed_turn_diagnostic_loads_persisted_session_and_redacted_signals() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let registry = test_registry(&temp_dir);
+        let key = create_session(&registry, "failed-1", SessionKind::Main, Some("primary"));
+        registry
+            .record_message_blocks(
+                &key,
+                MessageRole::User,
+                vec![SessionContentBlock::Text {
+                    text: "debug the failed turn".to_string(),
+                }],
+                None,
+            )
+            .expect("record user");
+        registry
+            .record_message_blocks(
+                &key,
+                MessageRole::Assistant,
+                vec![SessionContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    provider_id: None,
+                    name: "run_command".to_string(),
+                    input: serde_json::json!({"command":"print-secret"}),
+                }],
+                None,
+            )
+            .expect("record tool use");
+        registry
+            .record_message_blocks(
+                &key,
+                MessageRole::Tool,
+                vec![SessionContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: serde_json::json!("existing session result"),
+                    is_error: Some(true),
+                }],
+                None,
+            )
+            .expect("record tool result");
+        drop(registry);
+        let signals = vec![
+            Signal::new(
+                LoopStep::Act,
+                SignalKind::Friction,
+                "tool run_command",
+                serde_json::json!({
+                    "decision_kind": "tool_failure",
+                    "decision": "failed",
+                    "tool": "run_command",
+                    "tool_call_id": "call-1",
+                    "output": "SECRET_TOKEN=abc123",
+                    "failure_class": "permanent",
+                }),
+                2_001,
+            )
+            .with_id(1),
+            failed_terminal_signal(2),
+        ];
+        persist_signals(&temp_dir, "failed-1", &signals);
+
+        let diagnostic =
+            load_failed_turn_diagnostic_from(temp_dir.path(), "failed-1").expect("diagnostic");
+
+        assert_eq!(
+            diagnostic.user_message.as_deref(),
+            Some("debug the failed turn")
+        );
+        assert_eq!(diagnostic.tool_chain.len(), 2);
+        let tool_failure = diagnostic
+            .decision_traces
+            .iter()
+            .find(|trace| trace.metadata["decision_kind"] == "tool_failure")
+            .expect("tool failure trace");
+        assert_eq!(
+            tool_failure.metadata["output"],
+            serde_json::json!("[redacted: 19 bytes]")
+        );
     }
 
     #[test]

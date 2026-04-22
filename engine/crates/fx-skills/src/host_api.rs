@@ -1,6 +1,8 @@
 //! Host API trait and implementations for WASM skills.
 
 use fx_core::error::SkillError;
+pub use fx_protocol::{HttpResponseEnvelope, HttpResponseRecord, HttpTransportError};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +34,18 @@ pub trait HostApi: Send + Sync {
     /// - `headers`: JSON-encoded header map (e.g., `{"Content-Type": "application/json"}`)
     /// - `body`: Request body (empty string for no body)
     fn http_request(&self, method: &str, url: &str, headers: &str, body: &str) -> Option<String>;
+
+    /// Make an HTTP request and preserve structured status/headers on success or failure.
+    fn http_request_v2(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &str,
+        body: &str,
+    ) -> Option<String> {
+        let _ = (method, url, headers, body);
+        None
+    }
 
     /// Execute a shell command. Returns JSON: {"stdout": "...", "stderr": "...", "exit_code": N}
     /// Returns None if Shell capability is not granted.
@@ -164,8 +178,8 @@ impl HostApiBase {
 pub struct MockHostApi {
     base: HostApiBase,
     logs: Arc<Mutex<Vec<(u32, String)>>>,
-    /// Canned HTTP responses: maps URL to response body.
-    http_responses: Arc<Mutex<HashMap<String, String>>>,
+    /// Canned HTTP responses: maps URL to structured envelopes.
+    http_responses: Arc<Mutex<HashMap<String, HttpResponseEnvelope>>>,
 }
 
 impl MockHostApi {
@@ -182,10 +196,22 @@ impl MockHostApi {
     ///
     /// When `http_request` is called with this URL, the canned response is returned.
     pub fn add_http_response(&self, url: impl Into<String>, response: impl Into<String>) {
+        self.add_http_response_envelope(
+            url,
+            HttpResponseEnvelope::response(200, BTreeMap::new(), response),
+        );
+    }
+
+    /// Register a canned structured HTTP response envelope for a URL.
+    pub fn add_http_response_envelope(
+        &self,
+        url: impl Into<String>,
+        response: HttpResponseEnvelope,
+    ) {
         self.http_responses
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(url.into(), response.into());
+            .insert(url.into(), response);
     }
 
     /// Get the output that was set by the skill.
@@ -252,7 +278,25 @@ impl HostApi for MockHostApi {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(url)
+            .and_then(|response| match response {
+                HttpResponseEnvelope::Response(response) => Some(response.body.clone()),
+                HttpResponseEnvelope::TransportError(_) => None,
+            })
+    }
+
+    fn http_request_v2(
+        &self,
+        _method: &str,
+        url: &str,
+        _headers: &str,
+        _body: &str,
+    ) -> Option<String> {
+        self.http_responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(url)
             .cloned()
+            .and_then(|response| serde_json::to_string(&response).ok())
     }
 
     fn get_output(&self) -> String {
@@ -342,6 +386,27 @@ mod tests {
 
         let response = api.http_request("GET", "https://example.com", "{}", "");
         assert_eq!(response, None);
+    }
+
+    #[test]
+    fn test_mock_host_api_http_request_v2_preserves_status_and_headers() {
+        let api = MockHostApi::new("");
+        let mut headers = BTreeMap::new();
+        headers.insert("retry-after".to_string(), "30".to_string());
+        api.add_http_response_envelope(
+            "https://api.example.com/data",
+            HttpResponseEnvelope::response(429, headers.clone(), r#"{"error":"slow down"}"#),
+        );
+
+        let response = api
+            .http_request_v2("GET", "https://api.example.com/data", "{}", "")
+            .expect("structured response");
+        let parsed: HttpResponseEnvelope =
+            serde_json::from_str(&response).expect("valid structured response");
+        assert_eq!(
+            parsed,
+            HttpResponseEnvelope::response(429, headers, r#"{"error":"slow down"}"#)
+        );
     }
 
     #[test]

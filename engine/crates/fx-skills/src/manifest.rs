@@ -1,8 +1,11 @@
 //! Skill manifest parsing and validation.
 
 use fx_core::error::SkillError;
+use fx_core::tool_routing::{RouteAuthMode, ToolRoutingMetadata};
+use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 /// Capability a skill can request.
@@ -80,6 +83,44 @@ pub enum SkillToolAuthoritySurface {
     Other,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSettingFieldType {
+    Text,
+    Secret,
+    Boolean,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillSettingsManifest {
+    #[serde(default = "default_settings_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub fields: Vec<SkillSettingFieldManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillSettingFieldManifest {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub field_type: SkillSettingFieldType,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub help_text: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub min_length: Option<usize>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
+    /// Optional server-side Rust `regex` pattern. The server is authoritative
+    /// for pattern validation because client regex engines may differ.
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -105,6 +146,12 @@ pub struct SkillManifest {
     /// Optional tool definitions declared by the skill.
     #[serde(default)]
     pub tools: Vec<SkillToolManifest>,
+    /// Optional skill-level intent hints for future routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_hints: Vec<String>,
+    /// Optional user-configurable settings exposed through shell UIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SkillSettingsManifest>,
     /// Entry point function name
     #[serde(default = "default_entry_point")]
     pub entry_point: String,
@@ -117,6 +164,8 @@ pub struct SkillToolManifest {
     pub description: String,
     #[serde(default)]
     pub authority_surface: Option<SkillToolAuthoritySurface>,
+    #[serde(default)]
+    pub routing: Option<ToolRoutingMetadata>,
     #[serde(default)]
     pub direct_utility: bool,
     #[serde(default)]
@@ -140,6 +189,10 @@ fn default_entry_point() -> String {
     "run".to_string()
 }
 
+const fn default_settings_version() -> u32 {
+    1
+}
+
 /// Parse a skill manifest from TOML.
 pub fn parse_manifest(toml_str: &str) -> Result<SkillManifest, SkillError> {
     toml::from_str(toml_str)
@@ -157,6 +210,140 @@ pub fn validate_skill_name(name: &str) -> Result<(), SkillError> {
         return Err(SkillError::InvalidManifest(
             "name must not contain path separators or '..'".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+/// Validate that every string entry in a manifest field is non-blank after trimming.
+pub fn validate_nonblank_string_entries(
+    field_name: &str,
+    values: &[String],
+) -> Result<(), SkillError> {
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.trim().is_empty())
+    {
+        return Err(SkillError::InvalidManifest(format!(
+            "{}[{}] cannot be blank",
+            field_name, index
+        )));
+    }
+
+    Ok(())
+}
+
+const MAX_INTENT_HINTS: usize = 64;
+const MAX_INTENT_HINT_LENGTH: usize = 256;
+
+pub type CompiledSettingPatterns = BTreeMap<String, Regex>;
+
+/// Validate `intent_hints` for blank, duplicate, and unbounded entries.
+pub fn validate_intent_hints(intent_hints: &[String]) -> Result<(), SkillError> {
+    if intent_hints.len() > MAX_INTENT_HINTS {
+        return Err(SkillError::InvalidManifest(format!(
+            "intent_hints cannot contain more than {} entries",
+            MAX_INTENT_HINTS
+        )));
+    }
+
+    validate_nonblank_string_entries("intent_hints", intent_hints)?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, intent_hint) in intent_hints.iter().enumerate() {
+        if intent_hint.chars().count() > MAX_INTENT_HINT_LENGTH {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] cannot exceed {} characters",
+                MAX_INTENT_HINT_LENGTH
+            )));
+        }
+
+        if !seen.insert(intent_hint.as_str()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "intent_hints[{index}] duplicates a previous entry"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn compile_setting_patterns(
+    fields: &[SkillSettingFieldManifest],
+) -> Result<CompiledSettingPatterns, SkillError> {
+    let mut compiled = BTreeMap::new();
+
+    for field in fields {
+        let Some(pattern) = field.pattern.as_deref() else {
+            continue;
+        };
+
+        let regex = Regex::new(pattern).map_err(|error| {
+            SkillError::InvalidManifest(format!(
+                "settings field '{}' has invalid pattern: {}",
+                field.key, error
+            ))
+        })?;
+        compiled.insert(field.key.clone(), regex);
+    }
+
+    Ok(compiled)
+}
+
+pub fn validate_setting_value(
+    field: &SkillSettingFieldManifest,
+    value: Option<&str>,
+    compiled_pattern: Option<&Regex>,
+) -> Result<(), SkillError> {
+    if field.required && value.is_none() {
+        return Err(SkillError::InvalidManifest(format!(
+            "{} is required.",
+            field.label
+        )));
+    }
+
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    if matches!(field.field_type, SkillSettingFieldType::Boolean)
+        && value != "true"
+        && value != "false"
+    {
+        return Err(SkillError::InvalidManifest(format!(
+            "{} must be either 'true' or 'false'",
+            field.label
+        )));
+    }
+
+    let length = value.chars().count();
+
+    if let Some(min_length) = field.min_length {
+        if length < min_length {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} must be at least {} characters.",
+                field.label, min_length
+            )));
+        }
+    }
+
+    if let Some(max_length) = field.max_length {
+        if length > max_length {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} must be at most {} characters.",
+                field.label, max_length
+            )));
+        }
+    }
+
+    if let Some(regex) = compiled_pattern {
+        if !regex.is_match(value) {
+            return Err(SkillError::InvalidManifest(format!(
+                "{} is invalid.",
+                field.label
+            )));
+        }
     }
 
     Ok(())
@@ -206,7 +393,81 @@ pub fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillError> {
         ));
     }
 
+    validate_intent_hints(&manifest.intent_hints)?;
+    validate_settings(manifest.settings.as_ref())?;
     validate_tools(&manifest.tools)?;
+
+    Ok(())
+}
+
+fn validate_settings(settings: Option<&SkillSettingsManifest>) -> Result<(), SkillError> {
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+
+    if settings.version != default_settings_version() {
+        return Err(SkillError::InvalidManifest(format!(
+            "unsupported settings version '{}'",
+            settings.version
+        )));
+    }
+
+    let mut seen_field_keys = BTreeSet::new();
+    for (index, field) in settings.fields.iter().enumerate() {
+        if field.key.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].key cannot be empty"
+            )));
+        }
+
+        if field.key.contains("..") || field.key.contains('/') || field.key.contains('\\') {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].key must not contain path separators or '..'"
+            )));
+        }
+
+        if !seen_field_keys.insert(field.key.as_str()) {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}] duplicates key '{}'",
+                field.key
+            )));
+        }
+
+        if field.label.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings.fields[{index}].label cannot be empty"
+            )));
+        }
+
+        if matches!(field.field_type, SkillSettingFieldType::Boolean)
+            && (field.min_length.is_some() || field.max_length.is_some() || field.pattern.is_some())
+        {
+            return Err(SkillError::InvalidManifest(format!(
+                "settings field '{}' cannot use min_length, max_length, or pattern with boolean type",
+                field.key
+            )));
+        }
+
+        if let (Some(min_length), Some(max_length)) = (field.min_length, field.max_length) {
+            if min_length > max_length {
+                return Err(SkillError::InvalidManifest(format!(
+                    "settings field '{}' has min_length greater than max_length",
+                    field.key
+                )));
+            }
+        }
+
+        if let Some(pattern) = &field.pattern {
+            if pattern.trim().is_empty() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "settings field '{}' pattern cannot be empty",
+                    field.key
+                )));
+            }
+        }
+    }
+
+    let _ = compile_setting_patterns(&settings.fields)?;
 
     Ok(())
 }
@@ -230,6 +491,9 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
                 "direct utility tool '{}' must declare at least one trigger pattern",
                 tool.name
             )));
+        }
+        if let Some(routing) = &tool.routing {
+            validate_tool_routing(&tool.name, routing)?;
         }
         if !seen_tool_names.insert(tool.name.clone()) {
             return Err(SkillError::InvalidManifest(format!(
@@ -270,11 +534,56 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
     Ok(())
 }
 
+fn validate_tool_routing(tool_name: &str, routing: &ToolRoutingMetadata) -> Result<(), SkillError> {
+    if routing.resource_kinds.is_empty() {
+        return Err(SkillError::InvalidManifest(format!(
+            "tool '{}' routing.resource_kinds cannot be empty",
+            tool_name
+        )));
+    }
+
+    if routing.operations.is_empty() {
+        return Err(SkillError::InvalidManifest(format!(
+            "tool '{}' routing.operations cannot be empty",
+            tool_name
+        )));
+    }
+
+    if let RouteAuthMode::CredentialRequired { key } = &routing.auth_mode {
+        if key.trim().is_empty() {
+            return Err(SkillError::InvalidManifest(format!(
+                "tool '{}' routing.auth_mode credential key cannot be blank",
+                tool_name
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fx_core::tool_routing::{ArtifactStrategy, ResourceKind, RouteOperation};
     use std::fs;
     use std::path::PathBuf;
+
+    fn brave_search_settings_manifest_toml(fields_toml: &str) -> String {
+        format!(
+            r#"
+name = "brave-search"
+version = "1.0.0"
+description = "Search the web"
+author = "Fawx Team"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+{fields_toml}
+"#
+        )
+    }
 
     #[test]
     fn test_parse_valid_manifest() {
@@ -294,6 +603,7 @@ entry_point = "run"
         assert_eq!(manifest.api_version, "host_api_v1");
         assert_eq!(manifest.capabilities, vec![Capability::Network]);
         assert!(manifest.tools.is_empty());
+        assert!(manifest.intent_hints.is_empty());
         assert_eq!(manifest.entry_point, "run");
     }
 
@@ -329,6 +639,7 @@ required = true
             manifest.tools[0].authority_surface,
             Some(SkillToolAuthoritySurface::Network)
         );
+        assert_eq!(manifest.tools[0].routing, None);
         assert!(manifest.tools[0].direct_utility);
         assert_eq!(
             manifest.tools[0].trigger_patterns,
@@ -338,6 +649,375 @@ required = true
         assert_eq!(manifest.tools[0].parameters[0].name, "query");
         assert_eq!(manifest.tools[0].parameters[0].kind, "string");
         assert!(manifest.tools[0].parameters[0].required);
+    }
+
+    #[test]
+    fn test_parse_manifest_with_settings() {
+        let toml = brave_search_settings_manifest_toml(
+            r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+min_length = 8
+max_length = 128
+
+[[settings.fields]]
+key = "safesearch"
+label = "Safe Search"
+type = "boolean"
+help_text = "Enable family-safe results."
+"#,
+        );
+
+        let manifest = parse_manifest(&toml).expect("parse manifest");
+        let settings = manifest.settings.expect("settings");
+        assert_eq!(settings.version, 1);
+        assert_eq!(settings.fields.len(), 2);
+        assert_eq!(settings.fields[0].key, "api_key");
+        assert_eq!(settings.fields[0].field_type, SkillSettingFieldType::Secret);
+        assert!(settings.fields[0].required);
+        assert_eq!(settings.fields[0].min_length, Some(8));
+        assert_eq!(settings.fields[0].max_length, Some(128));
+        assert_eq!(
+            settings.fields[1].field_type,
+            SkillSettingFieldType::Boolean
+        );
+    }
+
+    #[test]
+    fn test_parse_manifest_with_routing_metadata() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "web_fetch"
+description = "Fetch a web page"
+routing = { resource_kinds = ["generic_url"], operations = ["fetch"], auth_mode = { kind = "none" }, artifact_strategy = "direct_fetch", fallback_rank = 100 }
+"#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let routing = manifest.tools[0].routing.clone().expect("routing");
+
+        assert_eq!(
+            routing.resource_kinds,
+            vec![fx_core::tool_routing::ResourceKind::GenericUrl]
+        );
+        assert_eq!(
+            routing.operations,
+            vec![fx_core::tool_routing::RouteOperation::Fetch]
+        );
+        assert_eq!(routing.auth_mode, RouteAuthMode::None);
+        assert_eq!(
+            routing.artifact_strategy,
+            fx_core::tool_routing::ArtifactStrategy::DirectFetch
+        );
+        assert_eq!(routing.fallback_rank, 100);
+    }
+
+    #[test]
+    fn test_parse_manifest_with_probe_first_routing_metadata() {
+        let toml = r#"
+name = "browser"
+version = "1.0.0"
+description = "Browser skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+entry_point = "run"
+
+[[tools]]
+name = "web_screenshot"
+description = "Capture a page screenshot"
+
+[tools.routing]
+resource_kinds = ["generic_url"]
+operations = ["fetch"]
+artifact_strategy = "probe_first"
+fallback_rank = 100
+
+[tools.routing.auth_mode]
+kind = "none"
+"#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        let routing = manifest.tools[0].routing.clone().expect("routing");
+
+        assert_eq!(routing.resource_kinds, vec![ResourceKind::GenericUrl]);
+        assert_eq!(routing.operations, vec![RouteOperation::Fetch]);
+        assert_eq!(routing.artifact_strategy, ArtifactStrategy::ProbeFirst);
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_settings_keys() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![
+                    SkillSettingFieldManifest {
+                        key: "api_key".to_string(),
+                        label: "API Key".to_string(),
+                        field_type: SkillSettingFieldType::Secret,
+                        placeholder: None,
+                        help_text: None,
+                        required: true,
+                        min_length: Some(8),
+                        max_length: None,
+                        pattern: None,
+                    },
+                    SkillSettingFieldManifest {
+                        key: "api_key".to_string(),
+                        label: "Replacement API Key".to_string(),
+                        field_type: SkillSettingFieldType::Secret,
+                        placeholder: None,
+                        help_text: None,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                        pattern: None,
+                    },
+                ],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicates key"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_settings_pattern() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![SkillSettingFieldManifest {
+                    key: "region".to_string(),
+                    label: "Region".to_string(),
+                    field_type: SkillSettingFieldType::Text,
+                    placeholder: None,
+                    help_text: None,
+                    required: false,
+                    min_length: None,
+                    max_length: None,
+                    pattern: Some("[".to_string()),
+                }],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("invalid pattern"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_inverted_settings_length_bounds() {
+        let manifest = SkillManifest {
+            name: "brave-search".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Search the web".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![],
+            settings: Some(SkillSettingsManifest {
+                version: 1,
+                fields: vec![SkillSettingFieldManifest {
+                    key: "region".to_string(),
+                    label: "Region".to_string(),
+                    field_type: SkillSettingFieldType::Text,
+                    placeholder: None,
+                    help_text: None,
+                    required: false,
+                    min_length: Some(8),
+                    max_length: Some(4),
+                    pattern: None,
+                }],
+            }),
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("min_length greater than max_length"))
+        );
+    }
+
+    #[test]
+    fn test_validate_setting_value_enforces_max_length() {
+        let field = SkillSettingFieldManifest {
+            key: "region".to_string(),
+            label: "Region".to_string(),
+            field_type: SkillSettingFieldType::Text,
+            placeholder: None,
+            help_text: None,
+            required: false,
+            min_length: None,
+            max_length: Some(4),
+            pattern: None,
+        };
+
+        let result = validate_setting_value(&field, Some("global"), None);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("at most 4 characters"))
+        );
+    }
+
+    #[test]
+    fn test_parse_manifest_with_intent_hints_round_trips() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![
+                "review pr".to_string(),
+                "github issue management".to_string(),
+            ],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let toml = toml::to_string(&manifest).expect("serialize manifest");
+        let parsed = parse_manifest(&toml).expect("parse manifest");
+
+        assert_eq!(parsed.name, manifest.name);
+        assert_eq!(parsed.version, manifest.version);
+        assert_eq!(parsed.description, manifest.description);
+        assert_eq!(parsed.author, manifest.author);
+        assert_eq!(parsed.api_version, manifest.api_version);
+        assert_eq!(parsed.intent_hints, manifest.intent_hints);
+    }
+
+    #[test]
+    fn test_parse_manifest_defaults_intent_hints_to_empty() {
+        let toml = r#"
+name = "review-helper"
+version = "1.0.0"
+description = "Review helper"
+author = "Fawx Team"
+api_version = "host_api_v1"
+        "#;
+
+        let manifest = parse_manifest(toml).expect("parse manifest");
+        assert!(manifest.intent_hints.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec!["review pr".to_string(), "review pr".to_string()],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicates a previous entry"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_too_many_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: (0..=MAX_INTENT_HINTS)
+                .map(|index| format!("hint-{index}"))
+                .collect(),
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("more than 64 entries"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_overlong_intent_hint() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec![
+                "review pr".to_string(),
+                "a".repeat(MAX_INTENT_HINT_LENGTH + 1),
+            ],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("cannot exceed 256 characters"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_intent_hints() {
+        let manifest = SkillManifest {
+            name: "review-helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Review helper".to_string(),
+            author: "Fawx Team".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![],
+            intent_hints: vec!["review pr".to_string(), "   ".to_string()],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("intent_hints[1]"))
+        );
     }
 
     #[test]
@@ -353,8 +1033,9 @@ required = true
                 name: "weather".to_string(),
                 description: "Weather".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: true,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![SkillToolParameterManifest {
                     name: "location".to_string(),
                     kind: "string".to_string(),
@@ -362,12 +1043,121 @@ required = true
                     required: true,
                 }],
             }],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
         let result = validate_manifest(&manifest);
         assert!(result.is_err());
         assert!(matches!(result, Err(SkillError::InvalidManifest(_))));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_tool_routing_resource_kinds() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: Vec::new(),
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("routing.resource_kinds cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_tool_routing_operations() {
+        let manifest = SkillManifest {
+            name: "browser".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Browser".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GenericUrl],
+                    operations: Vec::new(),
+                    auth_mode: RouteAuthMode::None,
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 100,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("routing.operations cannot be empty"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_tool_routing_credential_key() {
+        let manifest = SkillManifest {
+            name: "github".to_string(),
+            version: "1.0.0".to_string(),
+            description: "GitHub".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "view_pr".to_string(),
+                description: "View pull request".to_string(),
+                authority_surface: Some(SkillToolAuthoritySurface::Network),
+                routing: Some(ToolRoutingMetadata {
+                    resource_kinds: vec![fx_core::tool_routing::ResourceKind::GitHubPullRequest],
+                    operations: vec![fx_core::tool_routing::RouteOperation::Fetch],
+                    auth_mode: RouteAuthMode::CredentialRequired {
+                        key: "   ".to_string(),
+                    },
+                    artifact_strategy: fx_core::tool_routing::ArtifactStrategy::DirectFetch,
+                    fallback_rank: 10,
+                }),
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("credential key cannot be blank"))
+        );
     }
 
     #[test]
@@ -391,6 +1181,8 @@ name = "broken
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -409,6 +1201,8 @@ name = "broken
             api_version: "host_api_v2".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
         assert!(validate_manifest(&manifest).is_ok());
@@ -424,6 +1218,8 @@ name = "broken
             api_version: "v2".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -480,6 +1276,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -496,6 +1294,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -569,6 +1369,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -585,6 +1387,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -601,6 +1405,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -621,6 +1427,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
             api_version: "host_api_v1".to_string(),
             capabilities: vec![],
             tools: vec![],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -642,19 +1450,23 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     name: "web_search".to_string(),
                     description: "Search".to_string(),
                     authority_surface: None,
+                    routing: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
                 SkillToolManifest {
                     name: "web_search".to_string(),
                     description: "Duplicate".to_string(),
                     authority_surface: None,
+                    routing: None,
                     direct_utility: false,
-                    trigger_patterns: Vec::new(),
+                    trigger_patterns: vec![],
                     parameters: vec![],
                 },
             ],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 
@@ -677,8 +1489,9 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                 name: "web_search".to_string(),
                 description: "Search".to_string(),
                 authority_surface: None,
+                routing: None,
                 direct_utility: false,
-                trigger_patterns: Vec::new(),
+                trigger_patterns: vec![],
                 parameters: vec![
                     SkillToolParameterManifest {
                         name: "query".to_string(),
@@ -694,6 +1507,8 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     },
                 ],
             }],
+            intent_hints: vec![],
+            settings: None,
             entry_point: "run".to_string(),
         };
 

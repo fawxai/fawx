@@ -1,14 +1,19 @@
 use super::*;
+use crate::act::{ContinuationToolScope, FailureClass};
 use crate::budget::{BudgetConfig, BudgetTracker, TerminationConfig};
 use crate::cancellation::CancellationToken;
 use crate::input::{loop_input_channel, LoopCommand};
+use crate::loop_engine::tool_execution::ToolLoopExhaustionReason;
 use async_trait::async_trait;
 use fx_core::error::LlmError as CoreLlmError;
+use fx_core::runtime_info::{ConfigSummary, RuntimeInfo, SkillInfo};
 use fx_core::types::{InputSource, ScreenState, UserInput};
-use fx_llm::{CompletionResponse, ContentBlock, Message, ProviderError, ToolCall, ToolDefinition};
+use fx_llm::{
+    CompletionResponse, ContentBlock, Message, MessageRole, ProviderError, ToolCall, ToolDefinition,
+};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Tool executor that tracks how many calls were actually executed
 /// and supports cooperative cancellation.
@@ -37,6 +42,7 @@ impl ToolExecutor for CountingToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             });
             // Cancel after first tool call to test partial execution
             if let Some(token) = cancel {
@@ -76,6 +82,7 @@ impl ToolExecutor for Phase4StubToolExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
             })
             .collect())
     }
@@ -113,6 +120,40 @@ impl ToolExecutor for Phase4NoDecomposeExecutor {
                 tool_name: call.name.clone(),
                 success: true,
                 output: "ok".to_string(),
+                failure_class: None,
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]
+    }
+}
+
+#[derive(Debug)]
+struct Phase4OutputToolExecutor {
+    output: String,
+}
+
+#[async_trait]
+impl ToolExecutor for Phase4OutputToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: self.output.clone(),
+                failure_class: None,
             })
             .collect())
     }
@@ -250,10 +291,53 @@ fn p4_engine_with_executor(
         .expect("test engine build")
 }
 
+fn runtime_info_with_skills(skills: Vec<SkillInfo>) -> Arc<RwLock<RuntimeInfo>> {
+    Arc::new(RwLock::new(RuntimeInfo {
+        active_model: String::new(),
+        provider: String::new(),
+        skills,
+        config_summary: ConfigSummary {
+            max_iterations: 3,
+            max_history: 20,
+            memory_enabled: false,
+        },
+        authority: None,
+        version: "test".to_string(),
+    }))
+}
+
+fn runtime_skill_info(name: &str, description: &str) -> SkillInfo {
+    SkillInfo {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        tool_names: Vec::new(),
+        routing_tools: Vec::new(),
+        capabilities: Vec::new(),
+        version: None,
+        source: None,
+        revision_hash: None,
+        manifest_hash: None,
+        activated_at_ms: None,
+        signature_status: None,
+        stale_source: None,
+    }
+}
+
 fn has_tool_round_progress_nudge(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
             ContentBlock::Text { text } => text.contains(TOOL_ROUND_PROGRESS_NUDGE),
+            _ => false,
+        })
+    })
+}
+
+fn has_retry_circuit_breaker_guidance(messages: &[Message], needle: &str) -> bool {
+    messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => {
+                text.contains("Tool guardrails:") && text.contains(needle)
+            }
             _ => false,
         })
     })
@@ -326,14 +410,29 @@ fn tool_use_response(calls: Vec<ToolCall>) -> CompletionResponse {
     }
 }
 
+fn tool_use_response_with_text(text: &str, calls: Vec<ToolCall>) -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        tool_calls: calls,
+        usage: None,
+        stop_reason: Some("tool_use".to_string()),
+    }
+}
+
 fn text_response(text: &str) -> CompletionResponse {
+    text_response_with_stop(text, None)
+}
+
+fn text_response_with_stop(text: &str, stop_reason: Option<&str>) -> CompletionResponse {
     CompletionResponse {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
         tool_calls: Vec::new(),
         usage: None,
-        stop_reason: None,
+        stop_reason: stop_reason.map(ToString::to_string),
     }
 }
 
@@ -377,6 +476,186 @@ async fn act_with_tools_executes_all_calls_and_returns_completion_text() {
     assert_eq!(action.response_text, "combined tool output");
 }
 
+#[test]
+fn task_contract_extraction_strips_internal_plan_block_from_visible_text() {
+    let extracted = extract_task_contract_from_text(
+        "Task plan:\n- [ ] ENGINEERING.md\n- [ ] TASTE.md\n\nReady to gather context.",
+    );
+
+    let contract = extracted.contract.expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Gathering);
+    assert_eq!(contract.inputs.len(), 2);
+    assert_eq!(contract.inputs[0].description, "ENGINEERING.md");
+    assert_eq!(contract.inputs[1].description, "TASTE.md");
+    assert_eq!(
+        extracted.visible_text.as_deref(),
+        Some("Ready to gather context.")
+    );
+}
+
+#[test]
+fn task_contract_extraction_accepts_checked_checkbox_prefixes() {
+    let extracted =
+        extract_task_contract_from_text("Task plan:\n- [x] Issue 1740\n- [X] ENGINEERING.md");
+
+    let contract = extracted.contract.expect("task contract");
+    assert_eq!(contract.inputs.len(), 2);
+    assert_eq!(contract.inputs[0].description, "Issue 1740");
+    assert_eq!(contract.inputs[1].description, "ENGINEERING.md");
+}
+
+#[tokio::test]
+async fn task_contract_satisfied_round_strips_follow_up_tools() {
+    let mut engine = p4_engine();
+    let decision = Decision::UseTools(vec![
+        read_file_call("1", "/repo/ENGINEERING.md"),
+        read_file_call("2", "/repo/TASTE.md"),
+    ]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md\n- TASTE.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("I have enough context now.")]);
+    let context_messages = vec![Message::user("read the doctrine docs")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "I have enough context now.");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].tools.is_empty(),
+        "task contract satisfaction should force synthesis without more tools"
+    );
+    let contract = engine.task_contract.as_ref().expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Synthesizing);
+    assert!(contract.inputs.iter().all(|input| input.satisfied));
+}
+
+#[tokio::test]
+async fn task_contract_ignores_unrelated_tool_output_when_matching_inputs() {
+    let mut engine = p4_engine_with_executor(
+        BudgetConfig::default(),
+        3,
+        Arc::new(Phase4OutputToolExecutor {
+            output: "README.md happens to mention ENGINEERING.md in the body.".to_string(),
+        }),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("1", "/repo/README.md")]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("Still gathering context.")]);
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &[Message::user("Read README.md first, then keep gathering.")],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "Still gathering context.");
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].tools.is_empty(),
+        "unrelated tool output should not force synthesis"
+    );
+    let contract = engine.task_contract.as_ref().expect("task contract");
+    assert_eq!(contract.phase, TaskPhase::Gathering);
+    assert!(!contract.inputs[0].satisfied);
+}
+
+#[tokio::test]
+async fn task_contract_plan_text_does_not_leak_into_visible_response() {
+    let mut engine = p4_engine();
+    let decision = Decision::UseTools(vec![read_file_call("1", "/repo/ENGINEERING.md")]);
+    engine.capture_tool_response_state(&tool_use_response_with_text(
+        "Task plan:\n- ENGINEERING.md",
+        calls_from_decision(&decision).to_vec(),
+    ));
+    let llm = Phase4MockLlm::new(vec![text_response("Summarized the file contents.")]);
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &[Message::user("read ENGINEERING.md")],
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "Summarized the file contents.");
+    assert!(!action.response_text.contains("Task plan:"));
+}
+
+#[tokio::test]
+async fn act_with_tools_includes_runtime_skill_capabilities_in_continuation_request() {
+    let mut engine = p4_engine();
+    engine.set_runtime_info(runtime_info_with_skills(vec![
+        runtime_skill_info(
+            "git",
+            "Inspect and manage git repositories, branches, merges, pushes, and PR creation.",
+        ),
+        runtime_skill_info("blank", "   "),
+    ]));
+
+    let decision = Decision::UseTools(vec![read_file_call("1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-1", "README.md")]),
+        text_response("done"),
+    ]);
+    let context_messages = vec![Message::user("read the file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    let requests = llm.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should trigger a continuation request"
+    );
+    let continuation_prompt = requests
+        .get(1)
+        .and_then(|request| request.system_prompt.as_deref())
+        .expect("continuation request should include a system prompt");
+
+    assert!(continuation_prompt.contains("Your capabilities:"));
+    assert!(continuation_prompt.contains(
+        "- git: Inspect and manage git repositories, branches, merges, pushes, and PR creation."
+    ));
+    assert!(
+        !continuation_prompt.contains("- blank:"),
+        "blank runtime skill descriptions should not render as empty bullets"
+    );
+    assert_eq!(action.response_text, "done");
+}
+
 #[tokio::test]
 async fn act_with_tools_reprompts_on_follow_up_tool_calls() {
     let mut engine = p4_engine();
@@ -402,6 +681,121 @@ async fn act_with_tools_reprompts_on_follow_up_tool_calls() {
     assert_eq!(action.tool_results[0].tool_call_id, "call-1");
     assert_eq!(action.tool_results[1].tool_call_id, "call-2");
     assert_eq!(action.response_text, "done after two rounds");
+}
+
+#[tokio::test]
+async fn act_with_tools_closes_duplicate_success_without_follow_up_prompt() {
+    let config = BudgetConfig::default();
+    let mut engine = p4_engine_with_executor(
+        config,
+        3,
+        Arc::new(Phase4OutputToolExecutor {
+            output: "same output".to_string(),
+        }),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
+        "call-2", "a.txt",
+    )])]);
+    let context_messages = vec![Message::user("read file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert!(
+        matches!(action.next_step, ActionNextStep::Continue(ref continuation)
+            if continuation.next_tool_scope == Some(ContinuationToolScope::NoTools)),
+        "duplicate successful observations should close the tool transaction and reserve root synthesis"
+    );
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn act_with_tools_relays_permanent_retry_blocker_into_follow_up_prompt() {
+    let mut engine = p4_engine();
+    engine.tool_retry_tracker.record_result_with_class(
+        &read_file_call("seed", "a.txt"),
+        false,
+        Some(FailureClass::Permanent),
+    );
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![text_response("done after permanent blocker")]);
+    let context_messages = vec![Message::user("read file")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.response_text, "done after permanent blocker");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        has_retry_circuit_breaker_guidance(&requests[0].messages, "already failed permanently"),
+        "expected permanent tool guardrail guidance in follow-up prompt: {:?}",
+        requests[0].messages
+    );
+}
+
+#[tokio::test]
+async fn act_with_tools_keeps_distinct_reads_available_before_observation_strip() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            observation_only_round_nudge_after: 2,
+            observation_only_round_strip_after_nudge: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine = p4_engine_with_config(config, 3);
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+        text_response("done after distinct reads"),
+    ]);
+    let context_messages = vec![Message::user("read files")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(action.tool_results.len(), 2);
+    assert_eq!(action.response_text, "done after distinct reads");
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].tools.is_empty());
+    assert!(!requests[1].tools.is_empty());
+    assert!(!requests[1].messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains("Stop doing more read-only research"),
+            _ => false,
+        })
+    }));
 }
 
 #[tokio::test]
@@ -592,6 +986,52 @@ async fn act_with_tools_strips_tools_after_threshold() {
 }
 
 #[tokio::test]
+async fn act_with_tools_allows_varied_observation_rounds_until_model_answers() {
+    let config = BudgetConfig {
+        termination: TerminationConfig {
+            tool_round_nudge_after: 100,
+            tool_round_strip_after_nudge: 100,
+            observation_only_round_nudge_after: 1,
+            observation_only_round_strip_after_nudge: 1,
+            ..TerminationConfig::default()
+        },
+        ..BudgetConfig::default()
+    };
+    let mut engine = p4_engine_with_config(config, 5);
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+        tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+        tool_use_response(vec![read_file_call("call-4", "d.txt")]),
+        text_response("done after methodical inspection"),
+    ]);
+    let context_messages = vec![Message::user("inspect the project and report back")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools");
+
+    assert_eq!(
+        llm.requests().len(),
+        4,
+        "distinct observations should remain available until the model answers"
+    );
+    assert_eq!(action.response_text, "done after methodical inspection");
+    assert_eq!(action.tool_results.len(), 4);
+    assert!(
+        action.tool_results.iter().all(|result| result.success),
+        "varied evidence-gathering calls should not be blocked as flailing"
+    );
+}
+
+#[tokio::test]
 async fn act_with_tools_no_nudge_when_disabled() {
     let config = tool_round_budget_config(0, 2);
     let mut engine = p4_engine_with_config(config, 4);
@@ -676,11 +1116,11 @@ async fn act_with_tools_no_nudge_before_threshold() {
 }
 
 #[tokio::test]
-async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_synth() {
+async fn run_cycle_duplicate_success_closes_tool_transaction_for_root_synthesis() {
     let config = BudgetConfig {
         termination: TerminationConfig {
             observation_only_round_nudge_after: 1,
-            observation_only_round_strip_after_nudge: 1,
+            observation_only_round_strip_after_nudge: 0,
             ..TerminationConfig::default()
         },
         ..BudgetConfig::default()
@@ -688,8 +1128,8 @@ async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_s
     let mut engine = p4_engine_with_config(config, 6);
     let llm = Phase4MockLlm::new(vec![
         tool_use_response(vec![read_file_call("call-1", "a.txt")]),
-        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
-        tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+        tool_use_response(vec![read_file_call("call-2", "a.txt")]),
+        text_response("done from observed evidence"),
     ]);
 
     let result = engine
@@ -698,25 +1138,24 @@ async fn run_cycle_observation_restriction_finishes_incomplete_without_wrap_up_s
         .expect("run_cycle");
 
     match result {
-        LoopResult::Incomplete {
-            partial_response,
-            reason,
-            ..
-        } => {
-            let partial = partial_response.expect("partial response");
-            assert!(partial.contains("completed tool work"), "{partial}");
-            assert!(
-                reason.contains("read-only inspection is disabled"),
-                "{reason}"
-            );
+        LoopResult::Complete { response, .. } => {
+            assert_eq!(response, "done from observed evidence");
         }
-        other => panic!("expected incomplete result, got {other:?}"),
+        other => panic!("expected complete root synthesis result, got {other:?}"),
     }
 
     assert_eq!(
         llm.requests().len(),
         3,
-        "expected only initial reasoning + two continuation requests"
+        "duplicate successful observations should close the tool transaction and reserve one no-tools root synthesis pass"
+    );
+    assert!(
+        llm.requests()
+            .last()
+            .expect("final synthesis request")
+            .tools
+            .is_empty(),
+        "root synthesis after duplicate evidence must not expose tools"
     );
 }
 
@@ -770,11 +1209,11 @@ async fn act_with_tools_nudge_fires_exactly_once() {
 }
 
 #[tokio::test]
-async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
+async fn act_with_tools_continues_valid_tool_chain_beyond_outer_iteration_cap() {
     let mut engine = LoopEngine::builder()
         .budget(BudgetTracker::new(
             crate::budget::BudgetConfig::default(),
-            0,
+            current_time_ms(),
             0,
         ))
         .context(ContextCompactor::new(2048, 256))
@@ -784,9 +1223,10 @@ async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
         .build()
         .expect("test engine build");
     let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
-    let llm = Phase4MockLlm::new(vec![tool_use_response(vec![read_file_call(
-        "call-2", "b.txt",
-    )])]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+        text_response("final from committed tool evidence"),
+    ]);
     let context_messages = vec![Message::user("read files")];
 
     let action = engine
@@ -800,14 +1240,122 @@ async fn act_with_tools_falls_back_to_synthesis_on_max_iterations() {
         .await
         .expect("act_with_tools");
 
-    assert_eq!(action.tool_results.len(), 1);
-    assert_eq!(action.response_text, "summary");
+    assert_eq!(
+        action.tool_results.len(),
+        2,
+        "inner tool transactions must not stop just because the outer iteration cap is low"
+    );
+    assert_eq!(action.response_text, "final from committed tool evidence");
+    match action.next_step {
+        ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+            assert_eq!(response, "final from committed tool evidence");
+        }
+        other => panic!("expected complete terminal after valid follow-up tool, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn act_with_tools_stops_at_tool_loop_hard_iteration_limit() {
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::unlimited(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(3)
+        .tool_executor(Arc::new(Phase4StubToolExecutor))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        tool_use_response(vec![read_file_call("call-2", "b.txt")]),
+        tool_use_response(vec![read_file_call("call-3", "c.txt")]),
+        tool_use_response(vec![read_file_call("call-4", "d.txt")]),
+    ]);
+    let context_messages = vec![Message::user("keep reading files forever")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools should stop cleanly at hard ceiling");
+
+    assert_eq!(
+        action.tool_results.len(),
+        3,
+        "the pending fourth tool request must not execute after the hard ceiling"
+    );
+    match action.next_step {
+        ActionNextStep::Continue(continuation) => {
+            assert_eq!(
+                continuation.next_tool_scope,
+                Some(ContinuationToolScope::NoTools),
+                "hard-ceiling exits must synthesize from observed evidence without reopening tools"
+            );
+        }
+        other => panic!("expected no-tool synthesis continuation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn act_with_tools_continues_truncated_synthesis_fallback() {
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(3)
+        .tool_executor(Arc::new(Phase4StubToolExecutor))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    engine.turn_execution_profile =
+        TurnExecutionProfile::DirectInspection(DirectInspectionProfile::ReadLocalPath);
+    let decision = Decision::UseTools(vec![read_file_call("call-1", "a.txt")]);
+    let llm = Phase4MockLlm::new(vec![
+        CompletionResponse {
+            content: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("stop".to_string()),
+        },
+        text_response_with_stop("supporting Anth", Some("max_tokens")),
+        text_response_with_stop("ropic, OpenAI, and Fireworks.", Some("stop")),
+    ]);
+    let context_messages = vec![Message::user("read files")];
+
+    let action = engine
+        .act_with_tools(
+            &decision,
+            calls_from_decision(&decision),
+            &llm,
+            &context_messages,
+            CycleStream::disabled(),
+        )
+        .await
+        .expect("act_with_tools should continue truncated synthesis");
+
+    assert_eq!(
+        action.response_text,
+        "supporting Anthropic, OpenAI, and Fireworks."
+    );
 }
 
 /// Regression test for #1105: budget soft-ceiling must be checked within
 /// the tool round loop, not only at act_with_tools entry. When budget
-/// crosses 80% mid-loop, the loop breaks and falls through to synthesis
-/// instead of continuing to burn through rounds.
+/// crosses 80% mid-loop, the loop breaks without executing the next pending
+/// tool request. With completed evidence in hand, the pending model intent
+/// should be preserved as non-executed context while root synthesis answers
+/// from observed results with the tool surface closed.
 #[tokio::test]
 async fn act_with_tools_breaks_on_budget_soft_ceiling_mid_loop() {
     let config = crate::budget::BudgetConfig {
@@ -854,7 +1402,7 @@ async fn act_with_tools_breaks_on_budget_soft_ceiling_mid_loop() {
             CycleStream::disabled(),
         )
         .await
-        .expect("act_with_tools should succeed via synthesis fallback");
+        .expect("act_with_tools should stop at the budget boundary");
 
     // Only round 1's 3 tool results should be present.
     // Round 2 should NOT have executed.
@@ -862,13 +1410,28 @@ async fn act_with_tools_breaks_on_budget_soft_ceiling_mid_loop() {
     assert_eq!(action.tool_results[0].tool_call_id, "call-1");
     assert_eq!(action.tool_results[1].tool_call_id, "call-2");
     assert_eq!(action.tool_results[2].tool_call_id, "call-3");
-    // Falls through to synthesize_tool_fallback which returns "summary"
-    assert_eq!(action.response_text, "summary");
+    assert_eq!(action.response_text, "");
+    match action.next_step {
+        ActionNextStep::Continue(continuation) => {
+            assert_eq!(
+                continuation.next_tool_scope,
+                Some(ContinuationToolScope::NoTools),
+                "budget boundaries should finish from observed evidence without executing pending tools"
+            );
+        }
+        other => panic!("expected no-tool synthesis continuation, got {other:?}"),
+    }
 }
 
 #[test]
 fn tool_round_outcome_budget_low_remains_debuggable() {
-    assert_eq!(format!("{:?}", ToolRoundOutcome::BudgetLow), "BudgetLow");
+    assert_eq!(
+        format!(
+            "{:?}",
+            ToolRoundOutcome::BudgetLow(ToolLoopExhaustionReason::BudgetLow)
+        ),
+        "BudgetLow(BudgetLow)"
+    );
 }
 
 #[tokio::test]
@@ -928,6 +1491,7 @@ fn append_tool_round_messages_appends_assistant_then_tool_messages() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
     let mut messages = vec![Message::user("prompt")];
 
@@ -955,12 +1519,14 @@ fn build_tool_result_message_creates_correct_blocks() {
             tool_name: "run_command".to_string(),
             success: false,
             output: "permission denied".to_string(),
+            failure_class: None,
         },
         ToolResult {
             tool_call_id: "call-1".to_string(),
             tool_name: "read_file".to_string(),
             success: true,
             output: "ok".to_string(),
+            failure_class: None,
         },
     ];
 
@@ -980,6 +1546,7 @@ fn build_tool_result_message_uses_tool_role() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
 
     let message = build_tool_result_message(&calls, &results).expect("build_tool_result_message");
@@ -995,6 +1562,7 @@ fn build_tool_result_message_formats_error_with_prefix() {
         tool_name: "read_file".to_string(),
         success: false,
         output: "permission denied".to_string(),
+        failure_class: None,
     }];
 
     let message = build_tool_result_message(&calls, &results).expect("build_tool_result_message");
@@ -1011,6 +1579,7 @@ fn build_tool_result_message_rejects_unmatched_tool_call_id() {
         tool_name: "read_file".to_string(),
         success: true,
         output: "ok".to_string(),
+        failure_class: None,
     }];
 
     let error = build_tool_result_message(&calls, &results)

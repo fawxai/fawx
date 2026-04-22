@@ -10,21 +10,28 @@ const CASUAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent ru
 You're direct, helpful, and concise. Skip the formalities and filler.
 Answer questions naturally. When you use tools, just share the results
 without narrating what you did or how you got them."#;
+const DIRECT_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
+Be task-first, plainspoken, and concise. Skip social padding, avoid hedging,
+and lead with the answer or next concrete action."#;
 const PROFESSIONAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
 Provide clear, structured responses. Be thorough but efficient.
 Use tools when needed and present results directly without narrating the process."#;
 const TECHNICAL_IDENTITY_TEMPLATE: &str = r#"You are {name}, a personal AI agent running on this machine.
 Be precise and terse. No filler, no hedging. Use tools, report results.
 Code and data speak louder than prose."#;
-const MINIMAL_IDENTITY_TEMPLATE: &str = r#"You are {name}. Answer with minimum words. No filler. Tools: use them, report results only."#;
+const CAVEMAN_IDENTITY_TEMPLATE: &str = r#"You are {name}. Caveman mode is active.
+Return the raw useful answer before social polish. Do not humanize, soften,
+pad, or wrap the response. Fragments, terse bullets, direct commands, and
+unadorned data are preferred. Keep kernel safety/tool constraints intact."#;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Personality {
     #[default]
     Casual,
+    Direct,
     Professional,
     Technical,
-    Minimal,
+    Caveman,
     Custom(String),
 }
 
@@ -182,6 +189,20 @@ impl SystemPromptBuilder {
     }
 }
 
+pub fn runtime_agent_preferences_from_config(agent: &AgentConfig) -> Option<String> {
+    let mut sections = Vec::new();
+
+    if let Some(personality) = render_runtime_personality(agent) {
+        sections.push(format!("Personality:\n{personality}"));
+    }
+
+    if let Some(behavior) = render_runtime_behavior(agent) {
+        sections.push(behavior);
+    }
+
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
 fn identity_from_config(agent: &AgentConfig) -> IdentityConfig {
     IdentityConfig {
         name: agent.name.clone(),
@@ -190,17 +211,32 @@ fn identity_from_config(agent: &AgentConfig) -> IdentityConfig {
 }
 
 fn behavior_from_config(agent: &AgentConfig) -> BehaviorConfig {
+    let custom_personality = non_empty(agent.custom_personality.as_deref());
+    let custom_instructions = non_empty(agent.behavior.custom_instructions.as_deref());
+    let custom_instruction_payload = match (
+        agent.personality.trim().eq_ignore_ascii_case("custom"),
+        custom_personality,
+        custom_instructions,
+    ) {
+        (true, Some(personality), Some(instructions)) if personality == instructions => None,
+        (_, _, instructions) => instructions.map(str::to_string),
+    };
+
     BehaviorConfig {
-        custom_instructions: agent.behavior.custom_instructions.clone(),
+        custom_instructions: custom_instruction_payload,
     }
 }
 
 fn personality_from_config(agent: &AgentConfig) -> Personality {
     match agent.personality.trim().to_ascii_lowercase().as_str() {
         "casual" | "" => Personality::Casual,
+        "direct" => Personality::Direct,
         "professional" => Personality::Professional,
         "technical" => Personality::Technical,
-        "minimal" => Personality::Minimal,
+        "caveman" | "minimal" => Personality::Caveman,
+        "custom" => custom_personality(agent)
+            .or_else(|| custom_instructions_personality(agent))
+            .unwrap_or_default(),
         _ => custom_personality(agent).unwrap_or_default(),
     }
 }
@@ -209,14 +245,57 @@ fn custom_personality(agent: &AgentConfig) -> Option<Personality> {
     non_empty(agent.custom_personality.as_deref()).map(|text| Personality::Custom(text.to_string()))
 }
 
+fn custom_instructions_personality(agent: &AgentConfig) -> Option<Personality> {
+    non_empty(agent.behavior.custom_instructions.as_deref())
+        .map(|text| Personality::Custom(text.to_string()))
+}
+
+fn render_runtime_personality(agent: &AgentConfig) -> Option<String> {
+    let configured = agent.personality.trim();
+    if configured.is_empty() || configured.eq_ignore_ascii_case("casual") {
+        return None;
+    }
+
+    let summary = match personality_from_config(agent) {
+        Personality::Casual => return None,
+        Personality::Direct => {
+            "Be task-first, plainspoken, and concise. Skip social padding, avoid hedging, and lead with the answer or next concrete action.".to_string()
+        }
+        Personality::Professional => {
+            "Provide clear, structured responses. Be thorough but efficient.".to_string()
+        }
+        Personality::Technical => {
+            "Be precise and terse. Prefer concrete technical details over narration.".to_string()
+        }
+        Personality::Caveman => {
+            "Caveman mode: return the raw useful answer before social polish. Do not humanize, soften, hedge, or wrap it. Fragments, terse bullets, direct commands, and unadorned data are preferred. Keep required safety/tool constraints intact.".to_string()
+        }
+        Personality::Custom(text) => text,
+    };
+
+    non_empty(Some(summary.as_str())).map(str::to_string)
+}
+
+fn render_runtime_behavior(agent: &AgentConfig) -> Option<String> {
+    let behavior = behavior_from_config(agent);
+    let instructions = non_empty(behavior.custom_instructions.as_deref())?;
+    if let Personality::Custom(personality) = personality_from_config(agent) {
+        if personality.trim() == instructions {
+            return None;
+        }
+    }
+    Some(format!("Behavioral:\n{instructions}"))
+}
+
 fn render_identity(identity: &IdentityConfig) -> String {
     let base = match &identity.personality {
         Personality::Casual => CASUAL_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
+        Personality::Direct => DIRECT_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
         Personality::Professional => {
             PROFESSIONAL_IDENTITY_TEMPLATE.replace("{name}", &identity.name)
         }
         Personality::Technical => TECHNICAL_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
-        Personality::Minimal => MINIMAL_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
+        Personality::Caveman => CAVEMAN_IDENTITY_TEMPLATE.replace("{name}", &identity.name),
         Personality::Custom(text) => {
             format!(
                 "You are {}, a personal AI agent running on this machine.\n{}",
@@ -337,6 +416,14 @@ mod tests {
     }
 
     #[test]
+    fn direct_personality_output() {
+        let prompt = builder_with_personality(Personality::Direct).build();
+
+        assert!(prompt.contains("Be task-first, plainspoken, and concise."));
+        assert!(prompt.contains("lead with the answer or next concrete action."));
+    }
+
+    #[test]
     fn professional_personality_output() {
         let prompt = builder_with_personality(Personality::Professional).build();
 
@@ -353,11 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn minimal_personality_output() {
-        let prompt = builder_with_personality(Personality::Minimal).build();
+    fn caveman_personality_output() {
+        let prompt = builder_with_personality(Personality::Caveman).build();
 
-        assert!(prompt.contains("You are Rivet. Answer with minimum words."));
-        assert!(prompt.contains("Tools: use them, report results only."));
+        assert!(prompt.contains("Caveman mode is active."));
+        assert!(prompt.contains("Return the raw useful answer before social polish."));
+        assert!(prompt.contains("Do not humanize, soften,"));
     }
 
     #[test]
@@ -388,6 +476,99 @@ mod tests {
         assert!(prompt.contains("You are Rivet, a personal AI agent running on this machine."));
         assert!(prompt.contains("Be warm, pragmatic, and slightly opinionated."));
         assert!(prompt.contains("Behavioral:\nPrefer concrete next steps."));
+    }
+
+    #[test]
+    fn from_config_skips_duplicate_custom_personality_behavior() {
+        let prompt = SystemPromptBuilder::from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "custom".to_string(),
+            custom_personality: Some("Speak like a field notebook.".to_string()),
+            behavior: AgentBehaviorConfig {
+                custom_instructions: Some("Speak like a field notebook.".to_string()),
+                ..AgentBehaviorConfig::default()
+            },
+        })
+        .build();
+
+        assert!(prompt.contains("Speak like a field notebook."));
+        assert!(!prompt.contains("Behavioral:\nSpeak like a field notebook."));
+    }
+
+    #[test]
+    fn from_config_maps_direct_personality() {
+        let prompt = SystemPromptBuilder::from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "direct".to_string(),
+            custom_personality: None,
+            behavior: AgentBehaviorConfig::default(),
+        })
+        .build();
+
+        assert!(prompt.contains("Be task-first, plainspoken, and concise."));
+        assert!(!prompt.contains("You're direct, helpful, and concise."));
+    }
+
+    #[test]
+    fn runtime_preferences_include_non_default_personality_and_behavior() {
+        let preferences = runtime_agent_preferences_from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "direct".to_string(),
+            custom_personality: None,
+            behavior: AgentBehaviorConfig {
+                custom_instructions: Some("Prefer concrete next steps.".to_string()),
+                ..AgentBehaviorConfig::default()
+            },
+        })
+        .expect("preferences");
+
+        assert!(preferences.contains("Personality:\nBe task-first"));
+        assert!(preferences.contains("Behavioral:\nPrefer concrete next steps."));
+    }
+
+    #[test]
+    fn runtime_preferences_support_caveman_and_legacy_minimal_alias() {
+        let caveman = runtime_agent_preferences_from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "caveman".to_string(),
+            custom_personality: None,
+            behavior: AgentBehaviorConfig::default(),
+        })
+        .expect("caveman preferences");
+
+        assert!(caveman.contains("Personality:\nCaveman mode:"));
+        assert!(caveman.contains("raw useful answer before social polish"));
+
+        let legacy_minimal = runtime_agent_preferences_from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "minimal".to_string(),
+            custom_personality: None,
+            behavior: AgentBehaviorConfig::default(),
+        })
+        .expect("legacy minimal preferences");
+
+        assert_eq!(legacy_minimal, caveman);
+    }
+
+    #[test]
+    fn runtime_preferences_skip_default_empty_config() {
+        assert!(runtime_agent_preferences_from_config(&AgentConfig::default()).is_none());
+    }
+
+    #[test]
+    fn from_config_uses_custom_instructions_for_custom_personality() {
+        let prompt = SystemPromptBuilder::from_config(&AgentConfig {
+            name: "Rivet".to_string(),
+            personality: "custom".to_string(),
+            custom_personality: Some("   ".to_string()),
+            behavior: AgentBehaviorConfig {
+                custom_instructions: Some("Speak like a field notebook.".to_string()),
+                ..AgentBehaviorConfig::default()
+            },
+        })
+        .build();
+
+        assert!(prompt.contains("Speak like a field notebook."));
     }
 
     #[test]

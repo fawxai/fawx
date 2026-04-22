@@ -2,8 +2,9 @@ use super::*;
 use crate::budget::TerminationConfig;
 
 #[test]
-fn standard_uses_mutation_only_escalation_after_observation() {
+fn standard_uses_mutation_only_escalation_after_observation_when_artifact_is_pending() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.requested_artifact_target = Some("src/lib.rs".to_string());
     let mut state = ToolRoundState::new(
         &[],
         &[Message::user("Research first, then implement.")],
@@ -55,6 +56,8 @@ fn tightened_termination_config_values_match_expected() {
         tool_round_strip_after_nudge: 100,
         observation_only_round_nudge_after: 100,
         observation_only_round_strip_after_nudge: 100,
+        max_repeated_failure_streak: 100,
+        root_turn_completion_retry_limit: 100,
     };
 
     let bounded = TurnExecutionProfile::BoundedLocal

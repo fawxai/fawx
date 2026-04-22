@@ -22,9 +22,13 @@ use tokio_tungstenite::tungstenite::{
 use crate::document::document_text_fallback;
 use crate::openai::{
     is_openai_chat_capable, openai_context_window, openai_models_endpoint, openai_thinking_levels,
-    OPENAI_FALLBACK_MODELS, OPENAI_THINKING_LEVELS,
+    OPENAI_THINKING_LEVELS,
 };
-use crate::openai_common::{filter_model_ids, OpenAiModelsResponse};
+use crate::openai_common::{
+    filter_model_ids, is_missing_model_read_scope_error, is_missing_model_read_scope_response,
+    log_restricted_model_catalog_fallback_once, missing_model_read_scope_error,
+    OpenAiModelsResponse,
+};
 use crate::provider::{
     bearer_auth_headers, insert_header_value, null_loop_harness,
     resolve_loop_harness_from_profiles, CompletionStream, LlmProvider,
@@ -42,6 +46,14 @@ use crate::validation::validate_tool_message_sequence;
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
 const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
+const OPENAI_RESPONSES_FALLBACK_MODELS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.1",
+    "o4-mini",
+];
 const GPT_REASONING_OVERLAY: &str = "\n\nModel-family guidance for GPT-5/Codex reasoning models: \
 When work clearly splits into independent streams, actually use `spawn_agent` / `subagent_status` instead of only describing a parallel plan. \
 If the user names an exact command or workflow, execute that exact path before exploring alternatives unless you hit a concrete blocker. \
@@ -228,19 +240,14 @@ impl OpenAiResponsesProvider {
         Ok(self.fetch_models().await?.len())
     }
 
-    fn ensure_supported_model(&self, model: &str) -> Result<(), LlmError> {
-        if self.supported_models.is_empty() || self.supported_models.iter().any(|m| m == model) {
-            return Ok(());
-        }
-        Err(LlmError::UnsupportedModel(model.to_string()))
-    }
-
     fn build_request_body(
         &self,
         request: &CompletionRequest,
         stream: bool,
     ) -> Result<ResponsesRequestBody, LlmError> {
-        self.ensure_supported_model(&request.model)?;
+        // The router is the source of truth for model selection. Do not reject
+        // a router-resolved model here just because this provider instance was
+        // constructed with an older startup snapshot.
         validate_tool_message_sequence(&request.messages)?;
 
         let mut input = Vec::new();
@@ -341,10 +348,7 @@ impl OpenAiResponsesProvider {
 
         CompletionResponse {
             content,
-            usage: body.usage.map(|u| Usage {
-                input_tokens: u.input_tokens.unwrap_or(0) as u32,
-                output_tokens: u.output_tokens.unwrap_or(0) as u32,
-            }),
+            usage: body.usage.map(responses_usage_to_usage),
             stop_reason: normalize_responses_stop_reason(body.status),
             tool_calls,
         }
@@ -754,10 +758,17 @@ fn normalize_responses_stop_reason(status: Option<String>) -> Option<String> {
 }
 
 fn responses_usage_to_usage(usage: ResponsesUsage) -> Usage {
-    Usage {
-        input_tokens: usage.input_tokens.unwrap_or(0) as u32,
-        output_tokens: usage.output_tokens.unwrap_or(0) as u32,
-    }
+    let cached_input_tokens = usage
+        .input_tokens_details
+        .as_ref()
+        .map(|details| details.cached_tokens)
+        .unwrap_or(0);
+    Usage::with_prompt_cache(
+        usage.input_tokens.unwrap_or(0) as u32,
+        usage.output_tokens.unwrap_or(0) as u32,
+        cached_input_tokens,
+        0,
+    )
 }
 
 fn insert_header(
@@ -1101,6 +1112,10 @@ impl LlmProvider for OpenAiResponsesProvider {
         match self.fetch_models().await {
             Ok(models) if !models.is_empty() => Ok(models),
             Ok(_) => Ok(self.supported_models()),
+            Err(error) if is_missing_model_read_scope_error(&error) => {
+                log_restricted_model_catalog_fallback_once(&self.provider_name);
+                Ok(self.supported_models())
+            }
             Err(error) => {
                 tracing::warn!(provider = %self.provider_name, error = %error, "failed to fetch openai responses models; using static fallback");
                 Ok(self.supported_models())
@@ -1112,6 +1127,8 @@ impl LlmProvider for OpenAiResponsesProvider {
         ProviderCapabilities {
             supports_temperature: false,
             requires_streaming: true,
+            prompt_cache: Default::default(),
+            prompt_cache_affinity: Default::default(),
         }
     }
 
@@ -1151,7 +1168,7 @@ impl LlmProvider for OpenAiResponsesProvider {
     }
 
     fn fallback_models(&self) -> Vec<&'static str> {
-        OPENAI_FALLBACK_MODELS.to_vec()
+        OPENAI_RESPONSES_FALLBACK_MODELS.to_vec()
     }
 
     fn context_window(&self, model: &str) -> usize {
@@ -1174,6 +1191,9 @@ async fn parse_model_response(
             .text()
             .await
             .unwrap_or_else(|error| format!("unable to read error body: {error}"));
+        if is_missing_model_read_scope_response(status, &body) {
+            return Err(missing_model_read_scope_error());
+        }
         return Err(LlmError::Provider(format!(
             "model list request failed ({status}): {body}"
         )));
@@ -1264,10 +1284,18 @@ struct ResponsesContentPart {
     text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct ResponsesUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesInputTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 // SSE event types
@@ -1657,6 +1685,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_models_treats_missing_model_read_scope_as_restricted_key_fallback() {
+        let body = r#"{"error":"You have insufficient permissions for this operation. Missing scopes: api.model.read."}"#;
+        let error_base_url = spawn_json_server("403 Forbidden", body).await;
+        let error_provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(error_base_url);
+
+        let error = error_provider
+            .fetch_models()
+            .await
+            .expect_err("missing model-read scope should be classified");
+        assert!(is_missing_model_read_scope_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "provider error: OpenAI model catalog unavailable; missing api.model.read scope"
+        );
+
+        let fallback_base_url = spawn_json_server("403 Forbidden", body).await;
+        let fallback_provider = OpenAiResponsesProvider::new("test-token", "test-account")
+            .expect("provider")
+            .with_base_url(fallback_base_url)
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let models = fallback_provider
+            .list_models()
+            .await
+            .expect("fallback models");
+
+        assert_eq!(models, vec!["gpt-4o-mini".to_string()]);
+    }
+
+    #[tokio::test]
     async fn list_models_returns_supported_models_when_token_is_empty() {
         let mut provider = OpenAiResponsesProvider::new("test-token", "test-account")
             .expect("provider")
@@ -1686,7 +1746,7 @@ mod tests {
         );
         assert!(provider.is_chat_capable("gpt-4o"));
         assert!(!provider.is_chat_capable("text-embedding-3-small"));
-        assert_eq!(provider.fallback_models(), OPENAI_FALLBACK_MODELS);
+        assert_eq!(provider.fallback_models(), OPENAI_RESPONSES_FALLBACK_MODELS);
         assert_eq!(provider.auth_method(), "subscription");
         assert_eq!(provider.context_window("gemini-2.5-pro"), 1_000_000);
     }
@@ -1704,6 +1764,28 @@ mod tests {
             "Bearer oauth-token-123"
         );
         assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+    }
+
+    #[test]
+    fn build_request_body_allows_model_outside_startup_snapshot() {
+        let provider = OpenAiResponsesProvider::new("test-token", "acct_123")
+            .expect("provider")
+            .with_supported_models(vec!["gpt-4o-mini".to_string()]);
+
+        let request = CompletionRequest {
+            model: "gpt-5.4".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(128),
+            system_prompt: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
+            thinking: None,
+        };
+
+        let result = provider.build_request_body(&request, false);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1725,6 +1807,7 @@ mod tests {
             usage: Some(ResponsesUsage {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
+                input_tokens_details: Some(ResponsesInputTokenDetails { cached_tokens: 4 }),
             }),
         };
 
@@ -1738,6 +1821,7 @@ mod tests {
         let usage = response.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cached_input_tokens, 4);
     }
 
     #[test]
@@ -1805,6 +1889,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         }
     }
@@ -1834,6 +1920,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         }
     }
@@ -1885,6 +1973,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1917,6 +2007,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -1945,6 +2037,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Reasoning {
                 effort: "xhigh".to_string(),
             }),
@@ -1969,6 +2063,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: Some(ThinkingConfig::Off),
         };
 
@@ -1994,6 +2090,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2031,6 +2129,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2071,6 +2171,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2171,6 +2273,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2261,6 +2365,8 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2281,6 +2387,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2303,6 +2411,8 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2321,6 +2431,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2369,6 +2481,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -2541,13 +2655,7 @@ mod tests {
             }]
         );
         assert_eq!(response.stop_reason.as_deref(), Some("stop"));
-        assert_eq!(
-            response.usage,
-            Some(Usage {
-                input_tokens: 7,
-                output_tokens: 3,
-            })
-        );
+        assert_eq!(response.usage, Some(Usage::new(7, 3)));
     }
 
     #[tokio::test]
@@ -2801,6 +2909,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 
@@ -3045,6 +3155,8 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            prompt_cache: Default::default(),
+            cache_affinity: None,
             thinking: None,
         };
 

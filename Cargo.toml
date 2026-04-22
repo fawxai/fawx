@@ -3,6 +3,7 @@ members = [
     "tui",
     "engine/crates/fx-config",
     "engine/crates/fx-core",
+    "engine/crates/fx-protocol",
     "engine/crates/fx-propose",
     "engine/crates/fx-subagent",
     "engine/crates/fx-decompose",
@@ -115,6 +116,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # Shared crates
 fx-config = { path = "engine/crates/fx-config" }
 fx-core = { path = "engine/crates/fx-core" }
+fx-protocol = { path = "engine/crates/fx-protocol" }
 fx-propose = { path = "engine/crates/fx-propose" }
 fx-subagent = { path = "engine/crates/fx-subagent" }
 fx-decompose = { path = "engine/crates/fx-decompose" }

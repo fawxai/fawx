@@ -2,11 +2,15 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::provider::CompletionStream;
 use crate::types::{
     CompletionResponse, ContentBlock, LlmError, StreamChunk, ToolCall, ToolUseDelta, Usage,
 };
+
+const STREAM_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -37,13 +41,33 @@ pub(crate) async fn collect_completion_stream(
     stream: &mut CompletionStream,
     callback: &StreamCallback,
 ) -> Result<CompletionResponse, LlmError> {
+    collect_completion_stream_with_idle_timeout(stream, callback, STREAM_CHUNK_IDLE_TIMEOUT).await
+}
+
+async fn collect_completion_stream_with_idle_timeout(
+    stream: &mut CompletionStream,
+    callback: &StreamCallback,
+    idle_timeout: Duration,
+) -> Result<CompletionResponse, LlmError> {
     let mut collector = StreamCollector::default();
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = next_stream_chunk(stream, idle_timeout).await? {
         collector.ingest(chunk?, callback);
     }
 
     Ok(collector.finish(callback))
+}
+
+async fn next_stream_chunk(
+    stream: &mut CompletionStream,
+    idle_timeout: Duration,
+) -> Result<Option<Result<StreamChunk, LlmError>>, LlmError> {
+    timeout(idle_timeout, stream.next()).await.map_err(|_| {
+        LlmError::Streaming(format!(
+            "provider stream was idle for {} seconds",
+            idle_timeout.as_secs()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -335,6 +359,7 @@ fn emit_events(callback: &StreamCallback, events: Vec<StreamEvent>) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::stream;
 
     use crate::provider::{CompletionStream, LlmProvider, ProviderCapabilities};
     use crate::test_helpers::{callback_events, read_events};
@@ -373,6 +398,8 @@ mod tests {
             ProviderCapabilities {
                 supports_temperature: true,
                 requires_streaming: false,
+                prompt_cache: Default::default(),
+                prompt_cache_affinity: Default::default(),
             }
         }
     }
@@ -381,11 +408,8 @@ mod tests {
         CompletionRequest {
             model: "test-model".to_string(),
             messages: vec![Message::user("hello")],
-            tools: Vec::new(),
-            temperature: None,
             max_tokens: Some(64),
-            system_prompt: None,
-            thinking: None,
+            ..Default::default()
         }
     }
 
@@ -481,6 +505,24 @@ mod tests {
         assert_eq!(completion_text(&response), "still returns");
     }
 
+    #[tokio::test]
+    async fn collect_completion_stream_fails_when_provider_stream_goes_idle() {
+        let mut stream: CompletionStream = Box::pin(stream::pending());
+        let (callback, _events) = callback_events();
+
+        let result = collect_completion_stream_with_idle_timeout(
+            &mut stream,
+            &callback,
+            Duration::from_millis(1),
+        )
+        .await;
+        let error = result.expect_err("idle stream should fail");
+        assert!(
+            matches!(error, LlmError::Streaming(ref message) if message.contains("provider stream was idle")),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn stream_chunk_collection_emits_tool_lifecycle_and_builds_response() {
         let chunks = vec![
@@ -549,6 +591,7 @@ mod tests {
 #[cfg(test)]
 mod parse_tool_arguments_tests {
     use super::parse_tool_arguments;
+    use crate::malformed_tool_arguments;
     use serde_json::Value;
 
     #[test]
@@ -570,10 +613,45 @@ mod parse_tool_arguments_tests {
             "must not be Value::String"
         );
         assert!(
-            result.get("__fawx_raw_args").is_some(),
-            "must contain __fawx_raw_args key"
+            malformed_tool_arguments(&result).is_some(),
+            "must preserve malformed arguments metadata"
         );
-        assert_eq!(result["__fawx_raw_args"], r#"{"path": "/tmp/test.md"#);
+        let malformed = malformed_tool_arguments(&result).expect("malformed arguments");
+        assert_eq!(malformed.raw, r#"{"path": "/tmp/test.md"#);
+        assert!(
+            malformed.error.contains("EOF while parsing"),
+            "must surface the parse error: {}",
+            malformed.error
+        );
+    }
+
+    #[test]
+    fn repairs_common_string_escaping_inside_tool_arguments() {
+        let result = parse_tool_arguments(
+            "{\n  \"path\": \"main.rs\",\n  \"content\": \"let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n\"\n}",
+        );
+        assert!(
+            malformed_tool_arguments(&result).is_none(),
+            "repairable arguments should parse without sentinel metadata"
+        );
+        assert_eq!(result["path"], "main.rs");
+        assert_eq!(
+            result["content"],
+            "let pattern = r\"\\d+\";\nlet msg = \"she said \\\"hello\\\"\";\n"
+        );
+    }
+
+    #[test]
+    fn repairs_trailing_commas_before_closing_delimiters() {
+        let result =
+            parse_tool_arguments(r#"{"path":"main.rs","lines":["a","b",],"mode":"write",}"#);
+        assert!(
+            malformed_tool_arguments(&result).is_none(),
+            "trailing commas should be repaired without sentinel metadata"
+        );
+        assert_eq!(result["path"], "main.rs");
+        assert_eq!(result["lines"], serde_json::json!(["a", "b"]));
+        assert_eq!(result["mode"], "write");
     }
 
     #[test]

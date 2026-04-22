@@ -4,7 +4,9 @@ pub(super) fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {
     for budget in [
         ThinkingBudget::High,
         ThinkingBudget::Adaptive,
+        ThinkingBudget::Medium,
         ThinkingBudget::Low,
+        ThinkingBudget::None,
         ThinkingBudget::Off,
     ] {
         if levels.iter().any(|level| level == &budget.to_string()) {
@@ -12,6 +14,32 @@ pub(super) fn preferred_supported_budget(levels: &[String]) -> ThinkingBudget {
         }
     }
     ThinkingBudget::Off
+}
+
+pub(super) fn compatible_thinking_budget(
+    budget: ThinkingBudget,
+    levels: &[String],
+) -> Option<ThinkingBudget> {
+    let exact = budget.to_string();
+    if levels.iter().any(|level| level == &exact) {
+        return Some(budget);
+    }
+
+    match budget {
+        ThinkingBudget::Off if levels.iter().any(|level| level == "none") => {
+            Some(ThinkingBudget::None)
+        }
+        ThinkingBudget::None if levels.iter().any(|level| level == "off") => {
+            Some(ThinkingBudget::Off)
+        }
+        ThinkingBudget::Adaptive if levels.iter().any(|level| level == "medium") => {
+            Some(ThinkingBudget::Medium)
+        }
+        ThinkingBudget::Medium if levels.iter().any(|level| level == "adaptive") => {
+            Some(ThinkingBudget::Adaptive)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(feature = "http")]
@@ -128,4 +156,37 @@ fn update_headless_synthesis_instruction(
         .set_synthesis_instruction(value.to_string())
         .map_err(|error| anyhow::anyhow!(error.reason))?;
     Ok(format!("Synthesis instruction updated: {}", value.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn levels(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn compatible_thinking_budget_maps_medium_and_adaptive_bidirectionally() {
+        assert_eq!(
+            compatible_thinking_budget(ThinkingBudget::Adaptive, &levels(&["medium"])),
+            Some(ThinkingBudget::Medium)
+        );
+        assert_eq!(
+            compatible_thinking_budget(ThinkingBudget::Medium, &levels(&["adaptive"])),
+            Some(ThinkingBudget::Adaptive)
+        );
+    }
+
+    #[test]
+    fn compatible_thinking_budget_maps_off_and_none_bidirectionally() {
+        assert_eq!(
+            compatible_thinking_budget(ThinkingBudget::Off, &levels(&["none"])),
+            Some(ThinkingBudget::None)
+        );
+        assert_eq!(
+            compatible_thinking_budget(ThinkingBudget::None, &levels(&["off"])),
+            Some(ThinkingBudget::Off)
+        );
+    }
 }

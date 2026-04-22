@@ -5,8 +5,9 @@ use chrono::{TimeZone, Utc};
 use fx_author::{BuildConfig, BuildResult};
 use fx_core::path::expand_tilde;
 use fx_loadable::{
-    find_revision_snapshot_dir, read_revision_source_metadata, read_skill_statuses,
-    revision_snapshot_dir, write_source_metadata, SkillSource,
+    find_revision_snapshot_dir, read_revision_source_metadata,
+    read_skill_statuses_with_credential_provider, revision_snapshot_dir, write_source_metadata,
+    SkillSource,
 };
 use fx_skills::manifest::{
     validate_skill_name as validate_manifest_skill_name, Capability, ALL_CAPABILITIES,
@@ -566,8 +567,16 @@ fn print_create_summary(project_dir: &Path, name: &str) {
 }
 
 pub fn status_output(data_dir: Option<&Path>) -> Result<String> {
-    let skills_dir = get_skills_dir(data_dir)?;
-    let statuses = read_skill_statuses(&skills_dir).map_err(anyhow::Error::msg)?;
+    let data_dir = resolve_data_dir(data_dir)?;
+    let skills_dir = data_dir.join("skills");
+    fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("Failed to create skills directory: {:?}", skills_dir))?;
+    let credential_provider = crate::startup::open_credential_store(&data_dir)
+        .ok()
+        .map(|store| crate::startup::credential_provider_from_store(&data_dir, store, None));
+    let statuses =
+        read_skill_statuses_with_credential_provider(&skills_dir, credential_provider.as_deref())
+            .map_err(anyhow::Error::msg)?;
     if statuses.is_empty() {
         return Ok("No activated loadable skills.".to_string());
     }

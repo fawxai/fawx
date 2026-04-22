@@ -6,16 +6,36 @@ use tracing::{debug, warn};
 
 use crate::{LlmProvider, LocalModelConfig};
 
+/// Local LLM provider using llama.cpp for on-device inference.
+///
+/// This struct wraps the unsafe local LLM FFI bindings and provides
+/// a safe, async Rust API.
 #[derive(Debug)]
 pub struct LocalModel {
     config: LocalModelConfig,
+    // Future: Add actual llama.cpp context handle
+    // context: Option<*mut llama_context>,
 }
 
 impl LocalModel {
+    /// Create a new LocalModel instance.
+    ///
+    /// # Arguments
+    /// * `config` - Validated configuration for the model
+    ///
+    /// # Returns
+    /// A new LocalModel instance, or an error if initialization fails
+    ///
+    /// # Errors
+    /// - `LlmError::Model`: Configuration is invalid
+    /// - `LlmError::Inference`: Model file doesn't exist or can't be loaded
     pub fn new(config: LocalModelConfig) -> Result<Self, LlmError> {
+        // Validate config (already validated in LocalModelConfig::new, but double-check)
         if config.context_size == 0 {
             return Err(LlmError::Model("context_size must be > 0".to_string()));
         }
+
+        // Check model file exists
         if !config.model_path.exists() {
             warn!("Model file does not exist: {}", config.model_path.display());
             return Err(LlmError::Model(format!(
@@ -23,15 +43,12 @@ impl LocalModel {
                 config.model_path.display()
             )));
         }
-        debug!("LocalModel created; llama-cpp backend not linked in this build");
-        Ok(Self { config })
-    }
 
-    #[allow(dead_code)]
-    fn infer_internal(&self, _prompt: &str, _max_tokens: u32) -> Result<String, LlmError> {
-        Err(LlmError::Model(
-            "llama-cpp feature not enabled; cannot perform local inference".to_string(),
-        ))
+        debug!(
+            "LocalModel created without local inference backend; inference will fail at runtime"
+        );
+
+        Ok(Self { config })
     }
 }
 
@@ -43,10 +60,10 @@ impl LlmProvider for LocalModel {
             prompt.len(),
             max_tokens
         );
-        let _config = self.config.clone();
-        tokio::task::spawn_blocking(move || {
+
+        tokio::task::spawn_blocking(|| {
             Err(LlmError::Model(
-                "llama-cpp feature not enabled; cannot perform local inference".to_string(),
+                "local inference backend is not available in this build".to_string(),
             ))
         })
         .await
@@ -63,6 +80,8 @@ impl LlmProvider for LocalModel {
             "LocalModel::generate_streaming called with prompt length: {}",
             prompt.len()
         );
+
+        // For now, fall back to non-streaming and call callback once
         let result = self.generate(prompt, max_tokens).await?;
         callback(result.clone());
         Ok(result)
@@ -92,6 +111,7 @@ mod tests {
             512,
         )
         .unwrap();
+
         let result = LocalModel::new(config);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), LlmError::Model(_)));
@@ -99,39 +119,62 @@ mod tests {
 
     #[test]
     fn test_model_name_extraction() {
+        // Create a temp file for testing
         let temp_dir = std::env::temp_dir();
         let model_path = temp_dir.join("test-model.gguf");
         std::fs::write(&model_path, b"fake model").unwrap();
+
         let config = LocalModelConfig::new(model_path.clone(), 2048, 0.7, 0.95, 512).unwrap();
         let model = LocalModel::new(config).unwrap();
+
         assert_eq!(model.model_name(), "test-model.gguf");
+
+        // Cleanup
         std::fs::remove_file(&model_path).ok();
     }
 
     #[tokio::test]
     async fn test_generate_without_feature() {
+        // Create a temp file
         let temp_dir = std::env::temp_dir();
         let model_path = temp_dir.join("test-model-2.gguf");
         std::fs::write(&model_path, b"fake model").unwrap();
+
         let config = LocalModelConfig::new(model_path.clone(), 2048, 0.7, 0.95, 512).unwrap();
         let model = LocalModel::new(config).unwrap();
+
         let result = model.generate("test prompt", 10).await;
+
         assert!(result.is_err());
+
+        // Cleanup
         std::fs::remove_file(&model_path).ok();
     }
 
     #[tokio::test]
     async fn test_streaming_callback_signature() {
+        // This test verifies the streaming API signature works correctly
+        // without requiring actual model inference
+
         let temp_dir = std::env::temp_dir();
         let model_path = temp_dir.join("test-model-streaming.gguf");
         std::fs::write(&model_path, b"fake model").unwrap();
+
         let config = LocalModelConfig::new(model_path.clone(), 2048, 0.7, 0.95, 512).unwrap();
         let model = LocalModel::new(config).unwrap();
+
+        // Verify callback accepts owned String (not &str)
         let callback = Box::new(|chunk: String| {
-            assert!(!chunk.is_empty() || chunk.is_empty());
+            // In real use, this would send chunk to a channel/stream
+            assert!(!chunk.is_empty() || chunk.is_empty()); // Always true, just to use chunk
         });
+
         let result = model.generate_streaming("test", 10, callback).await;
+
+        // Without a local inference backend, generate() fails, so streaming also fails.
         assert!(result.is_err());
+
+        // Cleanup
         std::fs::remove_file(&model_path).ok();
     }
 }
