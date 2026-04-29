@@ -231,13 +231,21 @@ fn looks_like_progress_only_final_response(text: &str) -> bool {
         "i am continuing ",
         "i’ll continue ",
         "i will continue ",
+        "i'll fix ",
+        "i’ll fix ",
+        "i will fix ",
+        "i'm going to fix ",
+        "i am going to fix ",
         "continuing the inspection",
         "continuing to inspect",
         "now i need to ",
         "next i need to ",
+        "what i’m going to change",
+        "what i'm going to change",
         "let me read ",
         "let me inspect ",
         "let me check ",
+        "i need the exact ",
         "i need to check ",
         "i need to inspect ",
         "i need to read ",
@@ -257,6 +265,7 @@ fn looks_like_progress_only_final_response(text: &str) -> bool {
         " next i need to check ",
         " next i need to inspect ",
         " i still need to ",
+        " i need the exact ",
     ];
     MARKERS.iter().any(|marker| collapsed.contains(marker))
 }
@@ -504,6 +513,20 @@ mod tests {
                 response_truncated: false,
                 response_text: Some(
                     "I'm continuing the inspection. I've already seen the view layer. Let me read the model layer first.",
+                ),
+            }),
+            FinalResponseValidationOutcome::Retry(FinalResponseViolation::ProgressOnlyResponse)
+        );
+    }
+
+    #[test]
+    fn final_response_validation_rejects_planned_fix_deferral() {
+        assert_eq!(
+            TurnControlPlane::validate_final_response(FinalResponseValidationFacts {
+                attempted_tool_activity: false,
+                response_truncated: false,
+                response_text: Some(
+                    "I'll fix this by tightening the formatter boundary.\n\nI need the exact source locations to apply the patch safely.",
                 ),
             }),
             FinalResponseValidationOutcome::Retry(FinalResponseViolation::ProgressOnlyResponse)

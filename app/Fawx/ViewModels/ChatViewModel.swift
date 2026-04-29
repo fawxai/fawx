@@ -1517,14 +1517,32 @@ final class ChatViewModel {
       return nil
     }
 
-    guard
-      localTail.allSatisfy(isPlainAssistantTailMessage),
-      fetchedTail.allSatisfy(isPlainAssistantTailMessage)
-    else {
+    guard localTail.allSatisfy(isPlainAssistantTailMessage) else {
+      return nil
+    }
+
+    guard fetchedTailRepresentsCompletedAssistantTurn(fetchedTail) else {
       return nil
     }
 
     return fetchedMessages
+  }
+
+  private func fetchedTailRepresentsCompletedAssistantTurn(_ messages: [SessionMessage]) -> Bool {
+    guard let finalMessage = messages.last, isPlainAssistantTailMessage(finalMessage) else {
+      return false
+    }
+
+    return messages.allSatisfy { message in
+      switch message.role {
+      case .assistant:
+        return true
+      case .tool:
+        return message.contentBlocks.contains(where: \.containsToolResult)
+      case .user, .system:
+        return false
+      }
+    }
   }
 
   private func isPlainAssistantTailMessage(_ message: SessionMessage) -> Bool {
@@ -2161,6 +2179,8 @@ final class ChatViewModel {
     )
     syncThreadRuntimeActivity()
     streamingDisplayController(for: sessionID).reset(repinToBottom: true)
+    liveNarrationByActivityIDBySession[sessionID] = nil
+    liveActivityOrderBySession[sessionID] = nil
 
     let task = Task {
       var finalResponse: String?

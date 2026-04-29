@@ -67,16 +67,16 @@ impl Tool for RunCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Run a local command and capture exit code, stdout, and stderr. Use argv for an exact non-shell program/argument invocation. Use command with shell=true to execute a shell string via /bin/sh -c. If shell=false and only command is supplied, the tool tokenizes the string with strict quote-aware parsing and rejects malformed quoting. The tool succeeds only when the command exits with code 0; any non-zero exit returns a failed tool result with the captured output.".to_string(),
+            description: "Run a local command and capture exit code, stdout, and stderr. Use argv for an exact non-shell program/argument invocation. Use command with shell=true to execute a shell string via /bin/sh -c. Use shell=false to force exact non-shell parsing of command. If shell is omitted, the runtime auto-detects whether command needs a shell: pipes, redirection, and similar shell operators run through /bin/sh -c, while plain commands are tokenized with strict quote-aware parsing. If both command and argv are supplied, the runtime chooses the safer unambiguous form instead of failing the turn. The tool succeeds only when the command exits with code 0; any non-zero exit returns a failed tool result with the captured output.".to_string(),
             // Anthropic rejects top-level allOf/oneOf/anyOf in tool schemas, so the
             // exact either-or contract is enforced by parse_run_command_invocation_from_args.
             parameters: serde_json::json!({
                 "type": "object",
-                "description": "Provide either command or argv. When shell=true, command is required and argv must be omitted. Runtime validation enforces the exact shape.",
+                "description": "Prefer either command or argv. When both are supplied, command is used for shell=true and argv is used otherwise. When shell is omitted, command auto-detects shell syntax while argv always stays exact non-shell.",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command text when shell=true, or a backward-compatible non-shell command string parsed with strict quote-aware tokenization when shell=false."
+                        "description": "Command text. With shell=true it runs via /bin/sh -c. With shell=false it is parsed as an exact non-shell command string. When shell is omitted, the runtime auto-detects whether shell syntax is required."
                     },
                     "argv": {
                         "type": "array",
@@ -87,7 +87,7 @@ impl Tool for RunCommandTool {
                     "working_dir": { "type": "string" },
                     "shell": {
                         "type": "boolean",
-                        "description": "When true, require command and execute it via /bin/sh -c. When false or omitted, run argv exactly or parse command without a shell."
+                        "description": "Optional execution mode override. true forces /bin/sh -c. false forces exact non-shell execution. When omitted, argv stays non-shell and command auto-detects whether shell syntax such as pipes or redirection is present."
                     }
                 }
             }),
@@ -158,12 +158,41 @@ fn shell_exit_code(output: &str, success: bool) -> i32 {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RunCommandShellMode {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl<'de> Deserialize<'de> for RunCommandShellMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let enabled = bool::deserialize(deserializer)?;
+        Ok(if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        })
+    }
+}
+
+impl RunCommandShellMode {
+    fn diagnostics_shell_flag(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+#[derive(Clone, Deserialize)]
 struct RunCommandArgs {
     command: Option<String>,
     argv: Option<Vec<String>>,
     working_dir: Option<String>,
-    shell: Option<bool>,
+    #[serde(default)]
+    shell: RunCommandShellMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,16 +236,17 @@ impl ToolContext {
             attach_run_command_diagnostics(
                 ToolFailure::permanent(error),
                 started_at,
-                false,
+                RunCommandShellMode::Auto.diagnostics_shell_flag(),
                 None,
                 false,
             )
         })?;
-        let shell = parsed.shell.unwrap_or(false);
+        let shell = parsed.shell.diagnostics_shell_flag();
         let requested_working_dir = parsed.working_dir.clone();
-        let invocation = parse_run_command_invocation_from_args(parsed).map_err(|error| {
-            attach_run_command_diagnostics(error, started_at, shell, None, false)
-        })?;
+        let invocation =
+            parse_run_command_invocation_from_args(parsed.clone()).map_err(|error| {
+                attach_run_command_diagnostics(error, started_at, shell, None, false)
+            })?;
         let working_dir = self
             .resolve_command_dir(requested_working_dir.as_deref())
             .map_err(|error| {
@@ -246,7 +276,13 @@ impl ToolContext {
             .map_err(|error| {
                 attach_run_command_diagnostics(error, started_at, invocation.shell(), None, true)
             })?;
+        let invocation_note = discarded_run_command_field_note(&parsed, &invocation);
         let formatted = format_command_output(&output, invocation.shell());
+        let failure_output = format_command_output_with_invocation_note(
+            &output,
+            invocation.shell(),
+            invocation_note.as_deref(),
+        );
         if output.status.success() {
             Ok(RunCommandExecution {
                 diagnostics: run_command_success_diagnostics(
@@ -260,7 +296,7 @@ impl ToolContext {
             })
         } else {
             Err(
-                ToolFailure::new(formatted, classify_command_exit(&output)).with_diagnostics(
+                ToolFailure::new(failure_output, classify_command_exit(&output)).with_diagnostics(
                     run_command_failure_diagnostics(
                         started_at,
                         invocation.shell(),
@@ -468,6 +504,18 @@ fn format_command_output(output: &std::process::Output, shell: bool) -> String {
     lines.join("\n")
 }
 
+fn format_command_output_with_invocation_note(
+    output: &std::process::Output,
+    shell: bool,
+    invocation_note: Option<&str>,
+) -> String {
+    let formatted = format_command_output(output, shell);
+    match invocation_note {
+        Some(note) => format!("[run_command note: {note}]\n{formatted}"),
+        None => formatted,
+    }
+}
+
 fn classify_command_exit(output: &std::process::Output) -> FailureClass {
     match output.status.code() {
         Some(126 | 127) => FailureClass::Permanent,
@@ -618,6 +666,18 @@ fn push_shell_segment<'a>(segments: &mut Vec<&'a str>, command: &'a str, start: 
     }
 }
 
+fn command_requires_shell(command: &str) -> bool {
+    shell_segments(command).len() > 1 || contains_shell_redirection(command)
+}
+
+fn contains_shell_redirection(command: &str) -> bool {
+    let normalized = strip_quoted_shell_strings(command).replace("\\>", "");
+    normalized.contains(">>")
+        || normalized.contains('>')
+        || normalized.contains("<<")
+        || normalized.contains('<')
+}
+
 fn is_observational_shell_segment(segment: &str) -> bool {
     if segment.is_empty() {
         return true;
@@ -727,12 +787,8 @@ fn parse_run_command_invocation(
 fn parse_run_command_invocation_from_args(
     parsed: RunCommandArgs,
 ) -> Result<RunCommandInvocation, ToolFailure> {
-    let shell = parsed.shell.unwrap_or(false);
-    match (shell, parsed.command, parsed.argv) {
-        (true, Some(_), Some(_)) | (true, None, Some(_)) => Err(ToolFailure::permanent(
-            "argv cannot be used when shell=true",
-        )),
-        (true, Some(command), None) => {
+    match (parsed.shell, parsed.command, parsed.argv) {
+        (RunCommandShellMode::Enabled, Some(command), _argv) => {
             let command = command.trim();
             if command.is_empty() {
                 return Err(ToolFailure::permanent("command cannot be empty"));
@@ -741,13 +797,25 @@ fn parse_run_command_invocation_from_args(
                 command: command.to_string(),
             })
         }
-        (true, None, None) => Err(ToolFailure::permanent(
-            "command is required when shell=true",
-        )),
-        (false, Some(_), Some(_)) => Err(ToolFailure::permanent(
-            "specify either command or argv, not both",
-        )),
-        (false, Some(command), None) => {
+        (RunCommandShellMode::Enabled, None, Some(argv)) => {
+            validate_argv(&argv)?;
+            Ok(RunCommandInvocation::NonShell {
+                display_command: format_argv_for_display(&argv),
+                argv,
+            })
+        }
+        (RunCommandShellMode::Enabled, None, None) => {
+            Err(ToolFailure::permanent("command or argv is required"))
+        }
+        (RunCommandShellMode::Disabled, Some(_command), Some(argv))
+        | (RunCommandShellMode::Auto, Some(_command), Some(argv)) => {
+            validate_argv(&argv)?;
+            Ok(RunCommandInvocation::NonShell {
+                display_command: format_argv_for_display(&argv),
+                argv,
+            })
+        }
+        (RunCommandShellMode::Disabled, Some(command), None) => {
             let command = command.trim();
             if command.is_empty() {
                 return Err(ToolFailure::permanent("command cannot be empty"));
@@ -759,14 +827,62 @@ fn parse_run_command_invocation_from_args(
                 argv,
             })
         }
-        (false, None, Some(argv)) => {
+        (RunCommandShellMode::Auto, Some(command), None) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(ToolFailure::permanent("command cannot be empty"));
+            }
+            if command_requires_shell(command) {
+                Ok(RunCommandInvocation::Shell {
+                    command: command.to_string(),
+                })
+            } else {
+                let argv = tokenize_non_shell_command(command)?;
+                validate_argv(&argv)?;
+                Ok(RunCommandInvocation::NonShell {
+                    display_command: command.to_string(),
+                    argv,
+                })
+            }
+        }
+        (RunCommandShellMode::Disabled, None, Some(argv))
+        | (RunCommandShellMode::Auto, None, Some(argv)) => {
             validate_argv(&argv)?;
             Ok(RunCommandInvocation::NonShell {
                 display_command: format_argv_for_display(&argv),
                 argv,
             })
         }
-        (false, None, None) => Err(ToolFailure::permanent("command or argv is required")),
+        (RunCommandShellMode::Disabled, None, None) | (RunCommandShellMode::Auto, None, None) => {
+            Err(ToolFailure::permanent("command or argv is required"))
+        }
+    }
+}
+
+fn discarded_run_command_field_note(
+    args: &RunCommandArgs,
+    invocation: &RunCommandInvocation,
+) -> Option<String> {
+    let command = args.command.as_deref()?.trim();
+    let argv = args.argv.as_ref()?;
+    if command.is_empty() || argv.is_empty() {
+        return None;
+    }
+    let argv_display = format_argv_for_display(argv);
+
+    match (args.shell, invocation) {
+        (RunCommandShellMode::Enabled, RunCommandInvocation::Shell { .. }) => {
+            (command != argv_display).then(|| {
+                format!("argv field was ignored because shell=true uses command: {argv_display}")
+            })
+        }
+        (
+            RunCommandShellMode::Disabled | RunCommandShellMode::Auto,
+            RunCommandInvocation::NonShell { .. },
+        ) => (command != argv_display).then(|| {
+            format!("command field was ignored because argv was also supplied: {command}")
+        }),
+        _ => None,
     }
 }
 
@@ -911,15 +1027,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_command_invocation_rejects_ambiguous_non_shell_shape() {
-        let error = parse_run_command_invocation(&serde_json::json!({
+    fn parse_run_command_invocation_prefers_argv_for_ambiguous_non_shell_shape() {
+        let invocation = parse_run_command_invocation(&serde_json::json!({
             "command": "echo hi",
             "argv": ["echo", "hi"]
         }))
-        .expect_err("ambiguous non-shell shape should fail");
+        .expect("ambiguous non-shell shape should use argv");
 
-        assert_eq!(error.class, FailureClass::Permanent);
-        assert!(error.message.contains("either command or argv"));
+        assert_eq!(
+            invocation,
+            RunCommandInvocation::NonShell {
+                display_command: "echo hi".to_string(),
+                argv: vec!["echo".to_string(), "hi".to_string()],
+            }
+        );
     }
 
     #[test]
@@ -928,5 +1049,103 @@ mod tests {
             extract_push_targets_from_shell_command(r#"git push --repo "/tmp/remote path" main"#);
 
         assert_eq!(targets, vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn parse_run_command_invocation_infers_shell_for_pipeline_commands() {
+        let invocation = parse_run_command_invocation(&serde_json::json!({
+            "command": "gh pr diff 1872 --repo fawxai/fawx 2>&1 | head -3000"
+        }))
+        .expect("pipeline command should infer shell");
+
+        assert!(matches!(
+            invocation,
+            RunCommandInvocation::Shell { ref command }
+            if command == "gh pr diff 1872 --repo fawxai/fawx 2>&1 | head -3000"
+        ));
+    }
+
+    #[test]
+    fn parse_run_command_invocation_infers_shell_for_redirection_commands() {
+        let invocation = parse_run_command_invocation(&serde_json::json!({
+            "command": "gh pr diff 1872 --repo fawxai/fawx > /tmp/pr1872.diff"
+        }))
+        .expect("redirect command should infer shell");
+
+        assert!(matches!(
+            invocation,
+            RunCommandInvocation::Shell { ref command }
+            if command == "gh pr diff 1872 --repo fawxai/fawx > /tmp/pr1872.diff"
+        ));
+    }
+
+    #[test]
+    fn parse_run_command_invocation_keeps_explicit_non_shell_pipeline_literal() {
+        let invocation = parse_run_command_invocation(&serde_json::json!({
+            "command": "gh pr diff 1872 --repo fawxai/fawx | head -3000",
+            "shell": false
+        }))
+        .expect("explicit non-shell command should not infer shell");
+
+        assert!(matches!(
+            invocation,
+            RunCommandInvocation::NonShell { ref argv, .. }
+            if argv.iter().any(|arg| arg == "|")
+        ));
+    }
+
+    #[test]
+    fn ambiguous_invocation_note_formats_only_failed_output() {
+        let args = RunCommandArgs {
+            command: Some("echo ignored".to_string()),
+            argv: Some(vec!["false".to_string()]),
+            working_dir: None,
+            shell: RunCommandShellMode::Auto,
+        };
+        let invocation = parse_run_command_invocation_from_args(args.clone())
+            .expect("ambiguous invocation should parse");
+        let invocation_note = discarded_run_command_field_note(&args, &invocation);
+        let output = std::process::Command::new("false")
+            .output()
+            .expect("run false");
+
+        let success_output = format_command_output(&output, invocation.shell());
+        let failure_output = format_command_output_with_invocation_note(
+            &output,
+            invocation.shell(),
+            invocation_note.as_deref(),
+        );
+
+        assert!(!success_output.contains("[run_command note:"));
+        assert!(failure_output.contains(
+            "[run_command note: command field was ignored because argv was also supplied: echo ignored]"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_invocation_note_suppressed_when_command_and_argv_match() {
+        let args = RunCommandArgs {
+            command: Some("echo hi".to_string()),
+            argv: Some(vec!["echo".to_string(), "hi".to_string()]),
+            working_dir: None,
+            shell: RunCommandShellMode::Auto,
+        };
+        let invocation = parse_run_command_invocation_from_args(args.clone())
+            .expect("ambiguous invocation should parse");
+
+        assert_eq!(discarded_run_command_field_note(&args, &invocation), None);
+    }
+
+    #[test]
+    fn command_requires_shell_ignores_quoted_metacharacters() {
+        assert!(!command_requires_shell(r#"echo "a | b" '>'"#));
+    }
+
+    #[test]
+    fn run_command_shell_mode_defaults_to_auto_when_omitted() {
+        let parsed: RunCommandArgs =
+            serde_json::from_value(serde_json::json!({ "command": "pwd" })).expect("parse");
+
+        assert_eq!(parsed.shell, RunCommandShellMode::Auto);
     }
 }

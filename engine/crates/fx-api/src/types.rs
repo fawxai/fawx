@@ -553,6 +553,9 @@ pub struct SkillSummaryDto {
     pub activated_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_status: Option<String>,
+    /// Opaque drift detail for installed skills whose source manifest no longer
+    /// matches the active loaded revision. Non-nil means "update available";
+    /// clients should not parse the string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_source: Option<String>,
 }

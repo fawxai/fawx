@@ -164,6 +164,16 @@ pub enum ToolExecutionDiagnostics {
     RunCommand(RunCommandDiagnostics),
     /// Diagnostics preserved from a structured HTTP/tool failure.
     Http(HttpDiagnostics),
+    /// Typed diagnostics preserved from a successful structured tool call.
+    Tool(ToolDiagnostics),
+}
+
+/// Diagnostics captured for a successful structured tool invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolDiagnostics {
+    /// Completed external actions observed from this tool call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_actions: Vec<ExternalActionEvidence>,
 }
 
 /// Diagnostics captured for a failed `run_command` invocation.
@@ -191,7 +201,7 @@ impl ToolExecutionDiagnostics {
     pub fn as_run_command(&self) -> Option<&RunCommandDiagnostics> {
         match self {
             Self::RunCommand(diagnostics) => Some(diagnostics),
-            Self::Http(_) => None,
+            Self::Http(_) | Self::Tool(_) => None,
         }
     }
 
@@ -200,6 +210,7 @@ impl ToolExecutionDiagnostics {
         match self {
             Self::RunCommand(_) => None,
             Self::Http(diagnostics) => Some(diagnostics),
+            Self::Tool(_) => None,
         }
     }
 
@@ -219,7 +230,7 @@ impl ToolExecutionDiagnostics {
         match self {
             Self::RunCommand(diagnostics) => Some(diagnostics.duration_ms),
             // Structured HTTP diagnostics do not yet carry wall-clock duration.
-            Self::Http(_) => None,
+            Self::Http(_) | Self::Tool(_) => None,
         }
     }
 
@@ -227,7 +238,7 @@ impl ToolExecutionDiagnostics {
     pub fn timed_out(&self) -> bool {
         match self {
             Self::RunCommand(diagnostics) => diagnostics.timed_out,
-            Self::Http(_) => false,
+            Self::Http(_) | Self::Tool(_) => false,
         }
     }
 
@@ -235,6 +246,7 @@ impl ToolExecutionDiagnostics {
     pub fn external_actions(&self) -> &[ExternalActionEvidence] {
         match self {
             Self::RunCommand(diagnostics) => &diagnostics.external_actions,
+            Self::Tool(diagnostics) => &diagnostics.external_actions,
             Self::Http(_) => &[],
         }
     }
@@ -817,6 +829,10 @@ pub trait ToolExecutor: Send + Sync + std::fmt::Debug {
 
     /// Clears any tool-result cache state for the current cycle.
     fn clear_cache(&self) {}
+
+    /// Notifies the executor that context compaction occurred, so cached
+    /// entries from before compaction can be invalidated. Default no-op.
+    fn notify_compaction(&self) {}
 
     /// Returns cache statistics when supported by the executor.
     fn cache_stats(&self) -> Option<ToolCacheStats> {

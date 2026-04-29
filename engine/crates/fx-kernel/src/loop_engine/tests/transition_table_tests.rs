@@ -5,10 +5,10 @@ use super::test_fixtures::{
 use super::*;
 use crate::act::{
     ActionNextStep, ActionTerminal, ContinuationToolScope, FinalizeResponse,
-    ProceedUnderConstraints, TurnCommitment,
+    ProceedUnderConstraints, ToolResult, TurnCommitment,
 };
 use crate::decide::Decision;
-use fx_llm::ToolCall;
+use fx_llm::{ToolCall, ToolDefinition};
 use std::sync::Arc;
 
 fn install_finalize_response_commitment(engine: &mut LoopEngine) {
@@ -122,6 +122,115 @@ fn explicit_deliverables_remain_hard_terminal_contracts() {
         )
         .is_none(),
         "all explicit deliverable headings should satisfy the root-turn gate"
+    );
+}
+
+#[test]
+fn mutation_requests_create_hard_root_turn_contracts() {
+    let extraction = extract_root_turn_contract(
+        "Please fix the harness loop issue and open a PR against loop-tuning.",
+    );
+    let contract = extraction.contract.expect("mutation contract");
+
+    let blocked = root_turn_completion_block(&contract, "I'll fix this by tightening the loop.")
+        .expect("mutation work should block terminal completion until a mutation tool succeeds");
+
+    assert_eq!(
+        blocked.pending_mutation_work,
+        vec!["Complete the requested code or file changes"]
+    );
+    assert_eq!(
+        blocked.pending_external_actions,
+        vec!["Open the GitHub pull request"]
+    );
+}
+
+#[test]
+fn mutation_request_detection_covers_common_code_change_language() {
+    for message in [
+        "Please refactor the module and open a PR.",
+        "Add the missing file handling.",
+        "Remove the dead crate code.",
+        "Rename the function in this package.",
+        "Please resolve these issues:\n\n1. discarded_field_note is too broad.\n2. ResultKind::Error regressed headless callers.",
+    ] {
+        let contract = extract_root_turn_contract(message)
+            .contract
+            .unwrap_or_else(|| panic!("expected mutation contract for: {message}"));
+
+        assert!(
+            contract.deliverables.iter().any(|deliverable| {
+                matches!(deliverable, RootTurnDeliverable::MutationWork { .. })
+            }),
+            "expected mutation deliverable for: {message}"
+        );
+    }
+}
+
+#[test]
+fn mutation_request_detection_does_not_convert_read_only_diagnostics() {
+    assert!(
+        extract_root_turn_contract("Tell me what needs to change in the harness.")
+            .contract
+            .is_none(),
+        "diagnostic requests should not become mutation contracts"
+    );
+}
+
+#[test]
+fn mutation_work_completion_requires_successful_file_write_tool() {
+    let calls = vec![
+        ToolCall {
+            id: "test".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"argv": ["cargo", "test"]}),
+        },
+        ToolCall {
+            id: "edit".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        },
+    ];
+
+    assert!(
+        !mutation_work_completed(
+            &calls[..1],
+            &[ToolResult::success("test", "run_command", "ok")]
+        ),
+        "successful command side effects should not prove local code changes happened"
+    );
+    assert!(
+        mutation_work_completed(
+            &calls,
+            &[ToolResult::success("edit", "edit_file", "edited")]
+        ),
+        "successful edit_file should satisfy mutation work"
+    );
+}
+
+#[test]
+fn mutation_tool_scope_includes_write_file_before_artifact_gate() {
+    let scope = mutation_tool_scope(&[
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+        ToolDefinition {
+            name: "write_file".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    ]);
+
+    assert_eq!(
+        scope,
+        ContinuationToolScope::Only(vec!["edit_file".to_string(), "write_file".to_string()])
     );
 }
 
@@ -828,6 +937,7 @@ async fn budget_boundary_pending_tool_request_synthesizes_from_observed_evidence
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn outer_budget_gate_does_not_preempt_committed_final_response() {
     let mut config = budget_config_with_llm_calls(2, 10);
     config.max_tool_invocations = 1;

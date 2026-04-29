@@ -417,6 +417,7 @@ mod tests {
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: Arc::new(tokio::sync::Mutex::new(
                 crate::experiment_registry::ExperimentRegistry::new(data_dir.as_path())
                     .expect("experiment registry"),

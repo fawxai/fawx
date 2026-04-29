@@ -25,14 +25,16 @@ use super::{
     summarize_tool_progress, tool_continuation_artifact_write_target,
     tool_continuation_turn_commitment, tool_error_relay_directive, ContextWindowStats, CycleStream,
     FollowUpDecomposeContext, LlmProvider, LoopEngine, ProgressSlot, ProgressSlotKind,
-    ProgressSlotStatus, RepeatedToolFailureEvent, RepeatedToolFailureState, ToolProgressClass,
-    ToolProgressEntry, ToolProgressOutcome, ToolRoundState, NOTIFY_TOOL_NAME,
-    OBSERVATION_ONLY_CALL_BLOCK_REASON, OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE,
-    OBSERVATION_ONLY_TOOL_ROUND_NUDGE, TOOL_ROUND_PROGRESS_NUDGE,
+    ProgressSlotStatus, RepeatedToolFailureEvent, RepeatedToolFailureState,
+    RootTurnExternalActionKind, ToolProgressClass, ToolProgressEntry, ToolProgressOutcome,
+    ToolRoundState, NOTIFY_TOOL_NAME, OBSERVATION_ONLY_CALL_BLOCK_REASON,
+    OBSERVATION_ONLY_MUTATION_REPLAN_DIRECTIVE, OBSERVATION_ONLY_TOOL_ROUND_NUDGE,
+    TOOL_ROUND_PROGRESS_NUDGE,
 };
 use crate::act::{
     ActionContinuation, ActionNextStep, ActionResult, ActionTerminal, ContinuationToolScope,
-    FailureClass, TokenUsage, ToolCacheability, ToolCallClassification, ToolExecutor, ToolResult,
+    ExternalActionKind, FailureClass, TokenUsage, ToolCacheability, ToolCallClassification,
+    ToolExecutor, ToolResult,
 };
 use crate::budget::{
     truncate_tool_result, ActionCost, BudgetState, ToolStrippingAfterNudge,
@@ -220,6 +222,7 @@ struct ToolEvidenceTerminalParts {
     pending_calls: Vec<ToolCall>,
     evidence_messages: Vec<Message>,
     tokens_used: TokenUsage,
+    unresolved_policy_deferred: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -519,6 +522,7 @@ impl LoopEngine {
         let prepared = PreparedToolCalls::new(allowed, blocked);
         let prepared = self.filter_calls_by_profile_tool_names(prepared);
         let prepared = self.filter_calls_by_bounded_local_semantics(prepared);
+        let prepared = self.filter_calls_by_external_action_closure(prepared);
         let prepared = self.filter_calls_by_observation_controls(prepared);
         self.filter_calls_by_mutation_guards(prepared)
     }
@@ -574,6 +578,23 @@ impl LoopEngine {
             ToolCallClassification::Mutation,
             OBSERVATION_ONLY_CALL_BLOCK_REASON,
         );
+        prepared.filtered(allowed, blocked)
+    }
+
+    fn filter_calls_by_external_action_closure(
+        &self,
+        prepared: PreparedToolCalls,
+    ) -> PreparedToolCalls {
+        let Some(action) = self.pending_external_action_target else {
+            return prepared;
+        };
+
+        let allowed_names = super::available_external_action_tool_names(
+            &self.tool_executor.tool_definitions(),
+            action,
+        );
+        let (allowed, blocked) =
+            partition_by_external_action_closure(&prepared.allowed, action, &allowed_names);
         prepared.filtered(allowed, blocked)
     }
 
@@ -1216,7 +1237,7 @@ impl LoopEngine {
                 .await?;
         }
 
-        if has_policy_deferred_tool_results(&state.all_tool_results) {
+        if has_unresolved_policy_deferred_calls(&state) {
             let ToolRoundState {
                 all_tool_results,
                 evidence_messages,
@@ -1308,7 +1329,7 @@ impl LoopEngine {
         decision: &Decision,
         state: ToolRoundState,
     ) -> ActionResult {
-        if has_policy_deferred_tool_results(&state.all_tool_results) {
+        if has_unresolved_policy_deferred_calls(&state) {
             let next_tool_scope = self.continuation_tool_scope_for_round(&state);
             let ToolRoundState {
                 all_tool_results,
@@ -1352,10 +1373,12 @@ impl LoopEngine {
             all_tool_results,
             accumulated_text,
             evidence_messages,
+            pending_policy_deferred_calls,
             mut tokens_used,
             used_mutation_tools,
             ..
         } = state;
+        let unresolved_policy_deferred = !pending_policy_deferred_calls.is_empty();
         let max_tokens = self.budget.config().max_synthesis_tokens;
         let evicted = evict_oldest_results(all_tool_results, max_tokens);
         let synthesis_prompt = tool_synthesis_prompt(&evicted, &self.synthesis_instruction);
@@ -1398,15 +1421,14 @@ impl LoopEngine {
             {
                 self.direct_inspection_empty_summary_action_result(decision, evicted, tokens_used)
             }
-            None if has_policy_deferred_tool_results(&evicted) => self
-                .policy_deferred_continuation_action_result(
-                    decision,
-                    evicted,
-                    accumulated_text,
-                    evidence_messages,
-                    tokens_used,
-                    next_tool_scope,
-                ),
+            None if unresolved_policy_deferred => self.policy_deferred_continuation_action_result(
+                decision,
+                evicted,
+                accumulated_text,
+                evidence_messages,
+                tokens_used,
+                next_tool_scope,
+            ),
             None => self.tool_evidence_terminal_action_from_parts(
                 decision,
                 ToolEvidenceTerminalParts {
@@ -1414,6 +1436,7 @@ impl LoopEngine {
                     pending_calls: Vec::new(),
                     evidence_messages,
                     tokens_used,
+                    unresolved_policy_deferred,
                 },
                 next_tool_scope,
                 None,
@@ -1439,6 +1462,7 @@ impl LoopEngine {
         let pending_calls = pending_calls_override.unwrap_or_else(|| state.current_calls.clone());
         let ToolRoundState {
             all_tool_results,
+            pending_policy_deferred_calls,
             evidence_messages,
             tokens_used,
             ..
@@ -1450,6 +1474,7 @@ impl LoopEngine {
                 pending_calls,
                 evidence_messages,
                 tokens_used,
+                unresolved_policy_deferred: !pending_policy_deferred_calls.is_empty(),
             },
             next_tool_scope,
             pending_tool_call_state,
@@ -1475,6 +1500,7 @@ impl LoopEngine {
             pending_calls,
             evidence_messages,
             tokens_used,
+            unresolved_policy_deferred,
         } = parts;
         let pending_tool_calls = pending_tool_call_state.unwrap_or({
             if pending_calls.is_empty() {
@@ -1485,7 +1511,7 @@ impl LoopEngine {
         });
         match TurnControlPlane::decide_tool_evidence_terminal(ToolEvidenceTerminalFacts {
             has_tool_results: !tool_results.is_empty(),
-            has_policy_deferred_results: has_policy_deferred_tool_results(&tool_results),
+            has_policy_deferred_results: unresolved_policy_deferred,
             pending_tool_calls,
             direct_inspection: self
                 .turn_execution_profile
@@ -3257,10 +3283,8 @@ fn tool_round_activity_title(calls: &[ToolCall]) -> Option<String> {
     ))
 }
 
-fn has_policy_deferred_tool_results(results: &[ToolResult]) -> bool {
-    results
-        .iter()
-        .any(|result| matches!(result.failure_class, Some(FailureClass::PolicyDeferred)))
+fn has_unresolved_policy_deferred_calls(state: &ToolRoundState) -> bool {
+    !state.pending_policy_deferred_calls.is_empty()
 }
 
 fn pending_subagent_ids(results: &[ToolResult]) -> Vec<String> {
@@ -3675,6 +3699,125 @@ pub(super) fn partition_by_allowed_tool_names(
         }
     }
     (allowed, blocked)
+}
+
+fn partition_by_external_action_closure(
+    calls: &[ToolCall],
+    action: RootTurnExternalActionKind,
+    allowed_names: &[String],
+) -> (Vec<ToolCall>, Vec<BlockedToolCall>) {
+    let allowed_name_set: HashSet<&str> = allowed_names.iter().map(String::as_str).collect();
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+    let label = super::external_action_label(action);
+    for call in calls {
+        if allowed_name_set.contains(call.name.as_str())
+            && tool_call_may_complete_external_action(call, action)
+        {
+            allowed.push(call.clone());
+        } else {
+            blocked.push(BlockedToolCall::policy_with_details(
+                call.clone(),
+                format!("pending external action gate requires: {label}"),
+                Some(FailureClass::PolicyDeferred),
+                Some(format!(
+                    "Use one of [{}] with arguments that complete this action before running more inspection.",
+                    allowed_names.join(", ")
+                )),
+            ));
+        }
+    }
+    (allowed, blocked)
+}
+
+pub(super) fn tool_call_may_complete_external_action(
+    call: &ToolCall,
+    action: RootTurnExternalActionKind,
+) -> bool {
+    // This predicate intentionally represents an attempted contract-closing
+    // action, not proof of success. The gate uses it to choose allowed tools
+    // before execution, and the loop uses the same shape after execution to
+    // count failed attempts against the recovery threshold.
+    match action {
+        RootTurnExternalActionKind::GitHubPrComment => {
+            matches!(call.name.as_str(), "comment_pr" | "github_pr_comment")
+                || run_command_may_complete_external_action(call, action)
+        }
+        RootTurnExternalActionKind::GitHubIssueComment => {
+            matches!(call.name.as_str(), "comment_issue" | "github_issue_comment")
+                || run_command_may_complete_external_action(call, action)
+        }
+        RootTurnExternalActionKind::GitHubPrReview => {
+            matches!(call.name.as_str(), "review_pr" | "github_pr_review")
+                || run_command_may_complete_external_action(call, action)
+        }
+        RootTurnExternalActionKind::GitHubPrCreate => {
+            matches!(call.name.as_str(), "create_pr" | "github_pr_create")
+                || run_command_may_complete_external_action(call, action)
+        }
+        RootTurnExternalActionKind::GitPush => {
+            call.name == "git_push" || run_command_may_complete_external_action(call, action)
+        }
+    }
+}
+
+fn run_command_may_complete_external_action(
+    call: &ToolCall,
+    action: RootTurnExternalActionKind,
+) -> bool {
+    if call.name != "run_command" {
+        return false;
+    }
+    if action == RootTurnExternalActionKind::GitHubPrCreate {
+        return run_command_arguments_contain_tokens(&call.arguments, &["gh", "pr", "create"]);
+    }
+    let evidence = crate::act::external_actions_from_run_command_arguments(
+        &call.arguments,
+        "https://github.com/owner/repo/pull/1#issuecomment-1",
+    );
+    evidence
+        .iter()
+        .any(|evidence| external_action_evidence_matches(evidence.kind, action))
+}
+
+fn external_action_evidence_matches(
+    evidence: ExternalActionKind,
+    action: RootTurnExternalActionKind,
+) -> bool {
+    matches!(
+        (evidence, action),
+        (
+            ExternalActionKind::GithubPrComment,
+            RootTurnExternalActionKind::GitHubPrComment
+        ) | (
+            ExternalActionKind::GithubIssueComment,
+            RootTurnExternalActionKind::GitHubIssueComment
+        ) | (
+            ExternalActionKind::GithubPrReview,
+            RootTurnExternalActionKind::GitHubPrReview
+        ) | (
+            ExternalActionKind::GitPush,
+            RootTurnExternalActionKind::GitPush
+        )
+    )
+}
+
+fn run_command_arguments_contain_tokens(arguments: &serde_json::Value, required: &[&str]) -> bool {
+    let normalized = arguments
+        .to_string()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .windows(required.len())
+        .any(|window| window == required)
 }
 
 pub(super) fn build_uniform_blocked_calls(

@@ -10,11 +10,17 @@ use crate::skill::{Skill, SkillError};
 use crate::wasm_host::{LiveHostApi, LiveHostApiConfig};
 use async_trait::async_trait;
 use fx_core::tool_routing::{RouteAuthMode, ToolReadinessSummary, ToolRoutingSummary};
-use fx_kernel::act::{ToolCacheability, ToolExecutionDiagnostics, ToolResult};
+use fx_kernel::act::{
+    ExternalActionEvidence, ExternalActionKind, ToolCacheability, ToolDiagnostics,
+    ToolExecutionDiagnostics, ToolResult,
+};
 use fx_kernel::cancellation::CancellationToken;
 use fx_kernel::{FailureClass, ToolAuthoritySurface};
 use fx_llm::{ToolCall, ToolDefinition};
-use fx_protocol::StructuredFailure;
+use fx_protocol::{
+    ExternalActionEvidence as ProtocolExternalActionEvidence,
+    ExternalActionKind as ProtocolExternalActionKind, StructuredFailure, StructuredToolDiagnostics,
+};
 use fx_skills::live_host_api::CredentialProvider;
 use fx_skills::loader::LoadedSkill;
 use fx_skills::manifest::{SkillManifest, SkillToolAuthoritySurface, SkillToolManifest};
@@ -128,13 +134,27 @@ impl WasmSkill {
             .parameters
             .iter()
             .map(|parameter| {
-                (
-                    parameter.name.clone(),
-                    serde_json::json!({
-                        "type": parameter.kind,
-                        "description": parameter.description,
-                    }),
-                )
+                let mut schema = serde_json::Map::new();
+                schema.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(parameter.kind.clone()),
+                );
+                schema.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(parameter.description.clone()),
+                );
+                if parameter.kind == "array" {
+                    schema.insert(
+                        "items".to_string(),
+                        serde_json::json!({
+                            "type": parameter
+                                .item_type
+                                .as_deref()
+                                .expect("validated array tool parameters must declare item_type"),
+                        }),
+                    );
+                }
+                (parameter.name.clone(), serde_json::Value::Object(schema))
             })
             .collect::<serde_json::Map<String, serde_json::Value>>();
         let required = tool
@@ -318,6 +338,58 @@ fn parse_structured_wasm_failure(output: &str) -> Option<StructuredFailure> {
     serde_json::from_str::<StructuredWasmFailureCarrier>(output)
         .ok()
         .and_then(|carrier| carrier.failure)
+}
+
+fn split_structured_wasm_diagnostics(output: &str) -> (String, Option<ToolExecutionDiagnostics>) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return (output.to_string(), None);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return (output.to_string(), None);
+    };
+    let Some(diagnostics_value) = object.remove("__fawx_diagnostics") else {
+        return (output.to_string(), None);
+    };
+
+    let diagnostics = serde_json::from_value::<StructuredToolDiagnostics>(diagnostics_value)
+        .ok()
+        .and_then(kernel_tool_diagnostics_from_protocol);
+    let sanitized_output = serde_json::to_string(&value).unwrap_or_else(|_| output.to_string());
+    (sanitized_output, diagnostics)
+}
+
+fn kernel_tool_diagnostics_from_protocol(
+    diagnostics: StructuredToolDiagnostics,
+) -> Option<ToolExecutionDiagnostics> {
+    let external_actions = diagnostics
+        .external_actions
+        .into_iter()
+        .map(kernel_external_action_from_protocol)
+        .collect::<Vec<_>>();
+    if external_actions.is_empty() {
+        return None;
+    }
+
+    Some(ToolExecutionDiagnostics::Tool(ToolDiagnostics {
+        external_actions,
+    }))
+}
+
+fn kernel_external_action_from_protocol(
+    evidence: ProtocolExternalActionEvidence,
+) -> ExternalActionEvidence {
+    let kind = match evidence.kind {
+        ProtocolExternalActionKind::GithubPrComment => ExternalActionKind::GithubPrComment,
+        ProtocolExternalActionKind::GithubIssueComment => ExternalActionKind::GithubIssueComment,
+        ProtocolExternalActionKind::GithubPrReview => ExternalActionKind::GithubPrReview,
+        ProtocolExternalActionKind::GitPush => ExternalActionKind::GitPush,
+    };
+    ExternalActionEvidence {
+        kind,
+        url: evidence.url,
+        remote: evidence.remote,
+        refspecs: evidence.refspecs,
+    }
 }
 
 pub(crate) fn manifest_routing_tools(
@@ -508,6 +580,8 @@ impl Skill for WasmSkill {
                     );
                     ToolResult::failure(tool_call_id, tool_name, failure.message, failure.class)
                 } else {
+                    let (output, diagnostics) = split_structured_wasm_diagnostics(&output);
+                    self.capture_wasm_diagnostics(tool_call_id, diagnostics);
                     ToolResult::success(tool_call_id, tool_name, output)
                 }
             }
@@ -829,6 +903,8 @@ fn signature_matches(wasm_bytes: &[u8], signature: &[u8], key: &[u8]) -> Option<
 ///
 /// The optional `credential_provider` bridges the encrypted credential
 /// store so skills can retrieve secrets (e.g., GitHub PAT) via `kv_get`.
+/// When absent, `kv_get` remains storage-backed only; missing credential
+/// infrastructure must not turn ordinary storage lookups into errors.
 ///
 /// Errors from individual skills are logged and skipped; only a
 /// directory-level failure propagates as an error.
@@ -907,8 +983,15 @@ mod tests {
     use fx_core::tool_routing::{
         ArtifactStrategy, ResourceKind, RouteAuthMode, RouteOperation, ToolRoutingMetadata,
     };
-    use fx_kernel::act::{HttpDiagnostics, ToolExecutionDiagnostics};
-    use fx_protocol::{FailureClass as ProtocolFailureClass, StructuredFailure};
+    use fx_kernel::act::{
+        ExternalActionEvidence as KernelExternalActionEvidence,
+        ExternalActionKind as KernelExternalActionKind, HttpDiagnostics, ToolDiagnostics,
+        ToolExecutionDiagnostics,
+    };
+    use fx_protocol::{
+        ExternalActionEvidence as ProtocolExternalActionEvidence,
+        FailureClass as ProtocolFailureClass, StructuredFailure, StructuredToolDiagnostics,
+    };
     use fx_skills::loader::SkillLoader;
     use fx_skills::manifest::{
         SkillManifest, SkillToolAuthoritySurface, SkillToolManifest, SkillToolParameterManifest,
@@ -976,6 +1059,7 @@ mod tests {
         SkillToolParameterManifest {
             name: name.to_string(),
             kind: "string".to_string(),
+            item_type: None,
             description: description.to_string(),
             required: true,
         }
@@ -1225,6 +1309,29 @@ mod tests {
     }
 
     #[test]
+    fn manifest_array_parameter_emits_items_schema() {
+        let mut manifest = test_manifest("github");
+        let mut create_issue = test_tool_manifest("create_issue", None);
+        create_issue.description = "Create issue".to_string();
+        create_issue.authority_surface = None;
+        create_issue.parameters = vec![SkillToolParameterManifest {
+            name: "assignees".to_string(),
+            kind: "array".to_string(),
+            item_type: Some("string".to_string()),
+            description: "Optional assignees".to_string(),
+            required: false,
+        }];
+        manifest.tools = vec![create_issue];
+        let skill = load_wasm_skill(&manifest, None);
+
+        let defs = skill.tool_definitions();
+        assert_eq!(
+            defs[0].parameters["properties"]["assignees"]["items"],
+            serde_json::json!({ "type": "string" })
+        );
+    }
+
+    #[test]
     fn multi_tool_manifest_inserts_explicit_tool_name_for_runtime_routing() {
         let mut manifest = test_manifest("canvas");
         let mut render_table = test_tool_manifest("render_table", None);
@@ -1311,6 +1418,66 @@ mod tests {
             })
         );
         assert!(skill.take_execution_diagnostics("call-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn wasm_skill_captures_success_diagnostics_and_strips_internal_envelope() {
+        let manifest = test_manifest("github");
+        let wasm = output_only_wasm(
+            r#"{"success":true,"comment_id":999,"__fawx_diagnostics":{"external_actions":[{"kind":"github_pr_comment","url":"https://github.com/acme/widgets/pull/42#issuecomment-999"}]}}"#,
+        );
+        let skill = load_wasm_skill_from_bytes(&manifest, &wasm, None);
+
+        let result = skill
+            .execute_tool_result("call-1", "github", r#"{"input":""}"#, None)
+            .await
+            .expect("tool result");
+
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).expect("json output");
+        assert_eq!(output["success"], true);
+        assert_eq!(output["comment_id"], 999);
+        assert!(output.get("__fawx_diagnostics").is_none());
+
+        let diagnostics = skill
+            .take_execution_diagnostics("call-1")
+            .expect("diagnostics");
+        assert_eq!(
+            diagnostics,
+            ToolExecutionDiagnostics::Tool(ToolDiagnostics {
+                external_actions: vec![KernelExternalActionEvidence {
+                    kind: KernelExternalActionKind::GithubPrComment,
+                    url: Some(
+                        "https://github.com/acme/widgets/pull/42#issuecomment-999".to_string()
+                    ),
+                    remote: None,
+                    refspecs: Vec::new(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_diagnostics_convert_to_kernel_external_action_diagnostics() {
+        let diagnostics = StructuredToolDiagnostics {
+            external_actions: vec![ProtocolExternalActionEvidence::github_pr_comment(Some(
+                "https://github.com/acme/widgets/pull/42#issuecomment-999".to_string(),
+            ))],
+        };
+
+        assert_eq!(
+            kernel_tool_diagnostics_from_protocol(diagnostics),
+            Some(ToolExecutionDiagnostics::Tool(ToolDiagnostics {
+                external_actions: vec![KernelExternalActionEvidence {
+                    kind: KernelExternalActionKind::GithubPrComment,
+                    url: Some(
+                        "https://github.com/acme/widgets/pull/42#issuecomment-999".to_string()
+                    ),
+                    remote: None,
+                    refspecs: Vec::new(),
+                }],
+            }))
+        );
     }
 
     #[test]

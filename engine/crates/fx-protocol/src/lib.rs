@@ -190,6 +190,90 @@ impl StructuredFailure {
     }
 }
 
+/// A side effect outside the local workspace that a skill completed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalActionKind {
+    /// A comment was posted to a GitHub pull request.
+    GithubPrComment,
+    /// A comment was posted to a GitHub issue.
+    GithubIssueComment,
+    /// A GitHub pull request review was submitted.
+    GithubPrReview,
+    /// Changes were pushed to a git remote.
+    GitPush,
+}
+
+/// Typed evidence that a skill completed an external side effect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalActionEvidence {
+    /// The kind of external action that completed.
+    pub kind: ExternalActionKind,
+    /// A stable URL for the completed action when the provider/tool exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Git remote affected by a push action, when it can be determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Git push refspecs/branch targets observed for a push action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refspecs: Vec<String>,
+}
+
+impl ExternalActionEvidence {
+    #[must_use]
+    pub fn github_pr_comment(url: Option<String>) -> Self {
+        Self {
+            kind: ExternalActionKind::GithubPrComment,
+            url,
+            remote: None,
+            refspecs: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn github_issue_comment(url: Option<String>) -> Self {
+        Self {
+            kind: ExternalActionKind::GithubIssueComment,
+            url,
+            remote: None,
+            refspecs: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn github_pr_review(url: Option<String>) -> Self {
+        Self {
+            kind: ExternalActionKind::GithubPrReview,
+            url,
+            remote: None,
+            refspecs: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn git_push(remote: Option<String>, refspecs: Vec<String>) -> Self {
+        Self {
+            kind: ExternalActionKind::GitPush,
+            url: None,
+            remote,
+            refspecs,
+        }
+    }
+}
+
+/// Structured success diagnostics emitted by WASM skills.
+///
+/// Skills include this under a top-level `__fawx_diagnostics` key alongside
+/// their normal success output. Hosts consume and strip that key before
+/// returning the tool result to the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StructuredToolDiagnostics {
+    /// Completed external actions observed from this tool call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_actions: Vec<ExternalActionEvidence>,
+}
+
 /// Structured HTTP result preserved across the string-only WASM boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

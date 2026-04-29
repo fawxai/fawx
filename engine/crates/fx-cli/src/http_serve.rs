@@ -30,6 +30,7 @@ pub async fn run(
     };
 
     let cron_store = app.cron_store().cloned();
+    let credential_store = app.credential_store().cloned();
     let scheduler_handle = start_scheduler_if_possible(&app, cron_store.as_ref());
     let ripcord = Arc::clone(app.ripcord_journal());
 
@@ -42,6 +43,7 @@ pub async fn run(
             port,
             http_config: http_config.clone(),
             data_dir,
+            credential_store,
             telegram,
             webhook_channels,
             cron_store,

@@ -1207,6 +1207,7 @@ mod tests {
                 max_iterations: 10,
                 max_history: 20,
                 memory_enabled: true,
+                tool_invocations_remaining: 0,
             },
             authority: None,
             version: "test".to_string(),

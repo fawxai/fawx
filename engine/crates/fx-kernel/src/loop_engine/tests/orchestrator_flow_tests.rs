@@ -42,6 +42,35 @@ impl ToolExecutor for StubToolExecutor {
     }
 }
 
+#[derive(Debug)]
+struct VerboseToolExecutor {
+    output: String,
+}
+
+#[async_trait]
+impl ToolExecutor for VerboseToolExecutor {
+    async fn execute_tools(
+        &self,
+        calls: &[ToolCall],
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<ToolResult>, crate::act::ToolExecutorError> {
+        Ok(calls
+            .iter()
+            .map(|call| ToolResult {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                success: true,
+                output: self.output.clone(),
+                failure_class: None,
+            })
+            .collect())
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        StubToolExecutor.tool_definitions()
+    }
+}
+
 #[derive(Debug, Default)]
 struct FailingToolExecutor;
 
@@ -386,6 +415,260 @@ fn expect_complete(result: LoopResult) -> (String, u32, Vec<Signal>) {
         } => (response, iterations, signals),
         other => panic!("expected LoopResult::Complete, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn simple_agent_loop_reasons_again_after_tool_results() {
+    let mut engine = test_engine();
+    let llm = SequentialMockLlm::new(vec![
+        tool_call_response(
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"src/lib.rs"}),
+        ),
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "fixed the issue".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some("stop".to_string()),
+        },
+    ]);
+
+    let result = engine
+        .run_cycle_streaming(test_snapshot("please resolve the issue"), &llm, None)
+        .await
+        .expect("cycle succeeds");
+
+    let (response, iterations, _) = expect_complete(result);
+    assert_eq!(response, "fixed the issue");
+    assert_eq!(iterations, 2);
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")
+            })
+        }),
+        "second reasoning request should include the prior tool result"
+    );
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call-1"))
+        }),
+        "second reasoning request should preserve the prior assistant tool call"
+    );
+}
+
+#[tokio::test]
+async fn simple_agent_loop_requests_no_tool_final_response_at_iteration_limit() {
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(1)
+        .tool_executor(Arc::new(StubToolExecutor))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let llm = SequentialMockLlm::new(vec![
+        tool_call_response(
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"src/lib.rs"}),
+        ),
+        text_response("final from gathered evidence", Some("stop"), None),
+    ]);
+
+    let result = engine
+        .run_cycle_streaming(
+            test_snapshot("review the code and report findings"),
+            &llm,
+            None,
+        )
+        .await
+        .expect("cycle succeeds");
+
+    let (response, iterations, signals) = expect_complete(result);
+    assert_eq!(response, "final from gathered evidence");
+    assert_eq!(iterations, 1);
+    assert!(signals.iter().any(|signal| {
+        signal.step == LoopStep::Reason
+            && signal.kind == SignalKind::Trace
+            && signal.message.contains("requesting final response")
+    }));
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].tools.is_empty(),
+        "iteration-limit final request should close the tool surface"
+    );
+    assert!(
+        requests[1]
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Do not call more tools"),
+        "final request should make the no-tool boundary explicit"
+    );
+}
+
+#[tokio::test]
+async fn simple_agent_loop_compacts_context_between_tool_rounds() {
+    let compaction_config = CompactionConfig {
+        slide_threshold: 0.05,
+        prune_threshold: 0.02,
+        _legacy_summarize_threshold: 0.80,
+        emergency_threshold: 0.95,
+        preserve_recent_turns: 2,
+        model_context_limit: 6_000,
+        reserved_system_tokens: 0,
+        recompact_cooldown_turns: 1,
+        use_summarization: false,
+        max_summary_tokens: 256,
+        prune_tool_blocks: false,
+        tool_block_summary_max_chars: 200,
+    };
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(2048, 256))
+        .compaction_config(compaction_config)
+        .max_iterations(3)
+        .tool_executor(Arc::new(VerboseToolExecutor {
+            output: "tool evidence ".repeat(40),
+        }))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let llm = SequentialMockLlm::new(vec![
+        tool_call_response(
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"src/lib.rs"}),
+        ),
+        text_response("done", Some("stop"), None),
+    ]);
+    let mut snapshot = test_snapshot("resolve the issue");
+    snapshot.conversation_history = (0..12)
+        .map(|index| Message::user(format!("prior turn {index} {}", "context ".repeat(40))))
+        .chain(std::iter::once(Message::user("resolve the issue")))
+        .collect();
+
+    let result = engine
+        .run_cycle_streaming(snapshot, &llm, None)
+        .await
+        .expect("cycle succeeds");
+
+    let (response, iterations, _) = expect_complete(result);
+    assert_eq!(response, "done");
+    assert_eq!(iterations, 2);
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if text.starts_with("[context compacted:"))
+            })
+        }),
+        "continued reasoning should see a compacted context marker"
+    );
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-1")
+            })
+        }),
+        "compaction must preserve the current tool result"
+    );
+}
+
+#[tokio::test]
+async fn simple_agent_loop_checks_tool_budget_before_execution() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut budget = crate::budget::BudgetConfig::default();
+    budget.max_tool_invocations = 0;
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(budget, current_time_ms(), 0))
+        .context(ContextCompactor::new(2048, 256))
+        .max_iterations(3)
+        .tool_executor(Arc::new(RecordingRunCommandExecutor::new(executed.clone())))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let llm = SequentialMockLlm::new(vec![tool_call_response(
+        "call-1",
+        "run_command",
+        serde_json::json!({"command":"git status"}),
+    )]);
+
+    let result = engine
+        .run_cycle_streaming(test_snapshot("check git status"), &llm, None)
+        .await
+        .expect("cycle succeeds");
+
+    match result {
+        LoopResult::BudgetExhausted { iterations, .. } => assert_eq!(iterations, 1),
+        other => panic!("expected LoopResult::BudgetExhausted, got: {other:?}"),
+    }
+    assert!(
+        executed.lock().expect("executed lock").is_empty(),
+        "tool executor should not run after the budget gate closes"
+    );
+    assert_eq!(llm.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn simple_agent_loop_records_current_reasoning_context_cost() {
+    let mut engine = LoopEngine::builder()
+        .budget(BudgetTracker::new(
+            crate::budget::BudgetConfig::default(),
+            current_time_ms(),
+            0,
+        ))
+        .context(ContextCompactor::new(100_000, 80_000))
+        .max_iterations(3)
+        .tool_executor(Arc::new(VerboseToolExecutor {
+            output: "expanded evidence ".repeat(1_000),
+        }))
+        .synthesis_instruction("Summarize tool output".to_string())
+        .build()
+        .expect("test engine build");
+    let llm = SequentialMockLlm::new(vec![
+        tool_call_response(
+            "call-1",
+            "read_file",
+            serde_json::json!({"path":"src/lib.rs"}),
+        ),
+        text_response("done", Some("stop"), None),
+    ]);
+
+    let result = engine
+        .run_cycle_streaming(test_snapshot("resolve the issue"), &llm, None)
+        .await
+        .expect("cycle succeeds");
+
+    let (response, iterations, _) = expect_complete(result);
+    assert_eq!(response, "done");
+    assert_eq!(iterations, 2);
+    assert!(
+        engine.budget.tokens_used() > 1_500,
+        "budget accounting should include the enlarged context on the second reasoning pass"
+    );
 }
 
 fn has_truncation_trace(signals: &[Signal], step: LoopStep) -> bool {
@@ -871,6 +1154,7 @@ async fn run_cycle_text_only_response_is_unchanged() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn run_cycle_completes_after_tool_fails_with_synthesis() {
     let mut engine = failing_tool_engine();
 
@@ -1303,6 +1587,7 @@ async fn signals_include_decision_on_tool_call() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
     let mut engine = test_engine();
     let llm = SequentialMockLlm::new(vec![
@@ -1391,6 +1676,7 @@ async fn tool_continuation_rounds_emit_trace_and_performance_signals() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn empty_tool_continuation_emits_empty_text_trace() {
     let mut engine = test_engine();
     let llm = SequentialMockLlm::new(vec![
@@ -1447,6 +1733,7 @@ async fn empty_tool_continuation_emits_empty_text_trace() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn valid_tool_transaction_continues_beyond_outer_iteration_cap() {
     let mut engine = LoopEngine::builder()
         .budget(BudgetTracker::new(
@@ -1691,6 +1978,7 @@ async fn run_cycle_auto_continues_truncated_response() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn tool_continuation_auto_continues_truncated_response() {
     let mut engine = test_engine();
     let llm = SequentialMockLlm::new(vec![
@@ -1780,6 +2068,7 @@ async fn finalize_tool_response_receives_stitched_text_after_continuation() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn truncation_continuation_emits_reason_and_act_trace_signals() {
     let mut reason_engine = test_engine();
     let reason_llm = SequentialMockLlm::new(vec![

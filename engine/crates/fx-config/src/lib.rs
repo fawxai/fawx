@@ -227,7 +227,7 @@ log_dir = "~/.fawx/custom-logs"
     #[test]
     fn default_values_are_sensible() {
         let defaults = FawxConfig::default();
-        assert_eq!(defaults.general.max_iterations, 10);
+        assert_eq!(defaults.general.max_iterations, 20);
         assert_eq!(defaults.general.max_history, 20);
         assert_eq!(defaults.agent.name, "Fawx");
         assert_eq!(defaults.agent.personality, "casual");

@@ -24,10 +24,10 @@ The guard compares the current branch against `public/main`, fails on blocked or
 Treat the guard as mandatory before any public promotion PR. Promotion branches stay fail-closed:
 
 - Start every promotion from `public/main`, not from `dev`, `main`, or a private feature branch.
-- App-inclusive promotions are limited to the reviewed app slice defined in `scripts/check-public-promotion.toml`.
-- That reviewed slice intentionally uses globs for already-audited directories; new files inside those globs still go through repo-wide marker scanning and normal promotion review.
-- Still-private app surfaces remain blocked explicitly, including the app shell/project files, assets/resources, services, platform-specific views, Ripcord UI, unresolved shared views, and non-reviewed app tests/UI tests.
-- Any new app path outside that reviewed slice must stay off the promotion branch until a follow-up policy PR adds it to the allowlist.
+- App-inclusive promotions include the full `app/**` tree defined in `scripts/check-public-promotion.toml`.
+- App files still go through repo-wide marker scanning and normal promotion review.
+- Still-private surfaces outside the app remain blocked explicitly, including private strategy/memory files, release tooling, imported scripts, and private workflows.
+- Any new non-app path outside the public allowlist must stay off the promotion branch until a follow-up policy PR adds it to the allowlist.
 
 ## H2.4 Spec Contract Validator
 

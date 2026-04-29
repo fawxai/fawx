@@ -35,6 +35,67 @@ final class SkillsViewModelTests: XCTestCase {
         )
     }
 
+    func testSkillSummaryDecodesLifecycleMetadataAndClassifiesBuiltIns() throws {
+        let skill = try JSONDecoder().decode(
+            SkillSummary.self,
+            from: Data(
+                """
+                {
+                    "name": "git",
+                    "description": "Built-in git tools",
+                    "tools": ["git_status"],
+                    "capabilities": [],
+                    "version": "1.0.0",
+                    "source": "builtin",
+                    "revision_hash": "abc123",
+                    "activated_at_ms": 42,
+                    "signature_status": "unsigned"
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(skill.displayName, "Git")
+        XCTAssertTrue(skill.isBuiltin)
+        XCTAssertFalse(skill.isInstallableSkill)
+        XCTAssertEqual(skill.loadedStatusLabel, "Built-in")
+        XCTAssertEqual(skill.revisionHash, "abc123")
+        XCTAssertEqual(skill.activatedAtMs, 42)
+    }
+
+    func testSkillSummaryTreatsStaleSourceAsOpaqueUpdateAvailableSignal() {
+        let skill = SkillSummary(
+            name: "github",
+            description: "GitHub tools",
+            tools: ["view_pr"],
+            capabilities: ["network"],
+            version: "1.0.0",
+            source: "installed",
+            revisionHash: "abc123",
+            activatedAtMs: 42,
+            signatureStatus: "unsigned",
+            staleSource: "source manifest drift (source=hash-a, active=hash-b)"
+        )
+
+        XCTAssertTrue(skill.hasStaleSource)
+        XCTAssertEqual(skill.loadedStatusLabel, "Update available")
+        XCTAssertEqual(
+            skill.staleSourceMessage,
+            "Installed source changed since this revision was loaded. Restart the server to activate the latest skill version."
+        )
+    }
+
+    func testSkillSummaryUsesInstalledLabelForNormalInstallableSkills() {
+        let skill = SkillSummary(
+            name: "github",
+            description: "GitHub tools",
+            tools: ["view_pr"],
+            capabilities: ["network"]
+        )
+
+        XCTAssertEqual(skill.loadedStatusLabel, "Installed")
+    }
+
     func testSkillSettingsFieldValidateRequiresValueWhenMarkedRequired() {
         let field = SkillSettingsField(
             key: "api_key",
@@ -71,6 +132,98 @@ final class SkillsViewModelTests: XCTestCase {
             field.validate("yes"),
             "Safe Search must be either true or false."
         )
+    }
+
+    func testSkillSettingsFieldDecodesLegacyManifestTypeKey() throws {
+        let field = try JSONDecoder().decode(
+            SkillSettingsField.self,
+            from: Data(
+                """
+                {
+                    "key": "github_token",
+                    "label": "GitHub Personal Access Token",
+                    "type": "secret"
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(field.fieldType, .secret)
+        XCTAssertFalse(field.required)
+    }
+
+    func testSkillSettingsFieldDecodesFieldTypeKey() throws {
+        let field = try JSONDecoder().decode(
+            SkillSettingsField.self,
+            from: Data(
+                """
+                {
+                    "key": "github_token",
+                    "label": "GitHub Personal Access Token",
+                    "field_type": "secret"
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(field.fieldType, .secret)
+    }
+
+    func testSkillSettingsFieldPrefersFieldTypeWhenBothKeysExist() throws {
+        let field = try JSONDecoder().decode(
+            SkillSettingsField.self,
+            from: Data(
+                """
+                {
+                    "key": "github_token",
+                    "label": "GitHub Personal Access Token",
+                    "field_type": "boolean",
+                    "type": "secret"
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(field.fieldType, .boolean)
+    }
+
+    func testSkillSettingsFieldDecodesMissingTypeKeyAsUnknown() throws {
+        let field = try JSONDecoder().decode(
+            SkillSettingsField.self,
+            from: Data(
+                """
+                {
+                    "key": "github_token",
+                    "label": "GitHub Personal Access Token"
+                }
+                """.utf8
+            )
+        )
+
+        switch field.fieldType {
+        case .unknown(let rawType):
+            XCTAssertEqual(rawType, "missing")
+        default:
+            XCTFail("expected unknown field type for missing type key")
+        }
+    }
+
+    func testSkillSettingsFieldEncodesApiFieldTypeKey() throws {
+        let field = SkillSettingsField(
+            key: "github_token",
+            label: "GitHub Personal Access Token",
+            fieldType: .secret,
+            placeholder: nil,
+            helpText: nil,
+            required: true,
+            minLength: nil,
+            maxLength: nil,
+            pattern: nil
+        )
+
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(field)) as? [String: Any]
+        XCTAssertEqual(json?["field_type"] as? String, "secret")
+        XCTAssertNil(json?["type"])
     }
 
     func testBeginEditingSettingsLoadsDraftAndRedactsSecrets() async throws {

@@ -264,8 +264,21 @@ fn install_skill_files(
     let dest_manifest = install_dir.join("manifest.toml");
     fs::copy(&src_manifest, &dest_manifest)
         .map_err(|e| AuthorError::InstallFailed(format!("Failed to copy manifest: {e}")))?;
+    clear_installed_signature(&install_dir, skill_name)?;
 
     Ok(install_dir)
+}
+
+fn clear_installed_signature(install_dir: &Path, skill_name: &str) -> Result<(), AuthorError> {
+    let sig_path = install_dir.join(format!("{skill_name}.wasm.sig"));
+    match fs::remove_file(&sig_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AuthorError::InstallFailed(format!(
+            "Failed to remove stale signature {}: {error}",
+            sig_path.display()
+        ))),
+    }
 }
 
 fn maybe_sign(
@@ -544,6 +557,34 @@ crate-type = ["lib"]
 
         let installed_wasm = fs::read(install_path.join("test-skill.wasm")).unwrap();
         assert_eq!(installed_wasm, mock_wasm);
+    }
+
+    #[test]
+    fn install_removes_stale_signature_before_optional_signing() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&project).unwrap();
+
+        fs::write(project.join("manifest.toml"), valid_manifest_toml()).unwrap();
+        fs::write(project.join("mock.wasm"), b"new wasm").unwrap();
+
+        let install_dir = data.join("skills").join("test-skill");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("test-skill.wasm.sig"), b"stale sig").unwrap();
+
+        let config = BuildConfig {
+            project_path: project.clone(),
+            data_dir: data.clone(),
+            no_sign: true,
+            no_install: false,
+        };
+
+        let installed =
+            install_skill_files(&config, "test-skill", &project.join("mock.wasm")).unwrap();
+
+        assert_eq!(installed, install_dir);
+        assert!(!install_dir.join("test-skill.wasm.sig").exists());
     }
 
     // 7. install_creates_signature_when_key_exists

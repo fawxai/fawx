@@ -684,6 +684,7 @@ mod tests {
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: test_registry(&data_dir),
             improvement_provider: None,
             telemetry: in_memory_telemetry(),

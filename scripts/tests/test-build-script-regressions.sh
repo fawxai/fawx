@@ -52,14 +52,14 @@ assert_skill_install_artifacts() {
     assert_exists "$install_dir/$directory/$artifact"
     assert_exists "$install_dir/$directory/manifest.toml"
   done <<'EOF'
-weather-skill:weather.wasm
-calculator-skill:calculator.wasm
-vision-skill:vision.wasm
-tts-skill:tts.wasm
-browser-skill:browser.wasm
-stt-skill:stt.wasm
-canvas-skill:canvas.wasm
-github-skill:github.wasm
+weather:weather.wasm
+calculator:calculator.wasm
+vision:vision.wasm
+tts:tts.wasm
+browser:browser.wasm
+stt:stt.wasm
+canvas:canvas.wasm
+github:github.wasm
 EOF
 }
 

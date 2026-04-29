@@ -138,6 +138,8 @@ mod tests {
     }
 
     fn store_github_pat(store: &EncryptedFileCredentialStore, token: &str) {
+        assert!(!token.is_empty(), "GitHub PAT must not be empty");
+        assert!(token.len() >= 8, "GitHub PAT must be at least 8 characters");
         store
             .set(
                 AuthProvider::GitHub,

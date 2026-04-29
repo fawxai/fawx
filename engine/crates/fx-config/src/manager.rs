@@ -391,7 +391,7 @@ mod tests {
     fn new_loads_defaults_when_no_file() {
         let temp = TempDir::new().expect("tempdir");
         let mgr = ConfigManager::new(temp.path()).expect("create manager");
-        assert_eq!(mgr.config().general.max_iterations, 10);
+        assert_eq!(mgr.config().general.max_iterations, 20);
     }
 
     #[test]

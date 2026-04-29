@@ -1397,6 +1397,10 @@ impl HeadlessApp {
         self.cron_store.as_ref()
     }
 
+    pub fn credential_store(&self) -> Option<&SharedCredentialStore> {
+        self.credential_store.as_ref()
+    }
+
     #[cfg(feature = "http")]
     pub fn experiment_registry(&self) -> Option<&fx_api::SharedExperimentRegistry> {
         self.experiment_registry.as_ref()
@@ -2733,12 +2737,14 @@ fn extract_response_text(result: &LoopResult) -> String {
             }
         }
         LoopResult::Incomplete {
-            partial_response, ..
+            partial_response,
+            reason,
+            ..
         } => {
             if has_meaningful_response(partial_response.as_deref()) {
                 partial_response.clone().unwrap_or_default()
             } else {
-                String::new()
+                reason.clone()
             }
         }
         LoopResult::UserStopped {
@@ -4352,6 +4358,7 @@ mod tests {
                 max_iterations: 3,
                 max_history: 20,
                 memory_enabled: false,
+                tool_invocations_remaining: 0,
             },
             authority: None,
             version: "test".to_string(),
@@ -5426,7 +5433,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_response_from_incomplete_without_content_is_empty() {
+    fn extract_response_from_incomplete_without_content_uses_reason() {
         let result = LoopResult::Incomplete {
             partial_response: None,
             reason: "iteration limit reached before a usable final response was produced"
@@ -5435,7 +5442,10 @@ mod tests {
             signals: Vec::new(),
         };
 
-        assert_eq!(extract_response_text(&result), "");
+        assert_eq!(
+            extract_response_text(&result),
+            "iteration limit reached before a usable final response was produced"
+        );
         assert_eq!(extract_result_kind(&result), ResultKind::Empty);
     }
 

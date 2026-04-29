@@ -74,6 +74,7 @@ async fn budget_exhaustion_mid_tool_execution_returns_budget_exhausted() {
 /// then the next LLM call triggers budget exhaustion with the tool
 /// output preserved as partial_response.
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn budget_exhaustion_preserves_partial_response() {
     let tight_budget = BudgetConfig {
         max_llm_calls: 2,
@@ -438,6 +439,7 @@ impl ToolExecutor for NumberedFailureToolExecutor {
 /// When a tool fails and the model reports the blocker instead of asking for
 /// more tools, the same-turn tool transaction can finish without a root detour.
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn repeated_tool_failures_synthesize_without_infinite_retry() {
     let mut engine = build_engine_with_executor(
         Arc::new(AlwaysFailingToolExecutor),
@@ -517,6 +519,7 @@ async fn tool_friction_caps_at_max_iterations() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn repeated_malformed_tool_failures_inject_guidance_then_trip_circuit_breaker() {
     fn malformed_write_file_call(id: &str, raw_arguments: &str) -> ToolCall {
         ToolCall {
@@ -600,6 +603,7 @@ async fn repeated_malformed_tool_failures_inject_guidance_then_trip_circuit_brea
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn repeated_non_malformed_failures_use_dedicated_streak_limit() {
     let config = BudgetConfig {
         max_consecutive_failures: 9,

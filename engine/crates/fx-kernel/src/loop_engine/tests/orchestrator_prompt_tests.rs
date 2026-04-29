@@ -425,6 +425,32 @@ fn continuation_request_includes_tool_continuation_directive_once() {
 }
 
 #[test]
+fn simple_agent_request_omits_legacy_harness_contracts() {
+    let perception = processed_perception("please fix these code review issues");
+    let request = build_simple_agent_request(SimpleAgentRequestParams::new(
+        &perception,
+        "mock-model",
+        vec![ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Edit a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }],
+        RequestBuildContext::new(None, None, None, false),
+    ));
+
+    let system = request.system_prompt.clone().expect("system prompt");
+    assert!(system.contains("recommendations are not a resolution"));
+    assert!(!system.contains("Task lifecycle"));
+    assert!(!system.contains("Root turn completion contract"));
+    assert!(!system.contains("decompose first"));
+
+    let prompt = completion_request_to_prompt(&request);
+    assert!(prompt.contains("User request:\nplease fix these code review issues"));
+    assert!(!prompt.contains("Active goals:"));
+    assert!(!prompt.contains("Budget remaining:"));
+}
+
+#[test]
 fn reasoning_request_injects_signal_feedback_at_prompt_seam() {
     let request = build_reasoning_request(ReasoningRequestParams::new(
         &processed_perception("Fix the failing command"),

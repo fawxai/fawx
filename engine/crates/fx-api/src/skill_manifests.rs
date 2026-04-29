@@ -121,19 +121,27 @@ pub fn load_skill_settings(
     data_dir: &Path,
     skill_name: &str,
 ) -> Result<Option<ResolvedSkillSettings>, SkillManifestError> {
+    let store = open_skill_store(data_dir)?;
+    load_skill_settings_with_store(data_dir, skill_name, &store)
+}
+
+pub fn load_skill_settings_with_store(
+    data_dir: &Path,
+    skill_name: &str,
+    store: &EncryptedFileCredentialStore,
+) -> Result<Option<ResolvedSkillSettings>, SkillManifestError> {
     validate_skill_name(skill_name)?;
-    let manifest_path = manifest_path_for_skill_name(&data_dir.join("skills"), skill_name)?;
+    let manifest_path = manifest_path_for_skill_settings(&data_dir.join("skills"), skill_name)?;
     let manifest = read_skill_manifest(&manifest_path)?;
     let Some(schema) = manifest.settings.clone() else {
         return Ok(None);
     };
 
-    let store = open_skill_store(data_dir)?;
     let values = schema
         .fields
         .iter()
         .map(|field| {
-            let stored = read_skill_setting(&store, skill_name, &field.key)?;
+            let stored = read_skill_setting(store, skill_name, &field.key)?;
             let is_secret = matches!(field.field_type, SkillSettingFieldType::Secret);
             Ok(ResolvedSkillSettingValue {
                 key: field.key.clone(),
@@ -156,16 +164,25 @@ pub fn update_skill_settings(
     skill_name: &str,
     updates: &[SkillSettingUpdate],
 ) -> Result<ResolvedSkillSettings, SkillManifestError> {
+    let store = open_skill_store(data_dir)?;
+    update_skill_settings_with_store(data_dir, skill_name, updates, &store)
+}
+
+pub fn update_skill_settings_with_store(
+    data_dir: &Path,
+    skill_name: &str,
+    updates: &[SkillSettingUpdate],
+    store: &EncryptedFileCredentialStore,
+) -> Result<ResolvedSkillSettings, SkillManifestError> {
     validate_skill_name(skill_name)?;
-    let manifest_path = manifest_path_for_skill_name(&data_dir.join("skills"), skill_name)?;
+    let manifest_path = manifest_path_for_skill_settings(&data_dir.join("skills"), skill_name)?;
     let manifest = read_skill_manifest(&manifest_path)?;
     let schema = manifest.settings.clone().ok_or_else(|| {
         SkillManifestError::Invalid(format!(
             "Skill '{skill_name}' does not declare any settings"
         ))
     })?;
-    let store = open_skill_store(data_dir)?;
-    let existing_values = load_existing_setting_values(&store, skill_name, &schema.fields)?;
+    let existing_values = load_existing_setting_values(store, skill_name, &schema.fields)?;
     let normalized_updates = normalize_updates(&schema.fields, updates)?;
     validate_merged_settings(&schema.fields, &existing_values, &normalized_updates)?;
 
@@ -175,15 +192,13 @@ pub fn update_skill_settings(
         };
 
         if let Some(value) = value {
-            store_skill_setting(&store, skill_name, &field.key, value)?;
+            store_skill_setting(store, skill_name, &field.key, value)?;
         } else {
-            clear_skill_setting(&store, skill_name, &field.key)?;
+            clear_skill_setting(store, skill_name, &field.key)?;
         }
     }
 
-    drop(store);
-
-    load_skill_settings(data_dir, skill_name)?.ok_or_else(|| {
+    load_skill_settings_with_store(data_dir, skill_name, store)?.ok_or_else(|| {
         SkillManifestError::Internal(format!(
             "Skill '{skill_name}' settings disappeared after update"
         ))
@@ -322,10 +337,31 @@ fn normalize_field_value(
                 }
             }
         },
-        SkillSettingFieldType::Text | SkillSettingFieldType::Secret => Ok(raw_value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)),
+        SkillSettingFieldType::Text | SkillSettingFieldType::Secret => {
+            let value = raw_value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            if let Some(ref v) = value {
+                if let Some(min) = field.min_length {
+                    if v.len() < min {
+                        return Err(SkillManifestError::Invalid(format!(
+                            "{} must be at least {} characters",
+                            field.label, min
+                        )));
+                    }
+                }
+                if let Some(max) = field.max_length {
+                    if v.len() > max {
+                        return Err(SkillManifestError::Invalid(format!(
+                            "{} must be at most {} characters",
+                            field.label, max
+                        )));
+                    }
+                }
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -433,6 +469,42 @@ fn manifest_path_for_skill_name(
     skills_dir: &Path,
     skill_name: &str,
 ) -> Result<std::path::PathBuf, SkillManifestError> {
+    manifest_candidates_for_skill_name(skills_dir, skill_name)?
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.path)
+        .ok_or_else(|| SkillManifestError::NotFound(format!("Skill '{skill_name}' not found")))
+}
+
+fn manifest_path_for_skill_settings(
+    skills_dir: &Path,
+    skill_name: &str,
+) -> Result<std::path::PathBuf, SkillManifestError> {
+    let candidates = manifest_candidates_for_skill_name(skills_dir, skill_name)?;
+    let Some(best) = candidates
+        .iter()
+        .find(|candidate| candidate.has_settings)
+        .or_else(|| candidates.first())
+    else {
+        return Err(SkillManifestError::NotFound(format!(
+            "Skill '{skill_name}' not found"
+        )));
+    };
+
+    Ok(best.path.clone())
+}
+
+#[derive(Debug, Clone)]
+struct ManifestPathCandidate {
+    path: std::path::PathBuf,
+    is_canonical_dir: bool,
+    has_settings: bool,
+}
+
+fn manifest_candidates_for_skill_name(
+    skills_dir: &Path,
+    skill_name: &str,
+) -> Result<Vec<ManifestPathCandidate>, SkillManifestError> {
     if !skills_dir.exists() {
         return Err(SkillManifestError::NotFound(format!(
             "Skill '{skill_name}' not found"
@@ -443,6 +515,7 @@ fn manifest_path_for_skill_name(
         SkillManifestError::Internal(format!("failed to read skills directory: {error}"))
     })?;
 
+    let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             SkillManifestError::Internal(format!("failed to read skill directory entry: {error}"))
@@ -456,18 +529,51 @@ fn manifest_path_for_skill_name(
             continue;
         }
 
-        let Ok((manifest_name, _)) = read_manifest_summary(&manifest_path) else {
+        let Ok(summary) = read_manifest_resolution_summary(&manifest_path) else {
             continue;
         };
 
-        if manifest_name == skill_name {
-            return Ok(manifest_path);
+        if summary.name == skill_name {
+            candidates.push(ManifestPathCandidate {
+                path: manifest_path,
+                is_canonical_dir: entry.path().file_name().and_then(|value| value.to_str())
+                    == Some(skill_name),
+                has_settings: summary.has_settings,
+            });
         }
     }
 
-    Err(SkillManifestError::NotFound(format!(
-        "Skill '{skill_name}' not found"
-    )))
+    candidates.sort_by(|lhs, rhs| {
+        rhs.is_canonical_dir
+            .cmp(&lhs.is_canonical_dir)
+            .then_with(|| lhs.path.cmp(&rhs.path))
+    });
+    Ok(candidates)
+}
+
+#[derive(Debug, Clone)]
+struct ManifestResolutionSummary {
+    name: String,
+    has_settings: bool,
+}
+
+fn read_manifest_resolution_summary(
+    manifest_path: &Path,
+) -> Result<ManifestResolutionSummary, SkillManifestError> {
+    let document = read_document(manifest_path)?;
+    let name = document["name"]
+        .as_str()
+        .ok_or_else(|| {
+            SkillManifestError::Invalid("manifest missing string field 'name'".to_string())
+        })?
+        .to_string();
+    Ok(ManifestResolutionSummary {
+        name,
+        has_settings: document
+            .as_table()
+            .get("settings")
+            .is_some_and(toml_edit::Item::is_table),
+    })
 }
 
 #[cfg(test)]
@@ -636,6 +742,49 @@ type = "boolean"
         assert!(settings.values[0].is_configured);
         assert!(settings.values[0].value.is_none());
         assert_eq!(settings.values[1].value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn load_skill_settings_prefers_matching_manifest_that_declares_settings() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_manifest_in_data_dir(
+            &temp_dir,
+            "github",
+            r#"
+name = "github"
+version = "1.0.0"
+description = "Legacy GitHub skill"
+author = "Fawx"
+api_version = "host_api_v1"
+"#,
+        );
+        write_manifest_in_data_dir(
+            &temp_dir,
+            "github-skill",
+            r#"
+name = "github"
+version = "2.0.0"
+description = "GitHub skill"
+author = "Fawx"
+api_version = "host_api_v1"
+
+[settings]
+version = 1
+
+[[settings.fields]]
+key = "github_token"
+label = "GitHub Token"
+type = "secret"
+required = true
+"#,
+        );
+
+        let settings = load_skill_settings(temp_dir.path(), "github")
+            .expect("load settings")
+            .expect("settings");
+
+        assert_eq!(settings.skill_name, "github");
+        assert_eq!(settings.schema.fields[0].key, "github_token");
     }
 
     #[test]

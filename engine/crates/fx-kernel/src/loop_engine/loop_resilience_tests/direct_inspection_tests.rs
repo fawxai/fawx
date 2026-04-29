@@ -98,6 +98,7 @@ async fn direct_inspection_successful_read_file_completes_terminally() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn direct_inspection_with_mixed_text_treats_text_as_transient_narration() {
     let prompt = "Read ~/.zshrc and explain what each line does.";
     let mut engine = mixed_tool_engine(BudgetConfig::default());

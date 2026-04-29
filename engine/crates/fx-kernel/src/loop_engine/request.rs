@@ -11,9 +11,9 @@ use std::fmt;
 use super::{
     message_content_to_text, message_to_text, ExecutionContext, DECOMPOSE_TOOL_DESCRIPTION,
     DECOMPOSE_TOOL_NAME, MEMORY_INSTRUCTION, NOTIFY_TOOL_GUIDANCE, REASONING_MAX_OUTPUT_TOKENS,
-    REASONING_SYSTEM_PROMPT, REASONING_TEMPERATURE, TERMINAL_SYNTHESIS_DIRECTIVE,
-    TERMINAL_SYNTHESIS_MAX_OUTPUT_TOKENS, TERMINAL_SYNTHESIS_SYSTEM_PROMPT,
-    TOOL_CONTINUATION_DIRECTIVE,
+    REASONING_SYSTEM_PROMPT, REASONING_TEMPERATURE, SIMPLE_AGENT_FINAL_RESPONSE_DIRECTIVE,
+    SIMPLE_AGENT_SYSTEM_PROMPT, TERMINAL_SYNTHESIS_DIRECTIVE, TERMINAL_SYNTHESIS_MAX_OUTPUT_TOKENS,
+    TERMINAL_SYNTHESIS_SYSTEM_PROMPT, TOOL_CONTINUATION_DIRECTIVE,
 };
 
 const TERMINAL_SYNTHESIS_USER_TOKEN_BUDGET: usize = 2_500;
@@ -253,6 +253,36 @@ impl<'a> ReasoningRequestParams<'a> {
     }
 }
 
+pub(super) struct SimpleAgentRequestParams<'a> {
+    perception: &'a ProcessedPerception,
+    model: &'a str,
+    tools: Vec<ToolDefinition>,
+    context: RequestBuildContext<'a>,
+    final_response: bool,
+}
+
+impl<'a> SimpleAgentRequestParams<'a> {
+    pub(super) fn new(
+        perception: &'a ProcessedPerception,
+        model: &'a str,
+        tools: Vec<ToolDefinition>,
+        context: RequestBuildContext<'a>,
+    ) -> Self {
+        Self {
+            perception,
+            model,
+            tools,
+            context,
+            final_response: false,
+        }
+    }
+
+    pub(super) fn final_response(mut self) -> Self {
+        self.final_response = true;
+        self
+    }
+}
+
 pub(super) fn completion_request_to_prompt(request: &CompletionRequest) -> String {
     let system = request
         .system_prompt
@@ -371,6 +401,32 @@ pub(super) fn build_reasoning_request(params: ReasoningRequestParams<'_>) -> Com
     }
 }
 
+pub(super) fn build_simple_agent_request(
+    params: SimpleAgentRequestParams<'_>,
+) -> CompletionRequest {
+    let mut system_prompt = build_simple_agent_system_prompt(&params.context);
+    if params.final_response {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(SIMPLE_AGENT_FINAL_RESPONSE_DIRECTIVE);
+    }
+
+    CompletionRequest {
+        model: params.model.to_string(),
+        messages: build_simple_agent_messages(params.perception),
+        tools: if params.final_response {
+            Vec::new()
+        } else {
+            params.tools
+        },
+        temperature: Some(REASONING_TEMPERATURE),
+        max_tokens: Some(REASONING_MAX_OUTPUT_TOKENS),
+        system_prompt: Some(system_prompt),
+        prompt_cache: PromptCachePolicy::Ephemeral,
+        cache_affinity: params.context.prompt_cache_affinity.clone(),
+        thinking: params.context.thinking,
+    }
+}
+
 pub(super) fn build_reasoning_messages(perception: &ProcessedPerception) -> Vec<Message> {
     let user_prompt = reasoning_user_prompt(perception);
     [
@@ -380,12 +436,25 @@ pub(super) fn build_reasoning_messages(perception: &ProcessedPerception) -> Vec<
     .concat()
 }
 
+pub(super) fn build_simple_agent_messages(perception: &ProcessedPerception) -> Vec<Message> {
+    let mut prompt = format!("User request:\n{}", perception.user_message);
+    if let Some(steer) = perception.steer_context.as_deref() {
+        prompt.push_str(&format!("\n\nLatest user steer:\n{steer}"));
+    }
+    [
+        perception.context_window.clone(),
+        vec![build_processed_perception_message(perception, &prompt)],
+    ]
+    .concat()
+}
+
 pub(super) fn reasoning_user_prompt(perception: &ProcessedPerception) -> String {
     let mut prompt = format!(
-        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls\n\nUser message:\n{}",
+        "Active goals:\n- {}\n\nBudget remaining: {} tokens, {} llm calls, {} tool calls\n\nUser message:\n{}",
         perception.active_goals.join("\n- "),
         perception.budget_remaining.tokens,
         perception.budget_remaining.llm_calls,
+        perception.budget_remaining.tool_invocations,
         perception.user_message,
     );
 
@@ -394,6 +463,38 @@ pub(super) fn reasoning_user_prompt(perception: &ProcessedPerception) -> String 
     }
 
     prompt
+}
+
+fn build_simple_agent_system_prompt(context: &RequestBuildContext<'_>) -> String {
+    let mut sections = vec![SIMPLE_AGENT_SYSTEM_PROMPT.to_string()];
+
+    if let Some(capabilities) = render_skill_capabilities(context.skill_summaries_slice()) {
+        sections.push(capabilities);
+    }
+    if let Some(execution_context) = render_execution_context(context.execution_context) {
+        sections.push(execution_context);
+    }
+    if let Some(preferences) = render_agent_preferences(context.agent_preferences) {
+        sections.push(preferences);
+    }
+    if context.notify_tool_guidance_enabled {
+        sections.push(trim_leading_newlines(NOTIFY_TOOL_GUIDANCE).to_string());
+    }
+    if let Some(scratchpad_context) = context.scratchpad_context {
+        sections.push(trim_section_newlines(scratchpad_context).to_string());
+    }
+    if let Some(memory_context) = context.memory_context {
+        let trimmed = trim_section_newlines(memory_context);
+        if !trimmed.trim().is_empty() {
+            sections.push(format!(
+                "{}\n\n{}",
+                trimmed,
+                trim_leading_newlines(MEMORY_INSTRUCTION)
+            ));
+        }
+    }
+
+    sections.join("\n\n")
 }
 
 #[cfg(test)]

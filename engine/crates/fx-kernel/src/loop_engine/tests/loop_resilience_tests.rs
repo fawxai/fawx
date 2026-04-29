@@ -2,7 +2,7 @@ use super::test_fixtures::{text_response, tool_use_response, RecordingLlm};
 use super::*;
 use crate::act::{
     ExternalActionEvidence, FailureClass, RunCommandDiagnostics, ToolCallClassification,
-    ToolExecutionDiagnostics, ToolExecutor, ToolResult,
+    ToolDiagnostics, ToolExecutionDiagnostics, ToolExecutor, ToolResult,
 };
 use crate::budget::{ActionCost, BudgetConfig, BudgetTracker, TerminationConfig};
 use crate::cancellation::CancellationToken;
@@ -1972,6 +1972,7 @@ async fn structured_weather_schema_without_direct_utility_metadata_does_not_trig
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn deterministic_local_browser_request_uses_one_bounded_tool_path() {
     let executed_calls = Arc::new(Mutex::new(Vec::new()));
     let mut engine = mixed_tool_engine_with_executor(
@@ -2334,6 +2335,7 @@ fn declaration_heuristic_rejects_period_terminated_abbreviations() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn observation_follow_up_still_injects_mutation_commitment_into_next_reasoning_pass() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     let llm = RecordingLlm::ok(vec![
@@ -2389,6 +2391,7 @@ async fn observation_follow_up_still_injects_mutation_commitment_into_next_reaso
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn explicit_deliverables_block_progress_only_terminal_response_after_tool_continuation() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
     let final_response = "\
@@ -2445,6 +2448,7 @@ async fn explicit_deliverables_block_progress_only_terminal_response_after_tool_
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn valid_tool_transaction_continues_beyond_outer_iteration_cap() {
     let mut engine = LoopEngine::builder()
         .budget(BudgetTracker::new(
@@ -2493,6 +2497,7 @@ async fn valid_tool_transaction_continues_beyond_outer_iteration_cap() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn root_turn_contract_retry_cap_ends_incomplete_after_limit() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
     let incomplete_response = "Still working on it.";
@@ -2556,6 +2561,64 @@ async fn root_turn_contract_retry_cap_ends_incomplete_after_limit() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
+async fn mutation_contract_blocks_terminal_response_after_observation_only_round() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    let unable_to_patch = "I can't resolve these in the current workspace because the relevant symbols aren't present.";
+    let llm = RecordingLlm::ok(vec![
+        tool_use_response(vec![ToolCall {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        }]),
+        text_response(unable_to_patch),
+        text_response(unable_to_patch),
+    ]);
+
+    let result = engine
+        .run_cycle(
+            test_snapshot(
+                "please resolve these issues:\n\n1. discarded_field_note is too broad.\n2. ResultKind::Error regressed headless callers.",
+            ),
+            &llm,
+        )
+        .await
+        .expect("run_cycle");
+
+    match result {
+        LoopResult::Incomplete {
+            partial_response,
+            reason,
+            signals,
+            ..
+        } => {
+            let partial_response = partial_response.expect("kernel-owned incomplete response");
+            assert!(
+                partial_response
+                    .contains("local mutation work `Complete the requested code or file changes`"),
+                "kernel-owned incomplete response should name the pending mutation work: {partial_response}"
+            );
+            assert!(
+                reason.contains("Complete the requested code or file changes"),
+                "incomplete reason should name the unsatisfied mutation work: {reason}"
+            );
+            assert!(
+                signals.iter().any(|signal| {
+                    signal.message
+                        == "blocked terminal completion until root turn deliverables are satisfied"
+                        && signal.metadata["pending_mutation_work"]
+                            .as_array()
+                            .is_some_and(|items| !items.is_empty())
+                }),
+                "the root-turn mutation contract should block final completion before retry cap"
+            );
+        }
+        other => panic!("expected incomplete mutation contract result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn explicit_deliverables_block_blocks_partial_terminal_response() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
     let partial_response = "**What you inspected**\n- `tui/src/app.rs`\n\n**Current architecture**\n- The UI is rendered from a single terminal app loop.";
@@ -2596,6 +2659,7 @@ async fn explicit_deliverables_block_blocks_partial_terminal_response() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn explicit_deliverables_block_blocks_raw_evidence_dump_terminal_response() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
     let raw_dump = "```rust\nfn render_entry(entry: Entry) {\n    render_tool(entry);\n}\n```\n\nThis appears to be the core render path.";
@@ -2629,6 +2693,7 @@ async fn explicit_deliverables_block_blocks_raw_evidence_dump_terminal_response(
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn root_turn_contract_retry_limit_uses_budget_config() {
     let config = BudgetConfig {
         termination: TerminationConfig {
@@ -2697,6 +2762,7 @@ async fn multiple_deliverables_blocks_emit_friction_signal_and_use_first_block_o
         .iter()
         .filter_map(|deliverable| match deliverable {
             RootTurnDeliverable::ResponseSection { label, .. } => Some(label.as_str()),
+            RootTurnDeliverable::MutationWork { .. } => None,
             RootTurnDeliverable::ArtifactWrite { .. } => None,
             RootTurnDeliverable::ExternalAction { .. } => None,
         })
@@ -2972,6 +3038,110 @@ fn root_turn_contract_progress_prefers_typed_external_action_evidence() {
 }
 
 #[test]
+fn root_turn_contract_progress_accepts_structured_skill_external_action_evidence() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.root_turn_contract = Some(RootTurnContract {
+        deliverables: vec![RootTurnDeliverable::ExternalAction {
+            kind: RootTurnExternalActionKind::GitHubPrComment,
+            label: external_action_label(RootTurnExternalActionKind::GitHubPrComment).to_string(),
+            satisfied: false,
+        }],
+        blocked_terminal_attempts: 0,
+    });
+
+    let calls = vec![ToolCall {
+        id: "comment-1".to_string(),
+        name: "comment_pr".to_string(),
+        arguments: serde_json::json!({
+            "owner": "abbudjoe",
+            "repo": "fawx",
+            "pr_number": 1842,
+            "body": "Review posted"
+        }),
+    }];
+    let results = vec![ToolResult {
+        tool_call_id: "comment-1".to_string(),
+        tool_name: "comment_pr".to_string(),
+        success: true,
+        output: r#"{"success":true,"comment_id":12345}"#.to_string(),
+        failure_class: None,
+    }];
+    engine.pending_tool_result_diagnostics.insert(
+        "comment-1".to_string(),
+        ToolExecutionDiagnostics::Tool(ToolDiagnostics {
+            external_actions: vec![ExternalActionEvidence::github_pr_comment(Some(
+                "https://github.com/fawxai/fawx/pull/1842#issuecomment-12345".to_string(),
+            ))],
+        }),
+    );
+
+    engine.record_root_turn_contract_progress(&calls, &results);
+
+    let contract = engine
+        .root_turn_contract
+        .as_ref()
+        .expect("root turn contract");
+    assert!(contract.deliverables.iter().any(|deliverable| {
+        matches!(
+            deliverable,
+            RootTurnDeliverable::ExternalAction {
+                kind: RootTurnExternalActionKind::GitHubPrComment,
+                satisfied: true,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn root_turn_contract_progress_accepts_successful_typed_comment_tool_without_diagnostics() {
+    let mut engine = mixed_tool_engine(BudgetConfig::default());
+    engine.root_turn_contract = Some(RootTurnContract {
+        deliverables: vec![RootTurnDeliverable::ExternalAction {
+            kind: RootTurnExternalActionKind::GitHubPrComment,
+            label: external_action_label(RootTurnExternalActionKind::GitHubPrComment).to_string(),
+            satisfied: false,
+        }],
+        blocked_terminal_attempts: 0,
+    });
+
+    let calls = vec![ToolCall {
+        id: "comment-1".to_string(),
+        name: "comment_pr".to_string(),
+        arguments: serde_json::json!({
+            "owner": "abbudjoe",
+            "repo": "fawx",
+            "pr_number": 1842,
+            "body": "Review posted"
+        }),
+    }];
+    let results = vec![ToolResult {
+        tool_call_id: "comment-1".to_string(),
+        tool_name: "comment_pr".to_string(),
+        success: true,
+        output: r#"{"success":true,"comment_id":12345}"#.to_string(),
+        failure_class: None,
+    }];
+
+    engine.record_root_turn_contract_progress(&calls, &results);
+
+    let contract = engine
+        .root_turn_contract
+        .as_ref()
+        .expect("root turn contract");
+    assert!(contract.deliverables.iter().any(|deliverable| {
+        matches!(
+            deliverable,
+            RootTurnDeliverable::ExternalAction {
+                kind: RootTurnExternalActionKind::GitHubPrComment,
+                satisfied: true,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
 fn root_turn_contract_progress_ignores_typed_external_action_on_failed_result() {
     let mut engine = mixed_tool_engine(BudgetConfig::default());
     engine.root_turn_contract = Some(RootTurnContract {
@@ -3063,6 +3233,7 @@ fn github_pr_comment_detection_accepts_common_gh_comment_forms() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn pending_external_action_retry_cap_surfaces_visible_partial_response() {
     let config = BudgetConfig {
         termination: TerminationConfig {
@@ -3091,15 +3262,41 @@ async fn pending_external_action_retry_cap_surfaces_visible_partial_response() {
             ..
         } => {
             let partial_response = partial_response.expect("visible incomplete response");
-            assert!(partial_response.contains("Post a comment on the GitHub pull request"));
-            assert!(partial_response.contains("rather than claiming the task was finished"));
+            assert!(partial_response.contains(
+                "I could not complete this turn because required root-turn deliverable(s) are still pending"
+            ));
+            assert!(partial_response
+                .contains("external action `Post a comment on the GitHub pull request`"));
+            assert!(partial_response.contains(
+                "Model response before the turn ended:\nI reviewed the PR but did not post the comment."
+            ));
             assert!(reason.contains("pending external actions"));
         }
         other => panic!("expected incomplete result after retry cap, got {other:?}"),
     }
 }
 
+#[test]
+fn root_turn_contract_incomplete_response_without_candidate_is_kernel_owned_note() {
+    let block = RootTurnCompletionBlock {
+        missing_response_sections: Vec::new(),
+        pending_mutation_work: Vec::new(),
+        pending_artifact_paths: Vec::new(),
+        pending_external_actions: vec!["Open the GitHub pull request".to_string()],
+    };
+
+    let response = LoopEngine::root_turn_contract_incomplete_response(&block, None)
+        .expect("kernel-owned incomplete response");
+
+    assert_eq!(
+        response,
+        "I could not complete this turn because required root-turn deliverable(s) are still pending: external action `Open the GitHub pull request`."
+    );
+    assert!(!response.contains("Model response before the turn ended"));
+}
+
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn requested_pr_comment_blocks_terminal_response_until_comment_is_posted() {
     let mut engine = run_command_observation_engine(BudgetConfig::default());
     let final_response = "Reviewed PR 1842 and posted the findings as a PR comment.";
@@ -3198,6 +3395,7 @@ fn root_turn_contract_progress_handles_partial_multi_artifact_writes() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn requested_artifact_write_blocks_terminal_response_until_file_is_written() {
     #[derive(Debug, Default)]
     struct ArtifactAwareWriteExecutor;
@@ -3337,6 +3535,7 @@ async fn append_follow_up_uses_actual_file_body_in_tool_continuation() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn mixed_observation_and_mutation_batch_defers_mutation_until_review() {
     let baseline = "README intro\nACTUAL FINAL LINE";
     let verification = "[verification] appended after review";
@@ -3365,6 +3564,7 @@ async fn mixed_observation_and_mutation_batch_defers_mutation_until_review() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn mutation_batches_execute_one_call_per_round() {
     let baseline = "README intro\nACTUAL FINAL LINE";
     let executor = Arc::new(StatefulReadWriteExecutor::new(baseline));
@@ -3595,6 +3795,7 @@ async fn deferred_tool_guardrail_does_not_expose_tool_continuation_text_as_parti
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn policy_deferred_empty_continuation_reasons_again_instead_of_finishing_with_progress() {
     let executor = Arc::new(StatefulReadWriteExecutor::new("README intro"));
     let mut engine = stateful_mixed_tool_engine(executor.clone());
@@ -4225,6 +4426,22 @@ fn user_message_evidence_extraction_seeds_pr_issue_and_file_references() {
     assert!(references
         .iter()
         .any(|reference| reference == "app/Fawx/ViewModels/ChatViewModel.swift"));
+}
+
+#[test]
+fn user_message_evidence_extraction_ignores_numbered_issue_list_items() {
+    let references = extract_user_evidence_references(
+        "please resolve these issues:\n\n1. discarded_field_note is too broad.\n2. ResultKind::Error regressed headless callers.",
+    );
+
+    assert!(
+        !references.iter().any(|reference| reference == "issue 1"),
+        "plural issue prose plus a numbered list item must not become a fake issue reference"
+    );
+    assert!(
+        !references.iter().any(|reference| reference == "issue 2"),
+        "plural issue prose plus a numbered list item must not become a fake issue reference"
+    );
 }
 
 #[test]

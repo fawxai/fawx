@@ -1110,6 +1110,7 @@ mod tests {
                 max_iterations: 6,
                 max_history: 128,
                 memory_enabled: true,
+                tool_invocations_remaining: 0,
             },
             authority: None,
             version: "0.1.0".to_string(),
@@ -1170,6 +1171,9 @@ mod tests {
             ToolExecutionDiagnostics::RunCommand(diagnostics) => diagnostics,
             ToolExecutionDiagnostics::Http(diagnostics) => {
                 panic!("expected run_command diagnostics, got http: {diagnostics:?}")
+            }
+            ToolExecutionDiagnostics::Tool(diagnostics) => {
+                panic!("expected run_command diagnostics, got tool: {diagnostics:?}")
             }
         }
     }
@@ -2396,7 +2400,7 @@ three
     }
 
     #[tokio::test]
-    async fn run_command_rejects_argv_when_shell_is_true() {
+    async fn run_command_prefers_command_when_shell_true_and_argv_is_also_present() {
         let temp = TempDir::new().expect("temp");
         let executor = test_executor(temp.path());
         let result = execute_tool_result(
@@ -2410,14 +2414,47 @@ three
         )
         .await;
 
-        assert!(!result.success);
-        assert_eq!(
-            result.failure_classification(),
-            Some(FailureClass::Permanent)
-        );
-        assert!(result
-            .output
-            .contains("argv cannot be used when shell=true"));
+        assert!(result.success);
+        assert!(result.output.contains("hi"));
+        assert!(!result.output.contains("field was ignored"));
+    }
+
+    #[tokio::test]
+    async fn run_command_prefers_argv_when_shell_false_and_command_is_also_present() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "command": "definitely-not-the-command-that-runs",
+                "argv": ["echo", "hi"],
+                "shell": false
+            }),
+        )
+        .await;
+
+        assert!(result.success);
+        assert!(result.output.contains("hi"));
+        assert!(!result.output.contains("field was ignored"));
+    }
+
+    #[tokio::test]
+    async fn run_command_uses_argv_when_shell_true_has_no_command() {
+        let temp = TempDir::new().expect("temp");
+        let executor = test_executor(temp.path());
+        let result = execute_tool_result(
+            &executor,
+            "run_command",
+            serde_json::json!({
+                "argv": ["echo", "hi"],
+                "shell": true
+            }),
+        )
+        .await;
+
+        assert!(result.success);
+        assert!(result.output.contains("hi"));
     }
 
     #[tokio::test]

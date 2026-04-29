@@ -72,6 +72,10 @@ pub struct LiveHostApiConfig<'a> {
     /// Capabilities the skill has declared in its manifest.
     pub capabilities: Vec<Capability>,
     /// Optional credential provider for bridging secrets to skills.
+    ///
+    /// When absent, `kv_get` still works against skill-local storage. This
+    /// keeps tests, headless startup, and legacy skills deterministic: missing
+    /// credential infrastructure does not turn storage lookups into errors.
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
@@ -124,7 +128,11 @@ impl HostApi for LiveHostApi {
     }
 
     fn kv_get(&self, key: &str) -> Option<String> {
-        // Credential provider takes priority (bridges secrets to skills)
+        // Credential provider takes priority when present (bridges secrets to
+        // skills), but the absence of a provider is not an error path. We
+        // always fall through to skill-local storage so `kv_get` keeps its
+        // storage semantics in tests/headless contexts that do not mount the
+        // encrypted credential store.
         if let Some(provider) = &self.credential_provider {
             if let Some(value) = provider.get_credential(&self.skill_scoped_setting_key(key)) {
                 return Some((*value).clone());
@@ -588,6 +596,15 @@ mod tests {
 
         api.kv_set("key", "value").expect("should set");
         assert_eq!(api.kv_get("key"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn kv_get_without_credential_provider_uses_storage_only_contract() {
+        let mut api = make_api("");
+        api.kv_set("github_token", "stored_only")
+            .expect("should set");
+
+        assert_eq!(api.kv_get("github_token"), Some("stored_only".to_string()));
     }
 
     #[test]

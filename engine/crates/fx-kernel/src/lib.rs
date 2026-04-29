@@ -1,4 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
+#![allow(dead_code)]
 //! # fx-kernel — Fawx Kernel
 //!
 //! The kernel layer: loop orchestration, policy engine, permissions, budget

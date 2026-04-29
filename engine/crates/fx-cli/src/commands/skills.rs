@@ -183,12 +183,37 @@ fn install_skill_files(
     let dest_manifest = skill_dir.join("manifest.toml");
     fs::copy(manifest_path, &dest_manifest)
         .with_context(|| format!("Failed to copy manifest to {:?}", dest_manifest))?;
+    sync_install_signature(wasm_path, &skill_dir, &manifest.name)?;
     if let Some(source) = source {
         write_source_metadata(&skill_dir, &source).map_err(anyhow::Error::msg)?;
     }
 
     print_install_summary(manifest, &skill_dir);
     Ok(())
+}
+
+fn sync_install_signature(wasm_path: &Path, skill_dir: &Path, skill_name: &str) -> Result<()> {
+    let source = signature_sidecar_path(wasm_path);
+    let target = skill_dir.join(format!("{skill_name}.wasm.sig"));
+    if source.exists() {
+        fs::copy(&source, &target)
+            .with_context(|| format!("Failed to copy signature to {:?}", target))?;
+        return Ok(());
+    }
+    match fs::remove_file(&target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "Failed to remove stale signature {}: {error}",
+            target.display()
+        )),
+    }
+}
+
+fn signature_sidecar_path(path: &Path) -> PathBuf {
+    let mut sig = path.as_os_str().to_os_string();
+    sig.push(".sig");
+    PathBuf::from(sig)
 }
 
 fn print_install_summary(manifest: &fx_skills::manifest::SkillManifest, skill_dir: &Path) {
@@ -897,6 +922,38 @@ mod tests {
             parsed.capabilities,
             vec![Capability::Network, Capability::Storage]
         );
+    }
+
+    #[test]
+    fn sync_install_signature_copies_present_sidecar() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let wasm_path = temp_dir.path().join("input.wasm");
+        let skill_dir = temp_dir.path().join("skills").join("weather");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(&wasm_path, b"wasm").expect("write wasm");
+        let source_sig = signature_sidecar_path(&wasm_path);
+        fs::write(&source_sig, b"sig").expect("write sig");
+
+        sync_install_signature(&wasm_path, &skill_dir, "weather").expect("sync signature");
+
+        assert_eq!(
+            fs::read(skill_dir.join("weather.wasm.sig")).expect("read copied sig"),
+            b"sig"
+        );
+    }
+
+    #[test]
+    fn sync_install_signature_removes_stale_target_when_source_missing() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let wasm_path = temp_dir.path().join("input.wasm");
+        let skill_dir = temp_dir.path().join("skills").join("weather");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(&wasm_path, b"wasm").expect("write wasm");
+        fs::write(skill_dir.join("weather.wasm.sig"), b"stale").expect("write stale sig");
+
+        sync_install_signature(&wasm_path, &skill_dir, "weather").expect("sync signature");
+
+        assert!(!skill_dir.join("weather.wasm.sig").exists());
     }
 
     fn assert_invalid_name(name: &str) {

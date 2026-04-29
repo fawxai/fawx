@@ -3,21 +3,13 @@ review_warning_file_count = 40
 review_warning_area_count = 4
 
 # Fail closed: any path matching neither list is rejected as an allowlist miss.
-# Reviewed app globs are intentional; new files in those audited slices still go
-# through private-marker scanning and normal promotion review.
+# App-inclusive promotions now include the full Swift app tree. The app still
+# goes through private-marker scanning and normal promotion review.
 allowlist = [
   ".cargo/**",
   ".github/workflows/ci.yml",
+  "app/**",
   "assets/**",
-  # Reviewed Swift app surface that passed the PR 2 sanitization gate.
-  "app/Fawx/Models/*.swift",
-  "app/Fawx/Networking/*.swift",
-  "app/Fawx/Utilities/*.swift",
-  "app/Fawx/ViewModels/*.swift",
-  "app/Fawx/Views/Shared/PairingSettingsPanel.swift",
-  "app/Fawx/Views/Shared/SetupWizard/*.swift",
-  "app/FawxTests/Utilities/*.swift",
-  "app/FawxTests/ViewModels/*.swift",
   "bindings/**",
   "engine/**",
   "tui/**",
@@ -42,31 +34,6 @@ allowlist = [
 ]
 
 blocklist = [
-  # Still-private or not-yet-reviewed app surface.
-  "app/Fawx.xcodeproj/**",
-  "app/Fawx/Fawx-macOS.entitlements",
-  "app/Fawx/FawxApp.swift",
-  "app/Fawx/Info-iOS.plist",
-  "app/Fawx/Info.plist",
-  "app/Fawx/LaunchScreen.storyboard",
-  "app/Fawx/Assets.xcassets/**",
-  "app/Fawx/Resources/**",
-  "app/Fawx/Services/**",
-  "app/Fawx/Theme/**",
-  "app/Fawx/Views/Ripcord/**",
-  "app/Fawx/Views/Shared/*.swift",
-  "app/Fawx/Views/iOS/**",
-  "app/Fawx/Views/macOS/**",
-  "app/FawxTests/Models/**",
-  "app/FawxTests/Networking/**",
-  "app/FawxTests/README.md",
-  "app/FawxTests/Services/**",
-  "app/FawxTests/Views/**",
-  "app/FawxUITests/**",
-  "app/Package.resolved",
-  "app/Package.swift",
-  "app/README.md",
-  "app/project.yml",
   "docs/strategy/**",
   "memory/**",
   "AGENTS.md",
@@ -108,6 +75,10 @@ pattern = "\\babbudjoe/fawx\\b"
 [[markers]]
 name = "internal assistant name"
 pattern = "\\bclawdio\\b"
+
+[[markers]]
+name = "private local user path"
+pattern = "\\/(?:Users|home)\\/joseph\\b"
 
 # Marker ordering matters because the guard reports the first named match.
 # Keep more-specific patterns above broader ones when multiple markers could overlap.

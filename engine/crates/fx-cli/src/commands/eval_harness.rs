@@ -39,6 +39,8 @@ struct ScenarioCase {
     deterministic_fallback_correct: bool,
     retries_observed: u8,
     retry_bound: u8,
+    mutation_state_pass: bool,
+    tool_result_reused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,6 +49,8 @@ pub struct EvalMetrics {
     pub completion_artifact_pass_rate: f64,
     pub deterministic_fallback_correctness: f64,
     pub retry_bound_adherence: f64,
+    pub mutation_state_pass_rate: f64,
+    pub tool_result_reuse_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,6 +69,7 @@ pub struct DomainCounts {
     pub travel: usize,
     pub shopping: usize,
     pub general_web_research: usize,
+    pub coding_agent: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,6 +78,8 @@ pub struct MetricDelta {
     pub completion_artifact_pass_rate: f64,
     pub deterministic_fallback_correctness: f64,
     pub retry_bound_adherence: f64,
+    pub mutation_state_pass_rate: f64,
+    pub tool_result_reuse_rate: f64,
 }
 
 pub fn run(options: Options) -> anyhow::Result<i32> {
@@ -84,7 +91,9 @@ pub fn run(options: Options) -> anyhow::Result<i32> {
             let has_regression = delta.false_success_claim_rate > 0.0
                 || delta.completion_artifact_pass_rate < 0.0
                 || delta.deterministic_fallback_correctness < 0.0
-                || delta.retry_bound_adherence < 0.0;
+                || delta.retry_bound_adherence < 0.0
+                || delta.mutation_state_pass_rate < 0.0
+                || delta.tool_result_reuse_rate < 0.0;
             if has_regression {
                 anyhow::bail!(
                     "metric regression detected vs baseline (false-success should not increase; other metrics should not decrease)"
@@ -116,20 +125,24 @@ pub fn run(options: Options) -> anyhow::Result<i32> {
     println!("Determinism eval completed ({})", options.mode.as_str());
     println!("Report: {}", options.output.display());
     println!(
-        "Metrics: false-success={:.3}, artifact-pass={:.3}, fallback-correct={:.3}, retry-adherence={:.3}",
+        "Metrics: false-success={:.3}, artifact-pass={:.3}, fallback-correct={:.3}, retry-adherence={:.3}, mutation-state={:.3}, tool-result-reuse={:.3}",
         report.metrics.false_success_claim_rate,
         report.metrics.completion_artifact_pass_rate,
         report.metrics.deterministic_fallback_correctness,
-        report.metrics.retry_bound_adherence
+        report.metrics.retry_bound_adherence,
+        report.metrics.mutation_state_pass_rate,
+        report.metrics.tool_result_reuse_rate
     );
 
     if let Some(delta) = &report.trend_vs_baseline {
         println!(
-            "Delta vs baseline: false-success={:+.3}, artifact-pass={:+.3}, fallback-correct={:+.3}, retry-adherence={:+.3}",
+            "Delta vs baseline: false-success={:+.3}, artifact-pass={:+.3}, fallback-correct={:+.3}, retry-adherence={:+.3}, mutation-state={:+.3}, tool-result-reuse={:+.3}",
             delta.false_success_claim_rate,
             delta.completion_artifact_pass_rate,
             delta.deterministic_fallback_correctness,
-            delta.retry_bound_adherence
+            delta.retry_bound_adherence,
+            delta.mutation_state_pass_rate,
+            delta.tool_result_reuse_rate
         );
     }
 
@@ -157,12 +170,16 @@ fn build_report(
         .iter()
         .filter(|c| c.retries_observed <= c.retry_bound)
         .count() as f64;
+    let mutation_state_pass = cases.iter().filter(|c| c.mutation_state_pass).count() as f64;
+    let tool_result_reused = cases.iter().filter(|c| c.tool_result_reused).count() as f64;
 
     let metrics = EvalMetrics {
         false_success_claim_rate: false_success_claims / scenario_count,
         completion_artifact_pass_rate: artifacts_pass / scenario_count,
         deterministic_fallback_correctness: fallback_correct / scenario_count,
         retry_bound_adherence: retry_within_bound / scenario_count,
+        mutation_state_pass_rate: mutation_state_pass / scenario_count,
+        tool_result_reuse_rate: tool_result_reused / scenario_count,
     };
 
     let domain_counts = DomainCounts {
@@ -172,6 +189,7 @@ fn build_report(
             .iter()
             .filter(|c| c.domain == "general_web_research")
             .count(),
+        coding_agent: cases.iter().filter(|c| c.domain == "coding_agent").count(),
     };
 
     let trend_vs_baseline = match baseline_path {
@@ -191,6 +209,10 @@ fn build_report(
                     - baseline.metrics.deterministic_fallback_correctness,
                 retry_bound_adherence: metrics.retry_bound_adherence
                     - baseline.metrics.retry_bound_adherence,
+                mutation_state_pass_rate: metrics.mutation_state_pass_rate
+                    - baseline.metrics.mutation_state_pass_rate,
+                tool_result_reuse_rate: metrics.tool_result_reuse_rate
+                    - baseline.metrics.tool_result_reuse_rate,
             })
         }
         _ => None,
@@ -224,6 +246,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 1,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "shopping-lite-1",
@@ -233,6 +257,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 0,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "research-lite-1",
@@ -242,6 +268,19 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 1,
             retry_bound: 1,
+            mutation_state_pass: true,
+            tool_result_reused: true,
+        },
+        ScenarioCase {
+            id: "coding-lite-review-fix",
+            domain: "coding_agent",
+            false_success_claim: false,
+            artifacts_complete: true,
+            deterministic_fallback_correct: true,
+            retries_observed: 0,
+            retry_bound: 1,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
     ];
 
@@ -259,6 +298,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 2,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "travel-full-3",
@@ -268,6 +309,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 1,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "shopping-full-2",
@@ -277,6 +320,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 1,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "shopping-full-3",
@@ -286,6 +331,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 2,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "research-full-2",
@@ -295,6 +342,8 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: true,
             retries_observed: 1,
             retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
         ScenarioCase {
             id: "research-full-3",
@@ -304,6 +353,41 @@ fn scenarios_for_mode(mode: EvalMode) -> Vec<ScenarioCase> {
             deterministic_fallback_correct: false,
             retries_observed: 3,
             retry_bound: 2,
+            mutation_state_pass: false,
+            tool_result_reused: false,
+        },
+        ScenarioCase {
+            id: "coding-full-git-credential-push",
+            domain: "coding_agent",
+            false_success_claim: false,
+            artifacts_complete: true,
+            deterministic_fallback_correct: true,
+            retries_observed: 1,
+            retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
+        },
+        ScenarioCase {
+            id: "coding-full-code-review-fix",
+            domain: "coding_agent",
+            false_success_claim: false,
+            artifacts_complete: true,
+            deterministic_fallback_correct: true,
+            retries_observed: 1,
+            retry_bound: 2,
+            mutation_state_pass: true,
+            tool_result_reused: true,
+        },
+        ScenarioCase {
+            id: "coding-full-wrong-branch-detection",
+            domain: "coding_agent",
+            false_success_claim: false,
+            artifacts_complete: true,
+            deterministic_fallback_correct: true,
+            retries_observed: 0,
+            retry_bound: 1,
+            mutation_state_pass: true,
+            tool_result_reused: true,
         },
     ]);
 
@@ -321,6 +405,23 @@ mod tests {
         assert!(cases.iter().any(|c| c.domain == "travel"));
         assert!(cases.iter().any(|c| c.domain == "shopping"));
         assert!(cases.iter().any(|c| c.domain == "general_web_research"));
+        assert!(cases.iter().any(|c| c.domain == "coding_agent"));
+    }
+
+    #[test]
+    fn coding_agent_metrics_are_state_based() {
+        let report =
+            build_report(EvalMode::Full, &scenarios_for_mode(EvalMode::Full), None).unwrap();
+
+        assert!(report.domain_counts.coding_agent >= 4);
+        assert!(
+            report.metrics.mutation_state_pass_rate > 0.0,
+            "mutation metric should track artifact/workspace state, not transcript phrasing"
+        );
+        assert!(
+            report.metrics.tool_result_reuse_rate > 0.0,
+            "tool-result reuse metric should catch loops that ignore prior tool evidence"
+        );
     }
 
     #[test]
@@ -347,12 +448,15 @@ mod tests {
                 travel: 3,
                 shopping: 3,
                 general_web_research: 3,
+                coding_agent: 0,
             },
             metrics: EvalMetrics {
                 false_success_claim_rate: 0.20,
                 completion_artifact_pass_rate: 0.60,
                 deterministic_fallback_correctness: 0.70,
                 retry_bound_adherence: 0.80,
+                mutation_state_pass_rate: 0.70,
+                tool_result_reuse_rate: 0.70,
             },
             trend_vs_baseline: None,
         };

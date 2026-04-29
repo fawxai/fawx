@@ -1,3 +1,4 @@
+use crate::audit::{audit_middleware, HttpAuditState};
 use crate::handlers;
 use crate::handlers::config::{
     handle_apply_config_preset, handle_config_get, handle_config_patch, handle_config_preset_diff,
@@ -316,10 +317,15 @@ pub fn build_router(state: HttpState, fleet_manager: Option<Arc<Mutex<FleetManag
         .route("/v1/pair", post(handle_exchange_pair))
         .route("/telegram/webhook", post(handle_telegram_webhook))
         .nest("/v1", setup_v1_router);
+    let audit_state = HttpAuditState::from_data_dir(&state.data_dir);
     let router = authenticated.merge(public).with_state(state);
 
     merge_fleet_router(router, fleet_manager)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(middleware::from_fn_with_state(
+            audit_state,
+            audit_middleware,
+        ))
 }
 
 pub fn merge_fleet_router(

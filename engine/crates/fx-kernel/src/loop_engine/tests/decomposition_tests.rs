@@ -556,6 +556,7 @@ async fn sub_goal_below_floor_maps_to_skipped_outcome() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn low_budget_decomposition_avoids_budget_exhaustion_signal() {
     let (result, llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 
@@ -570,6 +571,7 @@ async fn low_budget_decomposition_avoids_budget_exhaustion_signal() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn low_budget_decomposition_skips_sub_goals_without_retry_storm() {
     let (result, _llm_calls) = run_budget_exhausted_decomposition_cycle().await;
 

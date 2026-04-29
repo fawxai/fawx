@@ -1207,12 +1207,14 @@ fn build_skill_registry(
     registry.register(Arc::new(git_skill));
 
     let skills_dir = data_dir.join("skills");
-    let trusted_keys =
+    let mut trusted_keys = vec![fx_marketplace::FAWXAI_PUBLIC_KEY.to_vec()];
+    trusted_keys.extend(
         fx_loadable::wasm_skill::load_trusted_keys_from(&data_dir.join("trusted_keys"))
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to load trusted keys");
                 vec![]
-            });
+            }),
+    );
     let signature_policy = SignaturePolicy {
         trusted_keys,
         require_signatures: config.security.require_signatures,
@@ -1696,6 +1698,7 @@ fn new_runtime_info(config: &FawxConfig, memory_enabled: bool) -> Arc<RwLock<Run
             max_iterations: config.general.max_iterations,
             max_history: config.general.max_history,
             memory_enabled,
+            tool_invocations_remaining: 0,
         },
         authority: None,
         version: env!("CARGO_PKG_VERSION").to_string(),

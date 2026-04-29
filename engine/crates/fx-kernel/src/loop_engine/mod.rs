@@ -14,6 +14,7 @@ use crate::budget::{AllocationPlan, BudgetConfig};
 use crate::cancellation::CancellationToken;
 use crate::channels::ChannelRegistry;
 use crate::context_manager::ContextCompactor;
+use crate::loop_engine::tool_execution::tool_call_may_complete_external_action;
 
 #[cfg(test)]
 use crate::conversation_compactor::debug_assert_tool_pair_integrity;
@@ -95,8 +96,7 @@ use self::decomposition::{
     sub_goal_result_from_loop, successful_mutation_tool_names, successful_tool_names,
 };
 use self::decomposition::{
-    decomposition_results_all_skipped, estimate_plan_cost, is_decomposition_results_message,
-    parse_decomposition_plan,
+    estimate_plan_cost, is_decomposition_results_message, parse_decomposition_plan,
 };
 use self::preflight_route::{
     build_degraded_public_web_fallback_plan, build_route_plan, detect_route_resource, RoutePlan,
@@ -105,9 +105,10 @@ use self::preflight_route::{
 use self::request::{build_continuation_request, ContinuationRequestParams};
 use self::request::{
     build_forced_synthesis_request, build_reasoning_messages, build_reasoning_request,
-    build_truncation_continuation_request, completion_request_to_prompt,
-    ForcedSynthesisRequestParams, ReasoningRequestParams, RequestBuildContext, SkillPromptSummary,
-    ToolRequestConfig, TruncationContinuationRequestParams,
+    build_simple_agent_messages, build_simple_agent_request, build_truncation_continuation_request,
+    completion_request_to_prompt, ForcedSynthesisRequestParams, ReasoningRequestParams,
+    RequestBuildContext, SimpleAgentRequestParams, SkillPromptSummary, ToolRequestConfig,
+    TruncationContinuationRequestParams,
 };
 #[cfg(test)]
 use self::request::{
@@ -120,9 +121,11 @@ use self::request::{
 use self::retry::same_call_failure_reason;
 use self::retry::{RetryTracker, ToolCallKey};
 use self::streaming::{StreamingRequestContext, TextStreamVisibility};
-use self::tool_execution::extract_tool_use_provider_ids;
 #[cfg(test)]
 use self::tool_execution::ToolRoundOutcome;
+use self::tool_execution::{
+    blocked_tool_message, extract_tool_use_provider_ids, record_tool_round_messages,
+};
 use self::turn_control::{
     FinalResponseValidationFacts, FinalResponseValidationOutcome, FinalResponseViolation,
     TurnControlPlane,
@@ -130,9 +133,9 @@ use self::turn_control::{
 
 #[cfg(test)]
 use self::tool_execution::{
-    append_tool_round_messages, blocked_tool_message, build_tool_result_message,
-    build_tool_use_assistant_message, evict_oldest_results, tool_synthesis_prompt,
-    truncate_tool_results, TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS,
+    append_tool_round_messages, build_tool_result_message, build_tool_use_assistant_message,
+    evict_oldest_results, tool_synthesis_prompt, truncate_tool_results,
+    TOOL_SYNTHESIS_MAX_OUTPUT_TOKENS,
 };
 
 #[cfg(test)]
@@ -627,6 +630,10 @@ enum RootTurnDeliverable {
         label: String,
         normalized_label: String,
     },
+    MutationWork {
+        label: String,
+        satisfied: bool,
+    },
     ArtifactWrite {
         path: String,
         satisfied: bool,
@@ -644,12 +651,14 @@ enum RootTurnExternalActionKind {
     GitHubPrComment,
     GitHubIssueComment,
     GitHubPrReview,
+    GitHubPrCreate,
     GitPush,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootTurnCompletionBlock {
     missing_response_sections: Vec<String>,
+    pending_mutation_work: Vec<String>,
     pending_artifact_paths: Vec<String>,
     pending_external_actions: Vec<String>,
 }
@@ -784,6 +793,13 @@ pub struct LoopEngine {
     pending_tool_scope: Option<ContinuationToolScope>,
     /// Optional typed turn commitment for the next root reasoning pass.
     pending_turn_commitment: Option<TurnCommitment>,
+    /// Active closure gate for a root-turn external action that must be
+    /// completed before normal investigation can resume.
+    pending_external_action_target: Option<RootTurnExternalActionKind>,
+    /// Consecutive failed attempts at completing the pending external action.
+    /// After reaching the configured threshold, the gate lifts so the agent can
+    /// recover.
+    pending_external_action_consecutive_failures: u8,
     /// Cycle-scoped retry pressure for final-response protocol violations.
     final_response_blocked_attempts: u8,
     /// Cycle-scoped marker that the provider attempted tool activity while the
@@ -881,6 +897,10 @@ impl std::fmt::Debug for LoopEngine {
             )
             .field("pending_tool_scope", &self.pending_tool_scope)
             .field("pending_turn_commitment", &self.pending_turn_commitment)
+            .field(
+                "pending_external_action_target",
+                &self.pending_external_action_target,
+            )
             .field(
                 "final_response_blocked_attempts",
                 &self.final_response_blocked_attempts,
@@ -1277,6 +1297,8 @@ impl LoopEngineBuilder {
             pending_tool_response_text: None,
             pending_tool_scope: None,
             pending_turn_commitment: None,
+            pending_external_action_target: None,
+            pending_external_action_consecutive_failures: 0,
             final_response_blocked_attempts: 0,
             final_response_attempted_tool_activity: false,
             final_response_candidate_truncated: false,
@@ -1901,6 +1923,23 @@ Do not burn through your tool retry limit in a single sequential loop \
 ; decompose first, then execute. \
 ";
 
+const SIMPLE_AGENT_SYSTEM_PROMPT: &str = "You are Fawx, a code-capable agent running in a real workspace. \
+Answer by doing the requested work with the available tools. \
+For requests to fix, resolve, implement, update, review, test, commit, push, or open a pull request, \
+recommendations are not a resolution: inspect the workspace, make the concrete change, verify it when practical, \
+and then report the outcome. \
+Call tools whenever you need file contents, repository state, command output, or external action status. \
+After a tool call, use the tool result as the source of truth and continue from it. \
+Do not ask the user to confirm the obvious next step for an active implementation request. \
+Stop only when the user-facing request is complete, impossible, or blocked by missing credentials/permissions/input. \
+When blocked, state the exact blocker and the last concrete evidence. \
+Keep final answers concise and specific.";
+
+const SIMPLE_AGENT_FINAL_RESPONSE_DIRECTIVE: &str =
+    "The tool-use budget for this turn is exhausted. \
+Do not call more tools. Answer now from the gathered evidence. \
+If the work is incomplete, report the concrete blocker and the evidence you gathered.";
+
 const TERMINAL_SYNTHESIS_SYSTEM_PROMPT: &str = "You are Fawx in terminal answer mode. \
 Tool execution is closed for this turn. \
 You cannot call tools, request function calls, plan another tool step, or ask the runtime to continue execution. \
@@ -2197,6 +2236,21 @@ impl LoopEngine {
         .with_agent_preferences(self.agent_preferences.as_deref())
         .with_skill_prompt_summaries(skill_prompt_summaries)
         .with_signal_feedback_summary(signal_feedback_summary)
+        .with_prompt_cache_affinity(self.prompt_cache_affinity())
+    }
+
+    fn request_build_context_without_signal_feedback(&mut self) -> RequestBuildContext<'_> {
+        self.sync_runtime_skill_prompt_summaries();
+        let skill_prompt_summaries = self.runtime_skill_prompt_summaries();
+        RequestBuildContext::new(
+            self.memory_context.as_deref(),
+            self.scratchpad_context.as_deref(),
+            self.thinking_config.clone(),
+            self.notify_tool_guidance_enabled,
+        )
+        .with_execution_context(self.execution_context.as_ref())
+        .with_agent_preferences(self.agent_preferences.as_deref())
+        .with_skill_prompt_summaries(skill_prompt_summaries)
         .with_prompt_cache_affinity(self.prompt_cache_affinity())
     }
 
@@ -2599,87 +2653,225 @@ impl LoopEngine {
 
         self.emit_loop_phase(stream, Phase::Perceive);
         let mut processed = self.perceive(&perception).await?;
-        let reason_cost = self.estimate_reasoning_cost(&processed);
-        if let Some(result) = self.budget_terminal(reason_cost, None) {
-            return Ok(self.finish_streaming_result(result, stream));
-        }
-
-        self.emit_loop_phase(stream, Phase::Reason);
-        let response = self.reason(&processed, llm, stream).await?;
-        self.record_reasoning_cost(reason_cost, &mut state);
-
-        let mut decision = self.decide(&response).await?;
-        if let Some(result) = self.budget_terminal(self.estimate_action_cost(&decision), None) {
-            return Ok(self.finish_streaming_result(result, stream));
-        }
-
+        self.clear_turn_contract_control_plane();
         loop {
-            self.emit_loop_phase(stream, Phase::Act);
-            let mut action = self
-                .act(&decision, llm, &processed.context_window, stream)
-                .await?;
+            let reason_cost = self.estimate_reasoning_cost(&processed);
+            if let Some(result) = self.budget_terminal(reason_cost, None) {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
+            self.emit_loop_phase(stream, Phase::Reason);
+            let reasoning_messages = build_simple_agent_messages(&processed);
+            let response = self.reason_simple(&processed, llm, stream).await?;
+            state
+                .tokens
+                .accumulate(response_usage_or_estimate(&response, &reasoning_messages));
+            self.budget.record(&reason_cost);
 
-            let action_partial = action_partial_response(&action);
-
-            if let Some(result) =
-                self.apply_repeated_tool_failure_policy(&mut action, action_partial.as_deref())
-            {
+            let response_text =
+                normalize_response_text(&extract_readable_text(&extract_response_text(&response)));
+            if let Some(result) = self.check_cancellation(
+                (!response_text.trim().is_empty()).then_some(response_text.clone()),
+            ) {
                 return Ok(self.finish_streaming_result(result, stream));
             }
 
-            state.tokens.accumulate(action.tokens_used);
-            self.update_tool_turns(&action);
-
-            if let Some(result) = self.check_cancellation(action_partial.clone()) {
-                return Ok(self.finish_streaming_result(result, stream));
-            }
-
-            self.emit_action_observations(&action);
-
-            let recorded_action_cost = self.recorded_action_cost(&action);
-            let action_commits_final_response = action_commits_final_response(&action);
-            let action_is_terminal = action_is_terminal(&action);
-            if !action_is_terminal && !action_commits_final_response {
-                if let Some(result) = self.budget_terminal(
-                    recorded_action_cost.unwrap_or_default(),
-                    action_partial.clone(),
-                ) {
-                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
-                }
-            }
-            if let Some(action_cost) = recorded_action_cost {
-                self.budget.record(&action_cost);
-            }
-
-            let continuation = match action.next_step.clone() {
-                ActionNextStep::Finish(terminal) => {
-                    let terminal = self.apply_decomposition_terminal_fallback(
-                        terminal,
-                        processed.context_window.last(),
-                    );
-                    match self.guard_root_turn_terminal_completion(terminal) {
-                        ActionNextStep::Finish(terminal) => {
+            if response.tool_calls.is_empty() {
+                self.clear_tool_response_state();
+                let followed_tool_round = self.consecutive_tool_turns > 0;
+                let text = response_text;
+                self.emit_loop_phase(
+                    stream,
+                    if followed_tool_round {
+                        Phase::Synthesize
+                    } else {
+                        Phase::Act
+                    },
+                );
+                self.emit_decision_signals(&Decision::Respond(text.clone()));
+                if text.trim().is_empty() {
+                    if followed_tool_round {
+                        self.emit_signal(
+                            LoopStep::Act,
+                            SignalKind::Trace,
+                            "tool continuation returned empty text",
+                            serde_json::json!({ "iterations": self.iteration_count }),
+                        );
+                        self.emit_loop_phase(stream, Phase::Synthesize);
+                        let final_response = self
+                            .reason_simple_final_response(&processed, llm, stream)
+                            .await?;
+                        let final_messages = build_simple_agent_messages(&processed);
+                        state.tokens.accumulate(response_usage_or_estimate(
+                            &final_response,
+                            &final_messages,
+                        ));
+                        let final_text = normalize_response_text(&extract_readable_text(
+                            &extract_response_text(&final_response),
+                        ));
+                        self.emit_decision_signals(&Decision::Respond(final_text.clone()));
+                        if !final_text.trim().is_empty() {
                             return Ok(self.finish_streaming_result(
-                                self.loop_result_from_action_terminal(terminal, state.tokens),
+                                LoopResult::Complete {
+                                    response: final_text,
+                                    iterations: self.iteration_count,
+                                    tokens_used: state.tokens,
+                                    signals: Vec::new(),
+                                },
                                 stream,
                             ));
                         }
-                        ActionNextStep::Continue(continuation) => continuation,
+                    }
+                    self.consecutive_tool_turns = 0;
+                    return Ok(self.finish_streaming_result(
+                        LoopResult::Incomplete {
+                            partial_response: None,
+                            reason: "model returned no final response".to_string(),
+                            iterations: self.iteration_count,
+                            signals: Vec::new(),
+                        },
+                        stream,
+                    ));
+                }
+
+                match self.guard_root_turn_terminal_completion(ActionTerminal::Complete {
+                    response: text.clone(),
+                }) {
+                    ActionNextStep::Finish(ActionTerminal::Complete { response }) => {
+                        self.consecutive_tool_turns = 0;
+                        return Ok(self.finish_streaming_result(
+                            LoopResult::Complete {
+                                response,
+                                iterations: self.iteration_count,
+                                tokens_used: state.tokens,
+                                signals: Vec::new(),
+                            },
+                            stream,
+                        ));
+                    }
+                    ActionNextStep::Finish(ActionTerminal::Incomplete {
+                        partial_response,
+                        reason,
+                    }) => {
+                        self.consecutive_tool_turns = 0;
+                        return Ok(self.finish_streaming_result(
+                            LoopResult::Incomplete {
+                                partial_response,
+                                reason,
+                                iterations: self.iteration_count,
+                                signals: Vec::new(),
+                            },
+                            stream,
+                        ));
+                    }
+                    ActionNextStep::Continue(continuation) => {
+                        self.apply_pending_turn_commitment(&continuation, &[]);
+                        append_continuation_context(&mut processed.context_window, &continuation);
+                        self.consecutive_tool_turns = 0;
+                        self.iteration_count += 1;
+                        self.refresh_iteration_state();
+                        continue;
                     }
                 }
-                ActionNextStep::Continue(continuation) => continuation,
-            };
+            }
 
-            if continuation
-                .context_message
-                .as_deref()
-                .is_some_and(decomposition_results_all_skipped)
-            {
+            self.capture_tool_response_state(&response);
+            let calls = response.tool_calls.clone();
+            let tool_decision = Decision::UseTools(calls.clone());
+            let action_cost = ActionCost {
+                llm_calls: 0,
+                tool_invocations: calls.len() as u32,
+                tokens: 0,
+                cost_cents: 0,
+            };
+            if let Some(result) = self.budget_terminal(action_cost, None) {
+                if self.consecutive_tool_turns > 0 {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
+                return Ok(self.finish_streaming_result(result, stream));
+            }
+            self.budget.record(&action_cost);
+            self.emit_decision_signals(&tool_decision);
+            self.emit_loop_phase(stream, Phase::Act);
+            let batch = self
+                .execute_tool_calls_batch_with_stream(&calls, stream)
+                .await?;
+            self.emit_action_signals(&calls, &batch.results);
+            self.consecutive_tool_turns = self.consecutive_tool_turns.saturating_add(1);
+
+            let provider_ids = self.tool_call_provider_ids.clone();
+            let mut evidence_messages = Vec::new();
+            record_tool_round_messages(
+                &mut processed.context_window,
+                &mut evidence_messages,
+                &calls,
+                &provider_ids,
+                &batch.results,
+            )?;
+            self.clear_tool_response_state();
+            self.compact_simple_agent_context_if_needed(&mut processed)
+                .await?;
+            if !batch.blocked.is_empty() {
+                let blocked_guidance = batch
+                    .blocked
+                    .iter()
+                    .map(|blocked| {
+                        blocked_tool_message(
+                            &blocked.call.name,
+                            &blocked.reason,
+                            blocked.guidance.as_deref(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                processed.context_window.push(Message::system(format!(
+                    "Blocked tool calls this round:\n{blocked_guidance}"
+                )));
+            }
+
+            if let Some(result) = self.check_cancellation(None) {
+                return Ok(self.finish_streaming_result(result, stream));
+            }
+
+            if !batch.blocked.is_empty() && batch.results.iter().all(|result| !result.success) {
+                self.emit_signal(
+                    LoopStep::Act,
+                    SignalKind::Blocked,
+                    "all requested tool calls were blocked",
+                    serde_json::json!({"blocked_count": batch.blocked.len()}),
+                );
+                let final_reason_cost = self.estimate_reasoning_cost(&processed);
+                if let Some(result) = self.budget_terminal(final_reason_cost, None) {
+                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
+                }
+                self.emit_loop_phase(stream, Phase::Reason);
+                let final_response = self
+                    .reason_simple_final_response(&processed, llm, stream)
+                    .await?;
+                let final_messages = build_simple_agent_messages(&processed);
+                state
+                    .tokens
+                    .accumulate(response_usage_or_estimate(&final_response, &final_messages));
+                self.budget.record(&final_reason_cost);
+                self.clear_tool_response_state();
+                self.consecutive_tool_turns = 0;
+
+                let raw = extract_response_text(&final_response);
+                let text = normalize_response_text(&extract_readable_text(&raw));
+                self.emit_decision_signals(&Decision::Respond(text.clone()));
+                if text.trim().is_empty() {
+                    return Ok(self.finish_streaming_result(
+                        LoopResult::Incomplete {
+                            partial_response: None,
+                            reason: "all requested tool calls were blocked before a usable final response was produced".to_string(),
+                            iterations: self.iteration_count,
+                            signals: Vec::new(),
+                        },
+                        stream,
+                    ));
+                }
                 return Ok(self.finish_streaming_result(
                     LoopResult::Complete {
-                        response: continuation
-                            .context_message
-                            .expect("checked decomposition context message"),
+                        response: text,
                         iterations: self.iteration_count,
                         tokens_used: state.tokens,
                         signals: Vec::new(),
@@ -2688,58 +2880,77 @@ impl LoopEngine {
                 ));
             }
 
-            self.apply_pending_turn_commitment(&continuation, &action.tool_results);
-            let mut continuation_context = processed.context_window.clone();
-            append_continuation_context(&mut continuation_context, &continuation);
-
             // Tools were used. Check max before incrementing so the
             // reported iteration count is accurate (not inflated by 1).
             if self.iteration_count >= self.max_iterations {
-                return Ok(self
-                    .finish_iteration_limit(llm, &continuation_context, state.tokens, stream)
-                    .await);
+                self.emit_signal(
+                    LoopStep::Reason,
+                    SignalKind::Trace,
+                    "simple agent loop reached tool iteration limit; requesting final response",
+                    serde_json::json!({
+                        "iterations": self.iteration_count,
+                        "max_iterations": self.max_iterations,
+                    }),
+                );
+                self.emit_loop_phase(stream, Phase::Synthesize);
+                let final_response = self
+                    .reason_simple_final_response(&processed, llm, stream)
+                    .await?;
+                let final_messages = build_simple_agent_messages(&processed);
+                state
+                    .tokens
+                    .accumulate(response_usage_or_estimate(&final_response, &final_messages));
+                self.clear_tool_response_state();
+                self.consecutive_tool_turns = 0;
+
+                let text = normalize_response_text(&extract_readable_text(&extract_response_text(
+                    &final_response,
+                )));
+                self.emit_decision_signals(&Decision::Respond(text.clone()));
+                if text.trim().is_empty() {
+                    return Ok(self.finish_streaming_result(
+                        LoopResult::Incomplete {
+                            partial_response: None,
+                            reason: "iteration limit reached before a usable final response was produced".to_string(),
+                            iterations: self.iteration_count,
+                            signals: Vec::new(),
+                        },
+                        stream,
+                    ));
+                }
+
+                return Ok(self.finish_streaming_result(
+                    LoopResult::Complete {
+                        response: text,
+                        iterations: self.iteration_count,
+                        tokens_used: state.tokens,
+                        signals: Vec::new(),
+                    },
+                    stream,
+                ));
             }
             self.iteration_count += 1;
 
             self.refresh_iteration_state();
-
-            // Append a summary of what happened to the context window so
-            // the next reason() call sees the model's tool results. Without
-            // this the model would be re-prompted with stale context.
-            // NOTE: each continuation iteration adds one assistant message.
-            // Bounded by max_iterations (default 10), so growth is small.
-            //
-            // We build a compact assistant message with the synthesis text
-            // (which already summarizes tool outputs) rather than replaying
-            // every tool call/result message, because act_with_tools may
-            // have run multiple inner rounds with different call IDs that
-            // don't map 1:1 to the original Decision::UseTools calls.
-            processed.context_window = continuation_context;
-
-            let reason_cost = self.estimate_reasoning_cost(&processed);
-            let final_response_budget_reserve = self.active_finalize_response().is_some();
-            if !final_response_budget_reserve {
-                if let Some(result) = self.budget_terminal(reason_cost, action_partial.clone()) {
-                    return Ok(self.finish_budget_exhausted(result, llm, stream).await);
-                }
-            }
-
-            // No re-perceive needed; context_window was updated in-place above.
-            self.emit_loop_phase(stream, Phase::Reason);
-            let response = self.reason(&processed, llm, stream).await?;
-            self.record_reasoning_cost(reason_cost, &mut state);
-
-            decision = self.decide(&response).await?;
-            if !final_response_budget_reserve {
-                if let Some(result) =
-                    self.budget_terminal(self.estimate_action_cost(&decision), None)
-                {
-                    return Ok(self.finish_streaming_result(result, stream));
-                }
-            }
-
-            // Loop back to act with new decision
         }
+    }
+
+    async fn compact_simple_agent_context_if_needed(
+        &mut self,
+        processed: &mut ProcessedPerception,
+    ) -> Result<(), LoopError> {
+        let compacted = self
+            .compaction()
+            .compact_if_needed(
+                &processed.context_window,
+                CompactionScope::ToolContinuation,
+                self.iteration_count,
+            )
+            .await?;
+        if let Cow::Owned(messages) = compacted {
+            processed.context_window = messages;
+        }
+        Ok(())
     }
 
     /// Handle BudgetExhausted results with optional forced synthesis.
@@ -2765,14 +2976,17 @@ impl LoopEngine {
                 if let Some(response) = synthesized.as_deref() {
                     if let Some(block) = self.root_turn_completion_block_for_response(response) {
                         let reason = Self::root_turn_incomplete_reason(&block);
-                        let partial_response =
-                            Self::root_turn_external_action_incomplete_response(&block);
+                        let partial_response = Self::root_turn_contract_incomplete_response(
+                            &block,
+                            synthesized.as_deref(),
+                        );
                         self.emit_signal(
                             LoopStep::Synthesize,
                             SignalKind::Friction,
                             "forced synthesis did not satisfy root turn completion contract",
                             serde_json::json!({
                                 "missing_response_sections": &block.missing_response_sections,
+                                "pending_mutation_work": &block.pending_mutation_work,
                                 "pending_artifact_paths": &block.pending_artifact_paths,
                                 "pending_external_actions": &block.pending_external_actions,
                             }),
@@ -2816,13 +3030,15 @@ impl LoopEngine {
         let result = if let Some(response) = synthesized.filter(|text| !text.trim().is_empty()) {
             if let Some(block) = self.root_turn_completion_block_for_response(&response) {
                 let reason = Self::root_turn_incomplete_reason(&block);
-                let partial_response = Self::root_turn_external_action_incomplete_response(&block);
+                let partial_response =
+                    Self::root_turn_contract_incomplete_response(&block, Some(&response));
                 self.emit_signal(
                     LoopStep::Synthesize,
                     SignalKind::Friction,
                     "forced synthesis did not satisfy root turn completion contract",
                     serde_json::json!({
                         "missing_response_sections": &block.missing_response_sections,
+                        "pending_mutation_work": &block.pending_mutation_work,
                         "pending_artifact_paths": &block.pending_artifact_paths,
                         "pending_external_actions": &block.pending_external_actions,
                     }),
@@ -3136,6 +3352,7 @@ impl LoopEngine {
         self.pending_tool_response_text = None;
         self.pending_tool_scope = None;
         self.pending_turn_commitment = None;
+        self.pending_external_action_target = None;
         self.final_response_blocked_attempts = 0;
         self.final_response_attempted_tool_activity = false;
         self.final_response_candidate_truncated = false;
@@ -3156,6 +3373,26 @@ impl LoopEngine {
             token.reset();
         }
         self.tool_executor.clear_cache();
+    }
+
+    fn clear_turn_contract_control_plane(&mut self) {
+        self.turn_progress_ledger = TurnProgressLedger::default();
+        self.pending_tool_scope = None;
+        self.pending_turn_commitment = None;
+        self.pending_external_action_target = None;
+        self.pending_external_action_consecutive_failures = 0;
+        self.final_response_blocked_attempts = 0;
+        self.final_response_attempted_tool_activity = false;
+        self.final_response_candidate_truncated = false;
+        self.root_turn_contract = None;
+        self.task_contract = None;
+        self.requested_artifact_target = None;
+        self.pending_artifact_write_target = None;
+        self.turn_execution_profile = TurnExecutionProfile::Standard;
+        self.bounded_local_phase = BoundedLocalPhase::Discovery;
+        self.bounded_local_recovery_used = false;
+        self.bounded_local_recovery_focus.clear();
+        self.bounded_local_terminal_reason = None;
     }
 
     fn update_tool_turns(&mut self, action: &ActionResult) {
@@ -3421,14 +3658,24 @@ impl LoopEngine {
             results,
             &self.pending_tool_result_diagnostics,
         );
+        let completed_mutation_work = mutation_work_completed(calls, results);
         let Some(contract) = self.root_turn_contract.as_mut() else {
             return;
         };
 
         let mut satisfied_paths = Vec::new();
+        let mut satisfied_mutation_work = Vec::new();
         let mut satisfied_external_actions = Vec::new();
+        let mut satisfied_external_action_kinds = Vec::new();
         for deliverable in &mut contract.deliverables {
             match deliverable {
+                RootTurnDeliverable::MutationWork { label, satisfied } => {
+                    if *satisfied || !completed_mutation_work {
+                        continue;
+                    }
+                    *satisfied = true;
+                    satisfied_mutation_work.push(label.clone());
+                }
                 RootTurnDeliverable::ArtifactWrite { path, satisfied } => {
                     if *satisfied || !artifact_write_completed(path, results) {
                         continue;
@@ -3453,11 +3700,20 @@ impl LoopEngine {
                     }
                     *satisfied = true;
                     satisfied_external_actions.push(label.clone());
+                    satisfied_external_action_kinds.push(*kind);
                 }
                 RootTurnDeliverable::ResponseSection { .. } => {}
             }
         }
 
+        if !satisfied_mutation_work.is_empty() {
+            self.emit_signal(
+                LoopStep::Act,
+                SignalKind::Success,
+                "root turn mutation deliverable satisfied",
+                serde_json::json!({ "deliverables": satisfied_mutation_work }),
+            );
+        }
         if !satisfied_paths.is_empty() {
             self.emit_signal(
                 LoopStep::Act,
@@ -3467,12 +3723,43 @@ impl LoopEngine {
             );
         }
         if !satisfied_external_actions.is_empty() {
+            self.clear_pending_external_action_target_if_satisfied(
+                &satisfied_external_action_kinds,
+            );
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Success,
                 "root turn external action deliverable satisfied",
                 serde_json::json!({ "actions": satisfied_external_actions }),
             );
+        }
+
+        // Track consecutive failures against the pending external action gate.
+        // If the agent attempted the action but it failed, increment the counter
+        // so the gate can lift after repeated failures and allow recovery.
+        if let Some(target_kind) = self.pending_external_action_target {
+            if !satisfied_external_action_kinds.contains(&target_kind) {
+                let attempted_and_failed =
+                    calls.iter().zip(results.iter()).any(|(call, result)| {
+                        tool_call_may_complete_external_action(call, target_kind) && !result.success
+                    });
+                if attempted_and_failed {
+                    let threshold = self.external_action_gate_failure_lift_threshold();
+                    self.pending_external_action_consecutive_failures = self
+                        .pending_external_action_consecutive_failures
+                        .saturating_add(1)
+                        .min(threshold);
+                    self.emit_signal(
+                        LoopStep::Act,
+                        SignalKind::Friction,
+                        "pending external action attempt failed",
+                        serde_json::json!({
+                            "action": external_action_label(target_kind),
+                            "consecutive_failures": self.pending_external_action_consecutive_failures,
+                        }),
+                    );
+                }
+            }
         }
     }
 
@@ -3609,7 +3896,8 @@ impl LoopEngine {
 
         if blocked_attempts >= retry_limit {
             let reason = Self::root_turn_incomplete_reason(&block);
-            let partial_response = Self::root_turn_external_action_incomplete_response(&block);
+            let partial_response =
+                Self::root_turn_contract_incomplete_response(&block, Some(&response));
             self.emit_signal(
                 LoopStep::Act,
                 SignalKind::Friction,
@@ -3618,6 +3906,7 @@ impl LoopEngine {
                     "blocked_attempts": blocked_attempts,
                     "retry_limit": retry_limit,
                     "missing_response_sections": &block.missing_response_sections,
+                    "pending_mutation_work": &block.pending_mutation_work,
                     "pending_artifact_paths": &block.pending_artifact_paths,
                     "pending_external_actions": &block.pending_external_actions,
                 }),
@@ -3637,6 +3926,7 @@ impl LoopEngine {
                 "retry_limit": retry_limit,
                 "retries_remaining": retries_remaining,
                 "missing_response_sections": &block.missing_response_sections,
+                "pending_mutation_work": &block.pending_mutation_work,
                 "pending_artifact_paths": &block.pending_artifact_paths,
                 "pending_external_actions": &block.pending_external_actions,
             }),
@@ -3647,9 +3937,33 @@ impl LoopEngine {
             &block,
             retries_remaining,
         )));
-        let mut continuation =
-            ActionContinuation::new(Some(response), None).with_context_messages(context_messages);
-        if let Some(path) = block.pending_artifact_paths.first().cloned() {
+        let mut continuation = ActionContinuation::new(Some(response), None);
+        if let Some(label) = block.pending_mutation_work.first().cloned() {
+            let tool_scope = mutation_tool_scope(&self.tool_executor.tool_definitions());
+            continuation = continuation
+                .with_tool_scope(tool_scope.clone())
+                .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
+                    ProceedUnderConstraints {
+                        goal: format!(
+                            "Complete the pending root-turn mutation deliverable: {label}"
+                        ),
+                        success_target: Some(format!(
+                            "Use mutation tools to complete this requested work now: {label}."
+                        )),
+                        unsupported_items: block
+                            .missing_response_sections
+                            .iter()
+                            .map(|section| {
+                                format!(
+                                    "Response section still pending after mutation work: {section}"
+                                )
+                            })
+                            .collect(),
+                        assumptions: Vec::new(),
+                        allowed_tools: Some(tool_scope),
+                    },
+                ));
+        } else if let Some(path) = block.pending_artifact_paths.first().cloned() {
             let tool_scope = ContinuationToolScope::Only(vec!["write_file".to_string()]);
             continuation = continuation
                 .with_tool_scope(tool_scope.clone())
@@ -3672,14 +3986,34 @@ impl LoopEngine {
                     },
                 ));
         } else if let Some(action) = block.pending_external_actions.first().cloned() {
-            let tool_scope = ContinuationToolScope::Only(vec!["run_command".to_string()]);
+            let action_kind = self.first_pending_external_action_kind();
+            if let Some(kind) = action_kind {
+                self.pending_external_action_target = Some(kind);
+            }
+            let tool_scope_names = action_kind
+                .map(|kind| {
+                    available_external_action_tool_names(
+                        &self.tool_executor.tool_definitions(),
+                        kind,
+                    )
+                })
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| vec!["run_command".to_string()]);
+            let tool_scope = ContinuationToolScope::Only(tool_scope_names);
+            context_messages.push(Message::system(format!(
+                "Use one of [{}] to complete the pending external action before producing the final response.",
+                match &tool_scope {
+                    ContinuationToolScope::Only(names) => names.join(", "),
+                    _ => "run_command".to_string(),
+                }
+            )));
             continuation = continuation
                 .with_tool_scope(tool_scope.clone())
                 .with_turn_commitment(TurnCommitment::ProceedUnderConstraints(
                     ProceedUnderConstraints {
                         goal: format!("Complete the pending root-turn external action: {action}"),
                         success_target: Some(format!(
-                            "Use run_command to complete this external action, then continue to any remaining response deliverables: {action}."
+                            "Complete this external action now, then continue to any remaining response deliverables: {action}."
                         )),
                         unsupported_items: block
                             .missing_response_sections
@@ -3698,6 +4032,7 @@ impl LoopEngine {
                 "Produce one consolidated final response that satisfies all remaining response sections.",
             ));
         }
+        continuation = continuation.with_context_messages(context_messages);
         ActionNextStep::Continue(continuation)
     }
 
@@ -3827,7 +4162,8 @@ impl LoopEngine {
         let scoped = self.apply_pending_tool_scope(base);
         let phased = self.apply_turn_execution_profile_tool_surface(scoped);
         let routed = self.apply_preflight_route_tool_surface(phased);
-        self.apply_pending_artifact_gate(routed)
+        let externally_gated = self.apply_pending_external_action_gate(routed);
+        self.apply_pending_artifact_gate(externally_gated)
     }
 
     fn pending_turn_commitment_directive(&self) -> Option<String> {
@@ -3881,6 +4217,52 @@ impl LoopEngine {
         })
     }
 
+    fn first_pending_external_action_kind(&self) -> Option<RootTurnExternalActionKind> {
+        self.root_turn_contract
+            .as_ref()?
+            .deliverables
+            .iter()
+            .find_map(|deliverable| match deliverable {
+                RootTurnDeliverable::ExternalAction {
+                    kind,
+                    satisfied: false,
+                    ..
+                } => Some(*kind),
+                _ => None,
+            })
+    }
+
+    fn pending_external_action_directive(&self) -> Option<String> {
+        let action = self.pending_external_action_target?;
+        let allowed_tools =
+            available_external_action_tool_names(&self.tool_executor.tool_definitions(), action);
+        if allowed_tools.is_empty() {
+            Some(format!(
+                "Immediate next action: complete the external action \"{}\". Do not run more inspection, diff, search, or status commands before attempting this action. Only use a tool call that can complete this action.",
+                external_action_label(action)
+            ))
+        } else {
+            Some(format!(
+                "Immediate next action: complete the external action \"{}\". Do not run more inspection, diff, search, or status commands before attempting this action. Use one of [{}] to complete it now.",
+                external_action_label(action),
+                allowed_tools.join(", ")
+            ))
+        }
+    }
+
+    fn clear_pending_external_action_target_if_satisfied(
+        &mut self,
+        satisfied_kinds: &[RootTurnExternalActionKind],
+    ) {
+        if self
+            .pending_external_action_target
+            .is_some_and(|target| satisfied_kinds.contains(&target))
+        {
+            self.pending_external_action_target = None;
+            self.pending_external_action_consecutive_failures = 0;
+        }
+    }
+
     fn root_turn_completion_retry_limit(&self) -> u8 {
         self.current_termination_config()
             .root_turn_completion_retry_limit
@@ -3889,6 +4271,12 @@ impl LoopEngine {
     fn repeated_failure_streak_limit(&self) -> u16 {
         self.current_termination_config()
             .max_repeated_failure_streak
+            .max(1)
+    }
+
+    fn external_action_gate_failure_lift_threshold(&self) -> u8 {
+        self.current_termination_config()
+            .external_action_gate_failure_lift_threshold
             .max(1)
     }
 
@@ -3915,6 +4303,41 @@ impl LoopEngine {
             self.apply_pending_tool_scope(self.tool_executor.tool_definitions())
         } else {
             write_tools
+        }
+    }
+
+    fn apply_pending_external_action_gate(
+        &self,
+        tools: Vec<ToolDefinition>,
+    ) -> Vec<ToolDefinition> {
+        let Some(action) = self.pending_external_action_target else {
+            return tools;
+        };
+        // After repeated failures, lift the gate so the agent can diagnose
+        // and recover (e.g., fix git credentials before retrying push).
+        if self.pending_external_action_consecutive_failures
+            >= self.external_action_gate_failure_lift_threshold()
+        {
+            return tools;
+        }
+        let allowed_names = available_external_action_tool_names(&tools, action);
+        let filter_allowed = |tools: Vec<ToolDefinition>| {
+            tools
+                .into_iter()
+                .filter(|tool| allowed_names.iter().any(|name| name == &tool.name))
+                .collect::<Vec<_>>()
+        };
+        let filtered = filter_allowed(tools);
+        if filtered.is_empty() {
+            let fallback_tools = self.tool_executor.tool_definitions();
+            let fallback_allowed_names =
+                available_external_action_tool_names(&fallback_tools, action);
+            fallback_tools
+                .into_iter()
+                .filter(|tool| fallback_allowed_names.iter().any(|name| name == &tool.name))
+                .collect()
+        } else {
+            filtered
         }
     }
 
@@ -4064,6 +4487,10 @@ impl LoopEngine {
             reason.push_str("; missing response sections: ");
             reason.push_str(&block.missing_response_sections.join(", "));
         }
+        if !block.pending_mutation_work.is_empty() {
+            reason.push_str("; pending local mutation work: ");
+            reason.push_str(&block.pending_mutation_work.join(", "));
+        }
         if !block.pending_artifact_paths.is_empty() {
             reason.push_str("; pending artifact writes: ");
             reason.push_str(&block.pending_artifact_paths.join(", "));
@@ -4075,17 +4502,32 @@ impl LoopEngine {
         reason
     }
 
-    fn root_turn_external_action_incomplete_response(
+    fn root_turn_contract_incomplete_response(
         block: &RootTurnCompletionBlock,
+        candidate_response: Option<&str>,
     ) -> Option<String> {
-        if block.pending_external_actions.is_empty() {
+        let has_side_effect_deliverable = !block.pending_mutation_work.is_empty()
+            || !block.pending_artifact_paths.is_empty()
+            || !block.pending_external_actions.is_empty();
+        if !has_side_effect_deliverable {
             return None;
         }
 
-        Some(format!(
-            "I could not complete this turn because required external action(s) were still pending: {}. I stopped here rather than claiming the task was finished.",
-            block.pending_external_actions.join(", ")
-        ))
+        // The contract's `satisfied` flag gates tool scope, not speech.
+        // When the loop must end incomplete, keep the model's visible response
+        // available for context, but prefix it with the kernel-owned contract
+        // failure so confident-but-wrong text is not presented as completed
+        // work.
+        let pending = root_turn_pending_deliverable_summary(block);
+        let note = format!(
+            "I could not complete this turn because required root-turn deliverable(s) are still pending: {pending}."
+        );
+        match candidate_response.and_then(meaningful_response_text) {
+            Some(candidate) => Some(format!(
+                "{note}\n\nModel response before the turn ended:\n{candidate}"
+            )),
+            None => Some(note),
+        }
     }
 
     fn root_turn_completion_block_for_response(
@@ -4145,6 +4587,8 @@ impl LoopEngine {
                 .await?
         };
         if let Cow::Owned(messages) = compacted_context {
+            self.tool_retry_tracker.notify_compaction();
+            self.tool_executor.notify_compaction();
             self.emit_context_overflow_signal(
                 CompactionScope::Perceive,
                 before_context_window,
@@ -4192,6 +4636,15 @@ impl LoopEngine {
             budget_remaining: self.budget.remaining(snapshot_with_steer.timestamp_ms),
             steer_context: snapshot_with_steer.steer_context,
         };
+
+        // Sync live tool_invocations_remaining into the runtime info snapshot.
+        if let Some(ri) = &self.runtime_info {
+            let remaining = self.budget.remaining(snapshot_with_steer.timestamp_ms);
+            if let Ok(mut guard) = ri.write() {
+                guard.config_summary.tool_invocations_remaining = remaining.tool_invocations;
+            }
+        }
+
         let available_tools = self.tool_executor.tool_definitions();
         let seeded_evidence = self.seed_turn_progress_from_user_message(&user_message);
         if !seeded_evidence.is_empty() {
@@ -4353,8 +4806,19 @@ impl LoopEngine {
                 .iter()
                 .filter_map(|deliverable| match deliverable {
                     RootTurnDeliverable::ResponseSection { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::MutationWork { .. } => None,
                     RootTurnDeliverable::ArtifactWrite { .. } => None,
                     RootTurnDeliverable::ExternalAction { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let mutation_work = contract
+                .deliverables
+                .iter()
+                .filter_map(|deliverable| match deliverable {
+                    RootTurnDeliverable::MutationWork { label, .. } => Some(label.clone()),
+                    RootTurnDeliverable::ResponseSection { .. }
+                    | RootTurnDeliverable::ArtifactWrite { .. }
+                    | RootTurnDeliverable::ExternalAction { .. } => None,
                 })
                 .collect::<Vec<_>>();
             let artifact_paths = contract
@@ -4362,6 +4826,7 @@ impl LoopEngine {
                 .iter()
                 .filter_map(|deliverable| match deliverable {
                     RootTurnDeliverable::ArtifactWrite { path, .. } => Some(path.clone()),
+                    RootTurnDeliverable::MutationWork { .. } => None,
                     RootTurnDeliverable::ResponseSection { .. } => None,
                     RootTurnDeliverable::ExternalAction { .. } => None,
                 })
@@ -4372,12 +4837,14 @@ impl LoopEngine {
                 .filter_map(|deliverable| match deliverable {
                     RootTurnDeliverable::ExternalAction { label, .. } => Some(label.clone()),
                     RootTurnDeliverable::ResponseSection { .. }
+                    | RootTurnDeliverable::MutationWork { .. }
                     | RootTurnDeliverable::ArtifactWrite { .. } => None,
                 })
                 .collect::<Vec<_>>();
             tracing::info!(
                 deliverable_block_count = root_turn_contract.deliverable_block_count,
                 response_sections = ?response_sections,
+                mutation_work = ?mutation_work,
                 artifact_paths = ?artifact_paths,
                 external_actions = ?external_actions,
                 "extracted root turn completion contract"
@@ -4389,6 +4856,7 @@ impl LoopEngine {
                 serde_json::json!({
                     "deliverable_block_count": root_turn_contract.deliverable_block_count,
                     "response_sections": response_sections,
+                    "mutation_work": mutation_work,
                     "artifact_paths": artifact_paths,
                     "external_actions": external_actions,
                 }),
@@ -4464,6 +4932,12 @@ impl LoopEngine {
                 system_prompt.push_str(&directive);
             }
         }
+        if let Some(directive) = self.pending_external_action_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nExternal action gate:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
         if let Some(directive) = self.task_contract_state_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str("\n\nTask lifecycle contract:\n");
@@ -4515,6 +4989,92 @@ impl LoopEngine {
         Ok(response)
     }
 
+    async fn reason_simple(
+        &mut self,
+        perception: &ProcessedPerception,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        self.maybe_publish_reason_progress(stream);
+        let tools = if self.task_contract_blocks_tools() {
+            Vec::new()
+        } else {
+            let tools = self
+                .apply_turn_execution_profile_tool_surface(self.tool_executor.tool_definitions());
+            let scoped = self.apply_pending_tool_scope(tools);
+            self.apply_preflight_route_tool_surface(scoped)
+        };
+        let mut request = build_simple_agent_request(SimpleAgentRequestParams::new(
+            perception,
+            llm.model_name(),
+            tools,
+            self.request_build_context_without_signal_feedback(),
+        ));
+        request.cache_affinity = self.prompt_cache_affinity();
+        let request_messages = request.messages.clone();
+        let started = current_time_ms();
+        let response = self
+            .request_completion(
+                llm,
+                request,
+                StreamingRequestContext::new(
+                    LoopStep::Reason,
+                    StreamPhase::Reason,
+                    TextStreamVisibility::Preview,
+                )
+                .with_preview_final_commit(true),
+                stream,
+            )
+            .await?;
+        let response = self
+            .continue_truncated_response(response, &request_messages, llm, LoopStep::Reason, stream)
+            .await?;
+        let latency_ms = current_time_ms().saturating_sub(started);
+        let usage = response.usage;
+        self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
+        Ok(response)
+    }
+
+    async fn reason_simple_final_response(
+        &mut self,
+        perception: &ProcessedPerception,
+        llm: &dyn LlmProvider,
+        stream: CycleStream<'_>,
+    ) -> Result<CompletionResponse, LoopError> {
+        let mut request = build_simple_agent_request(
+            SimpleAgentRequestParams::new(
+                perception,
+                llm.model_name(),
+                Vec::new(),
+                self.request_build_context_without_signal_feedback(),
+            )
+            .final_response(),
+        );
+        request.cache_affinity = self.prompt_cache_affinity();
+        let request_messages = request.messages.clone();
+        let started = current_time_ms();
+        let response = self
+            .request_completion(
+                llm,
+                request,
+                StreamingRequestContext::new(
+                    LoopStep::Reason,
+                    StreamPhase::Synthesize,
+                    TextStreamVisibility::Public,
+                )
+                .with_preview_final_commit(true),
+                stream,
+            )
+            .await?;
+        let response = self
+            .continue_truncated_response(response, &request_messages, llm, LoopStep::Reason, stream)
+            .await?;
+        let latency_ms = current_time_ms().saturating_sub(started);
+        let usage = response.usage;
+        self.emit_reason_trace_and_perf(latency_ms, usage.as_ref());
+        Ok(response)
+    }
+
     async fn reason_final_response(
         &mut self,
         perception: &ProcessedPerception,
@@ -4547,6 +5107,12 @@ impl LoopEngine {
         if let Some(directive) = self.pending_artifact_write_directive() {
             if let Some(system_prompt) = request.system_prompt.as_mut() {
                 system_prompt.push_str("\n\nArtifact gate:\n");
+                system_prompt.push_str(&directive);
+            }
+        }
+        if let Some(directive) = self.pending_external_action_directive() {
+            if let Some(system_prompt) = request.system_prompt.as_mut() {
+                system_prompt.push_str("\n\nExternal action gate:\n");
                 system_prompt.push_str(&directive);
             }
         }
@@ -6069,9 +6635,14 @@ fn message_content_to_text(message: &Message) -> String {
         .iter()
         .map(|block| match block {
             fx_llm::ContentBlock::Text { text } => text.clone(),
-            fx_llm::ContentBlock::ToolUse { name, .. } => format!("[tool_use:{name}]"),
-            fx_llm::ContentBlock::ToolResult { tool_use_id, .. } => {
-                format!("[tool_result:{tool_use_id}]")
+            fx_llm::ContentBlock::ToolUse { name, input, .. } => {
+                format!("[tool_use:{name}] {input}")
+            }
+            fx_llm::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                format!("[tool_result:{tool_use_id}] {content}")
             }
             fx_llm::ContentBlock::Image { media_type, .. } => format!("[image:{media_type}]"),
             fx_llm::ContentBlock::Document {
@@ -6147,10 +6718,67 @@ fn extract_requested_external_actions(user_message: &str) -> Vec<RootTurnExterna
     if requests_github_pr_review(user_message) {
         actions.push(RootTurnExternalActionKind::GitHubPrReview);
     }
+    if requests_github_pr_create(user_message) {
+        actions.push(RootTurnExternalActionKind::GitHubPrCreate);
+    }
     if requests_git_push(user_message) {
         actions.push(RootTurnExternalActionKind::GitPush);
     }
     actions
+}
+
+fn requests_local_mutation_work(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not edit")
+        || normalized.contains("don t edit")
+        || normalized.contains("without editing")
+        || normalized.contains("only inspect")
+        || normalized.contains("tell me what")
+    {
+        return false;
+    }
+
+    const MUTATION_REQUEST_VERBS: &[&str] = &[
+        "add",
+        "adds",
+        "address",
+        "addresses",
+        "change",
+        "changes",
+        "delete",
+        "deletes",
+        "fix",
+        "fixed",
+        "fixes",
+        "implement",
+        "implemented",
+        "implements",
+        "patch",
+        "refactor",
+        "refactors",
+        "remove",
+        "removes",
+        "rename",
+        "renames",
+        "resolve",
+        "resolves",
+        "update",
+        "updates",
+    ];
+    const MUTATION_REQUEST_TARGETS: &[&str] = &[
+        "branch", "bug", "bugs", "code", "crate", "file", "function", "harness", "issue", "issues",
+        "module", "package", "pr", "repo", "review", "tests", "test",
+    ];
+
+    let has_mutation_verb = normalized
+        .split_whitespace()
+        .any(|token| MUTATION_REQUEST_VERBS.contains(&token));
+    let target_tokens = normalized.split_whitespace().collect::<HashSet<_>>();
+    let has_code_target = MUTATION_REQUEST_TARGETS
+        .iter()
+        .any(|target| target_tokens.contains(target));
+
+    has_mutation_verb && has_code_target
 }
 
 fn requests_github_pr_comment(user_message: &str) -> bool {
@@ -6215,6 +6843,26 @@ fn requests_github_pr_review(user_message: &str) -> bool {
     has_pr_target && asks_for_review_submission
 }
 
+fn requests_github_pr_create(user_message: &str) -> bool {
+    let normalized = normalize_contract_label(user_message);
+    if normalized.contains("do not open")
+        || normalized.contains("don t open")
+        || normalized.contains("without opening")
+        || normalized.contains("without creating")
+    {
+        return false;
+    }
+
+    let has_pr_target = normalized.split_whitespace().any(|token| token == "pr")
+        || normalized.contains("pull request");
+    let asks_for_creation = normalized.contains("open")
+        || normalized.contains("create")
+        || normalized.contains("raise")
+        || normalized.contains("submit");
+
+    has_pr_target && asks_for_creation
+}
+
 fn requests_git_push(user_message: &str) -> bool {
     let normalized = normalize_contract_label(user_message);
     if normalized.contains("do not push")
@@ -6237,8 +6885,88 @@ fn external_action_label(kind: RootTurnExternalActionKind) -> &'static str {
         RootTurnExternalActionKind::GitHubPrComment => "Post a comment on the GitHub pull request",
         RootTurnExternalActionKind::GitHubIssueComment => "Post a comment on the GitHub issue",
         RootTurnExternalActionKind::GitHubPrReview => "Submit the GitHub pull request review",
+        RootTurnExternalActionKind::GitHubPrCreate => "Open the GitHub pull request",
         RootTurnExternalActionKind::GitPush => "Push changes to the git remote",
     }
+}
+
+fn external_action_typed_tool_names(kind: RootTurnExternalActionKind) -> &'static [&'static str] {
+    match kind {
+        RootTurnExternalActionKind::GitHubPrComment => &["comment_pr", "github_pr_comment"],
+        RootTurnExternalActionKind::GitHubIssueComment => {
+            &["comment_issue", "github_issue_comment"]
+        }
+        RootTurnExternalActionKind::GitHubPrReview => &["review_pr", "github_pr_review"],
+        RootTurnExternalActionKind::GitHubPrCreate => &["create_pr", "github_pr_create"],
+        RootTurnExternalActionKind::GitPush => &["git_push"],
+    }
+}
+
+fn external_action_fallback_tool_names(
+    kind: RootTurnExternalActionKind,
+) -> &'static [&'static str] {
+    match kind {
+        RootTurnExternalActionKind::GitHubPrComment
+        | RootTurnExternalActionKind::GitHubIssueComment
+        | RootTurnExternalActionKind::GitHubPrReview
+        | RootTurnExternalActionKind::GitHubPrCreate
+        | RootTurnExternalActionKind::GitPush => &["run_command"],
+    }
+}
+
+fn external_action_tool_names(kind: RootTurnExternalActionKind) -> &'static [&'static str] {
+    match kind {
+        RootTurnExternalActionKind::GitHubPrComment => {
+            &["comment_pr", "github_pr_comment", "run_command"]
+        }
+        RootTurnExternalActionKind::GitHubIssueComment => {
+            &["comment_issue", "github_issue_comment", "run_command"]
+        }
+        RootTurnExternalActionKind::GitHubPrReview => {
+            &["review_pr", "github_pr_review", "run_command"]
+        }
+        RootTurnExternalActionKind::GitHubPrCreate => {
+            &["create_pr", "github_pr_create", "run_command"]
+        }
+        RootTurnExternalActionKind::GitPush => &["git_push", "run_command"],
+    }
+}
+
+fn available_external_action_tool_names(
+    available_tools: &[ToolDefinition],
+    kind: RootTurnExternalActionKind,
+) -> Vec<String> {
+    let available_names: HashSet<&str> = available_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+
+    let typed = external_action_typed_tool_names(kind)
+        .iter()
+        .filter(|name| available_names.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !typed.is_empty() {
+        return typed;
+    }
+
+    let fallback = external_action_fallback_tool_names(kind)
+        .iter()
+        .filter(|name| available_names.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !fallback.is_empty() {
+        return fallback;
+    }
+
+    external_action_tool_names_owned(kind)
+}
+
+fn external_action_tool_names_owned(kind: RootTurnExternalActionKind) -> Vec<String> {
+    external_action_tool_names(kind)
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 fn external_action_completed(
@@ -6253,11 +6981,24 @@ fn external_action_completed(
 
     match kind {
         RootTurnExternalActionKind::GitHubPrComment => {
-            github_pr_comment_completed_by_legacy_shell_inference(calls, results)
+            github_pr_comment_completed_by_successful_typed_tool(calls, results)
+                || github_pr_comment_completed_by_legacy_shell_inference(calls, results)
         }
-        RootTurnExternalActionKind::GitHubIssueComment => false,
-        RootTurnExternalActionKind::GitHubPrReview => false,
-        RootTurnExternalActionKind::GitPush => false,
+        RootTurnExternalActionKind::GitHubIssueComment => {
+            github_issue_comment_completed_by_successful_typed_tool(calls, results)
+        }
+        RootTurnExternalActionKind::GitHubPrReview => {
+            typed_completed_actions.contains(&RootTurnExternalActionKind::GitHubPrReview)
+                || github_pr_review_completed_by_successful_typed_tool(calls, results)
+        }
+        RootTurnExternalActionKind::GitHubPrCreate => {
+            github_pr_create_completed_by_successful_typed_tool(calls, results)
+                || github_pr_create_completed_by_legacy_shell_inference(calls, results)
+        }
+        RootTurnExternalActionKind::GitPush => {
+            typed_completed_actions.contains(&RootTurnExternalActionKind::GitPush)
+                || git_push_completed_by_successful_typed_tool(calls, results)
+        }
     }
 }
 
@@ -6300,6 +7041,52 @@ fn github_pr_comment_completed_by_legacy_shell_inference(
     })
 }
 
+fn github_pr_comment_completed_by_successful_typed_tool(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "comment_pr" | "github_pr_comment"))
+}
+
+fn github_issue_comment_completed_by_successful_typed_tool(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "comment_issue" | "github_issue_comment"))
+}
+
+fn github_pr_review_completed_by_successful_typed_tool(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "review_pr" | "github_pr_review"))
+}
+
+fn github_pr_create_completed_by_successful_typed_tool(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "create_pr" | "github_pr_create"))
+}
+
+fn github_pr_create_completed_by_legacy_shell_inference(
+    calls: &[ToolCall],
+    results: &[ToolResult],
+) -> bool {
+    successful_call_evidence(calls, results).any(|(call, result)| {
+        call.name == "run_command" && run_command_creates_github_pr(&call.arguments, &result.output)
+    })
+}
+
+fn git_push_completed_by_successful_typed_tool(calls: &[ToolCall], results: &[ToolResult]) -> bool {
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "git_push"))
+}
+
 fn successful_call_evidence<'a>(
     calls: &'a [ToolCall],
     results: &'a [ToolResult],
@@ -6314,6 +7101,15 @@ fn successful_call_evidence<'a>(
 
 fn run_command_posts_github_pr_comment(arguments: &serde_json::Value, output: &str) -> bool {
     !crate::act::external_actions_from_run_command_arguments(arguments, output).is_empty()
+}
+
+fn run_command_creates_github_pr(arguments: &serde_json::Value, output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    if !output.contains("github.com/") || !output.contains("/pull/") {
+        return false;
+    }
+
+    normalize_contract_label(&arguments.to_string()).contains("gh pr create")
 }
 
 #[cfg(test)]
@@ -6419,6 +7215,13 @@ fn extract_root_turn_contract(user_message: &str) -> RootTurnContractExtraction 
             label,
         })
         .collect::<Vec<_>>();
+
+    if requests_local_mutation_work(user_message) {
+        deliverables.push(RootTurnDeliverable::MutationWork {
+            label: "Complete the requested code or file changes".to_string(),
+            satisfied: false,
+        });
+    }
 
     if let Some(path) = extract_requested_write_target(user_message) {
         if !deliverables.iter().any(|deliverable| {
@@ -6624,7 +7427,7 @@ fn extract_user_evidence_references(user_message: &str) -> Vec<String> {
                     );
                 }
             }
-        } else if matches!(normalized.as_str(), "issue" | "issues") {
+        } else if normalized == "issue" {
             if let Some(value) = next.and_then(normalize_numeric_reference) {
                 push_unique_evidence_reference(
                     &mut references,
@@ -6830,6 +7633,7 @@ fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
         .iter()
         .filter_map(|deliverable| match deliverable {
             RootTurnDeliverable::ResponseSection { label, .. } => Some(label.as_str()),
+            RootTurnDeliverable::MutationWork { .. } => None,
             RootTurnDeliverable::ArtifactWrite { .. } => None,
             RootTurnDeliverable::ExternalAction { .. } => None,
         })
@@ -6839,6 +7643,26 @@ fn render_root_turn_contract_directive(contract: &RootTurnContract) -> String {
             "Produce one consolidated final response with these explicit section headings:\n",
         );
         for label in response_sections {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
+
+    let pending_mutation_work = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::MutationWork { label, satisfied } if !satisfied => {
+                Some(label.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !pending_mutation_work.is_empty() {
+        directive
+            .push_str("Do not finish until these local mutation deliverables are completed:\n");
+        for label in pending_mutation_work {
             directive.push_str("- ");
             directive.push_str(label);
             directive.push('\n');
@@ -7008,8 +7832,19 @@ fn root_turn_completion_block(
             _ => None,
         })
         .collect::<Vec<_>>();
+    let pending_mutation_work = contract
+        .deliverables
+        .iter()
+        .filter_map(|deliverable| match deliverable {
+            RootTurnDeliverable::MutationWork { label, satisfied } if !satisfied => {
+                Some(label.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
     if missing_response_sections.is_empty()
+        && pending_mutation_work.is_empty()
         && pending_artifact_paths.is_empty()
         && pending_external_actions.is_empty()
     {
@@ -7017,9 +7852,44 @@ fn root_turn_completion_block(
     } else {
         Some(RootTurnCompletionBlock {
             missing_response_sections,
+            pending_mutation_work,
             pending_artifact_paths,
             pending_external_actions,
         })
+    }
+}
+
+fn root_turn_pending_deliverable_summary(block: &RootTurnCompletionBlock) -> String {
+    let mut pending = Vec::new();
+    pending.extend(
+        block
+            .missing_response_sections
+            .iter()
+            .map(|section| format!("response section `{section}`")),
+    );
+    pending.extend(
+        block
+            .pending_mutation_work
+            .iter()
+            .map(|work| format!("local mutation work `{work}`")),
+    );
+    pending.extend(
+        block
+            .pending_artifact_paths
+            .iter()
+            .map(|path| format!("artifact write `{path}`")),
+    );
+    pending.extend(
+        block
+            .pending_external_actions
+            .iter()
+            .map(|action| format!("external action `{action}`")),
+    );
+
+    if pending.is_empty() {
+        "required deliverable(s)".to_string()
+    } else {
+        pending.join(", ")
     }
 }
 
@@ -7058,6 +7928,14 @@ fn render_root_turn_retry_directive(
             directive.push('\n');
         }
     }
+    if !block.pending_mutation_work.is_empty() {
+        directive.push_str("Pending local mutation work:\n");
+        for label in &block.pending_mutation_work {
+            directive.push_str("- ");
+            directive.push_str(label);
+            directive.push('\n');
+        }
+    }
     if !block.pending_artifact_paths.is_empty() {
         directive.push_str("Pending artifact writes:\n");
         for path in &block.pending_artifact_paths {
@@ -7087,6 +7965,34 @@ fn looks_like_artifact_path(path: &str) -> bool {
             .rsplit('/')
             .next()
             .is_some_and(|segment| segment.contains('.'))
+}
+
+fn mutation_tool_scope(available_tools: &[ToolDefinition]) -> ContinuationToolScope {
+    let mut names = available_tools
+        .iter()
+        .filter(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "edit_file" | "write_file" | "run_command" | "git_commit" | "git_push"
+            )
+        })
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        names.push("run_command".to_string());
+    }
+    ContinuationToolScope::Only(names)
+}
+
+fn mutation_work_completed(calls: &[ToolCall], results: &[ToolResult]) -> bool {
+    // Root mutation deliverables are satisfied only by successful local file
+    // writes. Broader side effects such as tests, commits, or pushes may be
+    // required later, but they should not prove that requested code changes
+    // actually happened.
+    successful_call_evidence(calls, results)
+        .any(|(call, _)| matches!(call.name.as_str(), "edit_file" | "write_file"))
 }
 
 fn artifact_write_completed(target: &str, tool_results: &[ToolResult]) -> bool {
