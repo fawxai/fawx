@@ -322,6 +322,7 @@ fn test_runtime_info() -> Arc<std::sync::RwLock<RuntimeInfo>> {
             max_iterations: 3,
             max_history: 20,
             memory_enabled: false,
+            tool_invocations_remaining: 0,
         },
         authority: None,
         version: "test".to_string(),
@@ -2280,6 +2281,7 @@ mod routing_and_status {
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
@@ -2322,6 +2324,7 @@ mod routing_and_status {
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
@@ -2366,6 +2369,7 @@ mod routing_and_status {
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
@@ -7227,9 +7231,54 @@ type = "text"
         let json = response_json(response).await;
         assert_eq!(json["skill_name"], "brave-search");
         assert_eq!(json["schema"]["fields"][0]["key"], "api_key");
+        assert_eq!(json["schema"]["fields"][0]["field_type"], "secret");
+        assert!(json["schema"]["fields"][0].get("type").is_none());
         assert_eq!(json["values"][0]["is_secret"], true);
         assert_eq!(json["values"][0]["is_configured"], true);
         assert_eq!(json["values"][0]["value"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn get_skill_settings_reuses_shared_store_when_database_is_open() {
+        let temp = TempDir::new().expect("tempdir");
+        let skills_dir = temp.path().join("skills").join("brave-search");
+        std::fs::create_dir_all(&skills_dir).expect("create skills dir");
+        std::fs::write(
+            skills_dir.join("manifest.toml"),
+            brave_search_settings_manifest_toml(
+                r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+"#,
+            ),
+        )
+        .expect("write manifest");
+
+        let store = Arc::new(
+            fx_auth::credential_store::EncryptedFileCredentialStore::open(temp.path())
+                .expect("open shared skill store"),
+        );
+        store
+            .set_generic("skill:brave-search:api_key", "brv_secret_123")
+            .expect("store secret");
+
+        let mut config = fx_config::FawxConfig::default();
+        config.general.data_dir = Some(temp.path().to_path_buf());
+        let mut state = test_state_with_config(config, None, Vec::new());
+        state.credential_store = Some(Arc::clone(&store));
+        let app = build_router(state, None);
+
+        let response = app
+            .oneshot(authed_request("GET", "/v1/skills/brave-search/settings"))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["values"][0]["is_configured"], true);
     }
 
     #[tokio::test]
@@ -7544,6 +7593,7 @@ type = "boolean"
             ripcord: None,
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: {
                 let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                 Arc::new(tokio::sync::Mutex::new(registry))
@@ -8009,6 +8059,7 @@ mod config_endpoint {
                     max_iterations: 3,
                     max_history: 20,
                     memory_enabled: false,
+                    tool_invocations_remaining: 0,
                 },
                 authority: None,
                 version: "test".to_string(),
@@ -8073,6 +8124,7 @@ mod config_endpoint {
                 ripcord: None,
                 fleet_manager: None,
                 cron_store: None,
+                credential_store: None,
                 experiment_registry: {
                     let registry = ExperimentRegistry::new(std::env::temp_dir().as_path()).unwrap();
                     Arc::new(tokio::sync::Mutex::new(registry))

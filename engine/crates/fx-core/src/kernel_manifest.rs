@@ -83,8 +83,11 @@ pub struct SandboxManifest {
 #[derive(Debug, Clone, Serialize)]
 pub struct SelfModifyManifest {
     pub enabled: bool,
+    pub capability_granted: bool,
     pub allow_paths: Vec<String>,
     pub deny_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,11 +152,7 @@ pub fn build_kernel_manifest(sources: &ManifestSources<'_>) -> KernelManifest {
             allow_subprocess: sources.sandbox.allow_subprocess,
             max_execution_seconds: sources.sandbox.max_execution_seconds,
         },
-        self_modify: SelfModifyManifest {
-            enabled: sources.self_modify_enabled,
-            allow_paths: sources.self_modify_allow.to_vec(),
-            deny_paths: sources.self_modify_deny.to_vec(),
-        },
+        self_modify: build_self_modify_manifest(sources),
         tools: sources
             .skills
             .iter()
@@ -167,6 +166,35 @@ pub fn build_kernel_manifest(sources: &ManifestSources<'_>) -> KernelManifest {
             working_dir: sources.working_dir.to_string(),
             writable_roots: build_writable_roots(sources.working_dir, sources.self_modify_allow),
         },
+    }
+}
+
+fn build_self_modify_manifest(sources: &ManifestSources<'_>) -> SelfModifyManifest {
+    let capability_granted = sources
+        .permissions
+        .unrestricted
+        .iter()
+        .any(|action| action.as_str() == "self_modify");
+    let diagnostic = if capability_granted && !sources.self_modify_enabled {
+        Some(
+            "self_modify capability is granted, but self_modify config is disabled; code changes require enabling self_modify or using file_write tools under the active authority policy"
+                .to_string(),
+        )
+    } else if sources.self_modify_enabled && sources.self_modify_allow.is_empty() {
+        Some(
+            "self_modify config is enabled without allow paths; path writes may still be blocked by self_modify policy"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    SelfModifyManifest {
+        enabled: sources.self_modify_enabled,
+        capability_granted,
+        allow_paths: sources.self_modify_allow.to_vec(),
+        deny_paths: sources.self_modify_deny.to_vec(),
+        diagnostic,
     }
 }
 
@@ -469,11 +497,33 @@ mod tests {
         let fixture = test_fixture();
         let manifest = build_kernel_manifest(&fixture.sources());
         assert!(manifest.self_modify.enabled);
+        assert!(!manifest.self_modify.capability_granted);
         assert_eq!(
             manifest.self_modify.allow_paths,
             vec!["/workspace/fawx/docs", "/workspace/fawx/scripts"]
         );
         assert_eq!(manifest.self_modify.deny_paths, vec![".git/**", "*.pem"]);
+    }
+
+    #[test]
+    fn build_kernel_manifest_surfaces_self_modify_capability_config_mismatch() {
+        let mut fixture = test_fixture();
+        fixture
+            .permissions
+            .unrestricted
+            .push(PermissionAction::SelfModify);
+        let mut sources = fixture.sources();
+        sources.self_modify_enabled = false;
+
+        let manifest = build_kernel_manifest(&sources);
+
+        assert!(!manifest.self_modify.enabled);
+        assert!(manifest.self_modify.capability_granted);
+        assert!(manifest
+            .self_modify
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("self_modify config is disabled")));
     }
 
     #[test]

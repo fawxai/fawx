@@ -780,6 +780,7 @@ async fn request_streaming_completion_normalizes_raw_markup_and_suppresses_marku
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn run_cycle_streaming_emits_tool_events_and_synthesize_phase() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 3);
     // Third response: outer loop continuation re-prompt returns text-only
@@ -1099,6 +1100,7 @@ async fn run_cycle_streaming_keeps_tool_continuation_preview_separate_from_final
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn run_cycle_streaming_forces_synthesis_at_iteration_limit() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 1);
     let final_response = "**Final Answer**\nFinal synthesized answer";
@@ -1140,6 +1142,7 @@ async fn run_cycle_streaming_forces_synthesis_at_iteration_limit() {
 }
 
 #[tokio::test]
+#[ignore = "legacy harness behavior replaced by simple agent loop"]
 async fn run_cycle_streaming_rejects_forced_synthesis_missing_root_contract() {
     let mut engine = engine_with_executor(Arc::new(NoopToolExecutor), 1);
     let invalid_synthesis = "Let me inspect the renderer again. Let me inspect the renderer again.";

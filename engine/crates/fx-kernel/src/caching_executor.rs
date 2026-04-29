@@ -30,6 +30,7 @@ struct ToolCache {
     hits: u64,
     misses: u64,
     evictions: u64,
+    compaction_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,6 +55,7 @@ struct CachedResult {
     output: String,
     success: bool,
     indexed_paths: Vec<String>,
+    epoch: u64,
 }
 
 #[derive(Debug)]
@@ -201,16 +203,38 @@ impl<T: ToolExecutor> CachingExecutor<T> {
         cache.evictions = 0;
     }
 
+    /// Called when context compaction fires. Increments the epoch so that
+    /// pre-compaction cache entries become stale on next lookup. Does NOT
+    /// clear the cache — stale entries are lazily evicted on access.
+    pub fn notify_compaction(&self) {
+        let Ok(mut cache) = self.cache.lock() else {
+            warn!("tool cache lock poisoned during compaction notification; skipping");
+            return;
+        };
+        cache.compaction_epoch = cache.compaction_epoch.saturating_add(1);
+    }
+
     fn lookup(&self, key: &CacheKey) -> Option<CachedResult> {
         let Ok(mut cache) = self.cache.lock() else {
             warn!("tool cache lock poisoned during lookup; treating as cache miss");
             return None;
         };
 
-        let hit = cache.entries.get(key).cloned();
+        let hit = cache.entries.get(key).cloned().filter(|entry| {
+            // Entries from a previous compaction epoch are stale —
+            // the evidence they represent is no longer in context.
+            entry.epoch == cache.compaction_epoch
+        });
         if hit.is_some() {
             cache.hits = cache.hits.saturating_add(1);
         } else {
+            // If the entry exists but is stale, remove it to free space
+            if cache.entries.contains_key(key) {
+                if let Some(stale) = cache.entries.remove(key) {
+                    cache.remove_key_from_path_index(key, &stale.indexed_paths);
+                    cache.order.retain(|k| k != key);
+                }
+            }
             cache.misses = cache.misses.saturating_add(1);
         }
 
@@ -367,12 +391,14 @@ impl<T: ToolExecutor> CachingExecutor<T> {
         }
 
         cache.order.push_back(key.clone());
+        let epoch = cache.compaction_epoch;
         cache.entries.insert(
             key,
             CachedResult {
                 output: result.output.clone(),
                 success: result.success,
                 indexed_paths,
+                epoch,
             },
         );
     }

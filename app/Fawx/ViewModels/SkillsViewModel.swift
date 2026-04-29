@@ -215,7 +215,13 @@ final class SkillsViewModel {
                     name: current.name,
                     description: current.description,
                     tools: current.tools,
-                    capabilities: response.capabilities
+                    capabilities: response.capabilities,
+                    version: current.version,
+                    source: current.source,
+                    revisionHash: current.revisionHash,
+                    activatedAtMs: current.activatedAtMs,
+                    signatureStatus: current.signatureStatus,
+                    staleSource: current.staleSource
                 )
             }
 

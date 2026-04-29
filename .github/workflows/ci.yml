@@ -65,7 +65,15 @@ jobs:
         run: cargo test --workspace
 
       - name: Run tests (oauth-bridge feature)
-        run: cargo test -p fx-cli --features oauth-bridge
+        env:
+          # The oauth-bridge feature test links the full fx-cli binary. GitHub's
+          # Linux runner has intermittently crashed lld with SIGBUS on this
+          # target, so force the system C linker for this step.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C linker-features=-lld -C link-self-contained=no
+        run: |
+          cargo clean
+          cargo test -p fx-cli --features oauth-bridge
 
   clippy:
     name: Clippy
@@ -125,4 +133,3 @@ jobs:
 
       - name: Verify workflow cache path safety
         run: ./scripts/spec-tests/tests/ci-workflow-cache-paths-test.sh
-

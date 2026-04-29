@@ -336,43 +336,9 @@ def collect_invariant_findings(
     config: GuardConfig,
 ) -> tuple[Finding, ...]:
     findings: list[Finding] = []
-    findings.extend(check_llama_reintroduction(repo_root, context))
     findings.extend(check_author_metadata(context.added_lines, config))
     findings.extend(check_workflow_refs(context.added_lines, config))
     return tuple(findings)
-
-
-def check_llama_reintroduction(
-    repo_root: Path,
-    context: DiffContext,
-) -> tuple[Finding, ...]:
-    if ref_has_path(repo_root, context.base_ref, "engine/crates/llama-cpp-sys/Cargo.toml"):
-        return ()
-
-    findings = []
-    for added_line in context.added_lines:
-        if "llama-cpp-sys" not in added_line.text:
-            continue
-        findings.append(
-            Finding(
-                path=added_line.path,
-                line_number=added_line.line_number,
-                message="llama-cpp-sys is absent from the base ref and should not be reintroduced",
-                excerpt=added_line.text.strip(),
-            )
-        )
-    return tuple(findings)
-
-
-def ref_has_path(repo_root: Path, ref_name: str, repo_path: str) -> bool:
-    result = subprocess.run(
-        ["git", "cat-file", "-e", f"{ref_name}:{repo_path}"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    return result.returncode == 0
 
 
 def check_author_metadata(

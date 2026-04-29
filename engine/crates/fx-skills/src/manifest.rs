@@ -99,11 +99,10 @@ pub struct SkillSettingsManifest {
     pub fields: Vec<SkillSettingFieldManifest>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SkillSettingFieldManifest {
     pub key: String,
     pub label: String,
-    #[serde(rename = "type")]
     pub field_type: SkillSettingFieldType,
     #[serde(default)]
     pub placeholder: Option<String>,
@@ -119,6 +118,53 @@ pub struct SkillSettingFieldManifest {
     /// for pattern validation because client regex engines may differ.
     #[serde(default)]
     pub pattern: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SkillSettingFieldManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSkillSettingFieldManifest {
+            key: String,
+            label: String,
+            #[serde(default)]
+            field_type: Option<SkillSettingFieldType>,
+            #[serde(default, rename = "type")]
+            legacy_type: Option<SkillSettingFieldType>,
+            #[serde(default)]
+            placeholder: Option<String>,
+            #[serde(default)]
+            help_text: Option<String>,
+            #[serde(default)]
+            required: bool,
+            #[serde(default)]
+            min_length: Option<usize>,
+            #[serde(default)]
+            max_length: Option<usize>,
+            #[serde(default)]
+            pattern: Option<String>,
+        }
+
+        let raw = RawSkillSettingFieldManifest::deserialize(deserializer)?;
+        let field_type = raw
+            .field_type
+            .or(raw.legacy_type)
+            .ok_or_else(|| serde::de::Error::missing_field("field_type"))?;
+
+        Ok(Self {
+            key: raw.key,
+            label: raw.label,
+            field_type,
+            placeholder: raw.placeholder,
+            help_text: raw.help_text,
+            required: raw.required,
+            min_length: raw.min_length,
+            max_length: raw.max_length,
+            pattern: raw.pattern,
+        })
+    }
 }
 
 impl std::fmt::Display for Capability {
@@ -180,6 +226,8 @@ pub struct SkillToolParameterManifest {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub item_type: Option<String>,
     pub description: String,
     #[serde(default)]
     pub required: bool,
@@ -522,6 +570,25 @@ fn validate_tools(tools: &[SkillToolManifest]) -> Result<(), SkillError> {
                     tool.name, parameter.name
                 )));
             }
+            if parameter.kind == "array" {
+                let Some(item_type) = parameter.item_type.as_deref() else {
+                    return Err(SkillError::InvalidManifest(format!(
+                        "tool '{}' parameter '{}' with type 'array' must declare item_type",
+                        tool.name, parameter.name
+                    )));
+                };
+                if item_type.trim().is_empty() {
+                    return Err(SkillError::InvalidManifest(format!(
+                        "tool '{}' parameter '{}' item_type cannot be empty",
+                        tool.name, parameter.name
+                    )));
+                }
+            } else if parameter.item_type.is_some() {
+                return Err(SkillError::InvalidManifest(format!(
+                    "tool '{}' parameter '{}' may only declare item_type when type is 'array'",
+                    tool.name, parameter.name
+                )));
+            }
             if !seen_parameter_names.insert(parameter.name.clone()) {
                 return Err(SkillError::InvalidManifest(format!(
                     "duplicate parameter '{}' in tool '{}'",
@@ -648,7 +715,37 @@ required = true
         assert_eq!(manifest.tools[0].parameters.len(), 1);
         assert_eq!(manifest.tools[0].parameters[0].name, "query");
         assert_eq!(manifest.tools[0].parameters[0].kind, "string");
+        assert_eq!(manifest.tools[0].parameters[0].item_type, None);
         assert!(manifest.tools[0].parameters[0].required);
+    }
+
+    #[test]
+    fn test_parse_manifest_with_array_tool_parameter_item_type() {
+        let toml = r#"
+name = "github"
+version = "1.0.0"
+description = "GitHub skill"
+author = "Fawx Team"
+api_version = "host_api_v1"
+
+[[tools]]
+name = "create_issue"
+description = "Create a GitHub issue"
+
+[[tools.parameters]]
+name = "assignees"
+type = "array"
+item_type = "string"
+description = "Optional list of assignees"
+required = false
+        "#;
+
+        let manifest = parse_manifest(toml).expect("Should parse manifest with array tool param");
+        assert_eq!(manifest.tools[0].parameters[0].kind, "array");
+        assert_eq!(
+            manifest.tools[0].parameters[0].item_type.as_deref(),
+            Some("string")
+        );
     }
 
     #[test]
@@ -684,6 +781,91 @@ help_text = "Enable family-safe results."
             settings.fields[1].field_type,
             SkillSettingFieldType::Boolean
         );
+    }
+
+    #[test]
+    fn test_parse_manifest_accepts_legacy_settings_type_key() {
+        let manifest = parse_manifest(&brave_search_settings_manifest_toml(
+            r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+"#,
+        ))
+        .expect("parse manifest");
+
+        let settings = manifest.settings.expect("settings");
+        assert_eq!(settings.fields[0].field_type, SkillSettingFieldType::Secret);
+    }
+
+    #[test]
+    fn test_parse_manifest_accepts_field_type_key() {
+        let manifest = parse_manifest(&brave_search_settings_manifest_toml(
+            r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+field_type = "secret"
+"#,
+        ))
+        .expect("parse manifest");
+
+        let settings = manifest.settings.expect("settings");
+        assert_eq!(settings.fields[0].field_type, SkillSettingFieldType::Secret);
+    }
+
+    #[test]
+    fn test_parse_manifest_prefers_field_type_over_legacy_type_when_both_exist() {
+        let manifest = parse_manifest(&brave_search_settings_manifest_toml(
+            r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+field_type = "boolean"
+type = "secret"
+"#,
+        ))
+        .expect("parse manifest");
+
+        let settings = manifest.settings.expect("settings");
+        assert_eq!(
+            settings.fields[0].field_type,
+            SkillSettingFieldType::Boolean
+        );
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_settings_field_without_type_key() {
+        let error = parse_manifest(&brave_search_settings_manifest_toml(
+            r#"
+[[settings.fields]]
+key = "api_key"
+label = "API Key"
+"#,
+        ))
+        .expect_err("missing field type should fail");
+
+        assert!(error.to_string().contains("field_type"));
+    }
+
+    #[test]
+    fn test_serialize_settings_field_uses_field_type_key() {
+        let field = SkillSettingFieldManifest {
+            key: "api_key".to_string(),
+            label: "API Key".to_string(),
+            field_type: SkillSettingFieldType::Secret,
+            placeholder: None,
+            help_text: None,
+            required: true,
+            min_length: None,
+            max_length: None,
+            pattern: None,
+        };
+
+        let toml = toml::to_string(&field).expect("serialize field");
+        assert!(toml.contains("field_type = \"secret\""));
+        assert!(!toml.contains("\ntype = "));
     }
 
     #[test]
@@ -1039,6 +1221,7 @@ api_version = "host_api_v1"
                 parameters: vec![SkillToolParameterManifest {
                     name: "location".to_string(),
                     kind: "string".to_string(),
+                    item_type: None,
                     description: "Location".to_string(),
                     required: true,
                 }],
@@ -1496,12 +1679,14 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
                     SkillToolParameterManifest {
                         name: "query".to_string(),
                         kind: "string".to_string(),
+                        item_type: None,
                         description: "Search query".to_string(),
                         required: true,
                     },
                     SkillToolParameterManifest {
                         name: "query".to_string(),
                         kind: "string".to_string(),
+                        item_type: None,
                         description: "Duplicate".to_string(),
                         required: false,
                     },
@@ -1515,6 +1700,76 @@ capabilities = ["network", "storage", "shell", "filesystem", "notifications", "s
         let result = validate_manifest(&manifest);
         assert!(
             matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("duplicate parameter"))
+        );
+    }
+
+    #[test]
+    fn test_validate_array_tool_parameter_requires_item_type() {
+        let manifest = SkillManifest {
+            name: "github".to_string(),
+            version: "1.0.0".to_string(),
+            description: "GitHub".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "create_issue".to_string(),
+                description: "Create issue".to_string(),
+                authority_surface: None,
+                routing: None,
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![SkillToolParameterManifest {
+                    name: "assignees".to_string(),
+                    kind: "array".to_string(),
+                    item_type: None,
+                    description: "Optional assignees".to_string(),
+                    required: false,
+                }],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("must declare item_type"))
+        );
+    }
+
+    #[test]
+    fn test_validate_non_array_tool_parameter_rejects_item_type() {
+        let manifest = SkillManifest {
+            name: "github".to_string(),
+            version: "1.0.0".to_string(),
+            description: "GitHub".to_string(),
+            author: "Fawx".to_string(),
+            api_version: "host_api_v1".to_string(),
+            capabilities: vec![],
+            tools: vec![SkillToolManifest {
+                name: "create_issue".to_string(),
+                description: "Create issue".to_string(),
+                authority_surface: None,
+                routing: None,
+                direct_utility: false,
+                trigger_patterns: vec![],
+                parameters: vec![SkillToolParameterManifest {
+                    name: "title".to_string(),
+                    kind: "string".to_string(),
+                    item_type: Some("string".to_string()),
+                    description: "Issue title".to_string(),
+                    required: true,
+                }],
+            }],
+            intent_hints: vec![],
+            settings: None,
+            entry_point: "run".to_string(),
+        };
+
+        let result = validate_manifest(&manifest);
+        assert!(
+            matches!(result, Err(SkillError::InvalidManifest(message)) if message.contains("may only declare item_type"))
         );
     }
 

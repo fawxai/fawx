@@ -423,6 +423,77 @@ final class ChatViewModelTests: XCTestCase {
     XCTAssertEqual(toolGroups[0].toolCalls[0].result, "docs")
   }
 
+  func testApplyFetchedMessagesReplacesOptimisticAssistantTailWhenServerCompletedToolTurn() {
+    let sut = makeSUT()
+    let localUserMessage = SessionMessage(role: .user, content: "Apply the credential fix", timestamp: 11)
+    let optimisticAssistantMessage = SessionMessage(
+      role: .assistant,
+      content: "Almost there. Want me to apply it?",
+      timestamp: 12
+    )
+    let fetchedUserMessage = SessionMessage(
+      role: .user,
+      content: localUserMessage.content,
+      timestamp: 21
+    )
+    let fetchedAssistantToolMessage = SessionMessage(
+      role: .assistant,
+      contentBlocks: [
+        .toolUse(
+          id: "call_1",
+          name: "edit_file",
+          input: .object(["path": .string("skills/x-skill/src/lib.rs")])
+        )
+      ],
+      timestamp: 22
+    )
+    let fetchedToolResultMessage = SessionMessage(
+      role: .tool,
+      contentBlocks: [
+        .toolResult(toolUseId: "call_1", content: .string("edited"), isError: false)
+      ],
+      timestamp: 23
+    )
+    let fetchedFinalMessage = SessionMessage(
+      role: .assistant,
+      content: "Credential loading now reads from skill settings.",
+      timestamp: 24
+    )
+
+    sut.cacheMessages([localUserMessage, optimisticAssistantMessage], for: "session-a")
+    sut.prepareToDisplaySession("session-a")
+
+    sut.applyFetchedMessagesForTesting(
+      [
+        fetchedUserMessage,
+        fetchedAssistantToolMessage,
+        fetchedToolResultMessage,
+        fetchedFinalMessage,
+      ],
+      sessionID: "session-a"
+    )
+
+    XCTAssertEqual(
+      sut.cachedMessages(for: "session-a")?.map(\.content),
+      [
+        localUserMessage.content,
+        fetchedAssistantToolMessage.content,
+        fetchedToolResultMessage.content,
+        fetchedFinalMessage.content,
+      ]
+    )
+    XCTAssertFalse(
+      sut.transcriptItems
+        .compactMap(\.sessionMessage)
+        .map(\.content)
+        .contains(optimisticAssistantMessage.content)
+    )
+    XCTAssertEqual(
+      sut.transcriptItems.compactMap(\.sessionMessage).last?.content,
+      fetchedFinalMessage.content
+    )
+  }
+
   func testApplyFetchedMessagesKeepsEarlierOptimisticAssistantBeforeLaterMatchedTurn() {
     let sut = makeSUT()
     let initialUserMessage = SessionMessage(role: .user, content: "Inspect the docs", timestamp: 11)
@@ -996,7 +1067,7 @@ final class ChatViewModelTests: XCTestCase {
         .toolUse(
           id: "call-1",
           name: "list_dir",
-          input: .object(["path": .string("/Users/joseph/fawx/app")])
+          input: .object(["path": .string("/Users/fawx/fawx/app")])
         ),
         .text("Historical loose narration after the first tool."),
       ],
@@ -1016,7 +1087,7 @@ final class ChatViewModelTests: XCTestCase {
         .toolUse(
           id: "call-2",
           name: "read_file",
-          input: .object(["path": .string("/Users/joseph/fawx/app/Fawx/ViewModels/ChatViewModel.swift")])
+          input: .object(["path": .string("/Users/fawx/fawx/app/Fawx/ViewModels/ChatViewModel.swift")])
         ),
         .text("Historical loose narration after the second tool."),
       ],
@@ -1060,7 +1131,7 @@ final class ChatViewModelTests: XCTestCase {
         activityID: "round-1",
         id: "call-1",
         name: "list_dir",
-        arguments: #"{"path":"/Users/joseph/fawx/app"}"#
+        arguments: #"{"path":"/Users/fawx/fawx/app"}"#
       ),
       sessionID: sessionID
     )
@@ -1094,7 +1165,7 @@ final class ChatViewModelTests: XCTestCase {
         activityID: "round-2",
         id: "call-2",
         name: "read_file",
-        arguments: #"{"path":"/Users/joseph/fawx/app/Fawx/ViewModels/ChatViewModel.swift"}"#
+        arguments: #"{"path":"/Users/fawx/fawx/app/Fawx/ViewModels/ChatViewModel.swift"}"#
       ),
       sessionID: sessionID
     )

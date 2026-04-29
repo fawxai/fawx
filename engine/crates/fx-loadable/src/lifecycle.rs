@@ -8,6 +8,7 @@ use fx_llm::ToolDefinition;
 use fx_skills::live_host_api::CredentialProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -183,10 +184,20 @@ impl SkillLifecycleManager {
     }
 
     fn load_startup_skill(&mut self, skill_dir: &Path) -> Result<(), LifecycleError> {
-        let skill_name = skill_dir_name(skill_dir)?;
-        if let Some(active) = self.load_existing_activation(skill_dir)? {
-            self.log_loaded_activation(&skill_name, &active.activation);
-            self.active.insert(skill_name.clone(), active);
+        let skill_name = source_skill_name(skill_dir)?;
+        match self.load_existing_activation(skill_dir) {
+            Ok(Some(active)) => {
+                self.log_loaded_activation(&skill_name, &active.activation);
+                self.active.insert(skill_name.clone(), active);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    skill = %skill_name,
+                    error = %error,
+                    "persisted skill activation is unavailable; attempting to stage from source"
+                );
+            }
         }
         self.reconcile_startup_skill(skill_dir, &skill_name)
     }
@@ -195,7 +206,7 @@ impl SkillLifecycleManager {
         &self,
         skill_dir: &Path,
     ) -> Result<Option<ActiveSkill>, LifecycleError> {
-        let skill_name = skill_dir_name(skill_dir)?;
+        let skill_name = source_skill_name(skill_dir)?;
         let Some(activation) = read_activation_record(&self.skills_dir, &skill_name)? else {
             return Ok(None);
         };
@@ -245,9 +256,10 @@ impl SkillLifecycleManager {
             self.credential_provider.clone(),
             &self.signature_policy,
         )?;
-        self.persist_revision_snapshot(skill_dir_name(skill_dir)?.as_str(), &staged)?;
+        let skill_name = staged.skill.name().to_string();
+        self.persist_revision_snapshot(skill_name.as_str(), &staged)?;
         let revision = staged.revision.clone();
-        self.staged.insert(skill_dir_name(skill_dir)?, staged);
+        self.staged.insert(skill_name, staged);
         Ok(revision)
     }
 
@@ -606,6 +618,12 @@ fn read_revision_source(revision_dir: &Path) -> Result<SkillSource, LifecycleErr
     read_json(&path)
 }
 
+#[derive(Debug, Clone)]
+struct SkillSourceDirSummary {
+    name: String,
+    version: String,
+}
+
 fn skill_source_dirs(skills_dir: &Path) -> Result<Vec<PathBuf>, LifecycleError> {
     let entries = match fs::read_dir(skills_dir) {
         Ok(entries) => entries,
@@ -617,7 +635,7 @@ fn skill_source_dirs(skills_dir: &Path) -> Result<Vec<PathBuf>, LifecycleError> 
             ))
         }
     };
-    let mut dirs = Vec::new();
+    let mut candidates: HashMap<String, SkillSourceDirCandidate> = HashMap::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -627,16 +645,124 @@ fn skill_source_dirs(skills_dir: &Path) -> Result<Vec<PathBuf>, LifecycleError> 
             }
         };
         let path = entry.path();
-        if path.is_dir() && !is_lifecycle_dir(&path) {
-            dirs.push(path);
+        if !path.is_dir() || is_lifecycle_dir(&path) {
+            continue;
         }
+
+        let summary = match read_skill_source_summary(&path) {
+            Ok(Some(summary)) => summary,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to read skill source manifest; skipping installed skill source"
+                );
+                continue;
+            }
+        };
+
+        let candidate = SkillSourceDirCandidate {
+            path,
+            manifest_name: summary.name.clone(),
+            version: summary.version,
+        };
+        candidates
+            .entry(summary.name)
+            .and_modify(|current| {
+                if candidate.is_preferred_to(current) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
     }
+
+    let mut dirs = candidates
+        .into_values()
+        .map(|candidate| candidate.path)
+        .collect::<Vec<_>>();
     dirs.sort();
     Ok(dirs)
 }
 
+#[derive(Debug, Clone)]
+struct SkillSourceDirCandidate {
+    path: PathBuf,
+    manifest_name: String,
+    version: String,
+}
+
+impl SkillSourceDirCandidate {
+    fn is_preferred_to(&self, other: &Self) -> bool {
+        // Prefer the canonical directory name first so legacy alias folders do
+        // not silently override the authoritative installed source just because
+        // they carry a higher version. Version ordering only breaks ties among
+        // candidates with the same canonical-vs-legacy priority.
+        let self_is_canonical = source_dir_is_canonical(&self.path, &self.manifest_name);
+        let other_is_canonical = source_dir_is_canonical(&other.path, &other.manifest_name);
+        if self_is_canonical != other_is_canonical {
+            return self_is_canonical;
+        }
+
+        match compare_manifest_versions(&self.version, &other.version) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+
+        self.path < other.path
+    }
+}
+
 fn is_lifecycle_dir(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(LIFECYCLE_DIR)
+}
+
+fn read_skill_source_summary(
+    skill_dir: &Path,
+) -> Result<Option<SkillSourceDirSummary>, LifecycleError> {
+    let manifest_path = skill_dir.join("manifest.toml");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+    let manifest = contents
+        .parse::<toml::Value>()
+        .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
+    let name = manifest
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("{} missing string field 'name'", manifest_path.display()))?
+        .to_string();
+    let version = manifest
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(Some(SkillSourceDirSummary { name, version }))
+}
+
+fn source_dir_is_canonical(path: &Path, manifest_name: &str) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(manifest_name)
+}
+
+fn compare_manifest_versions(lhs: &str, rhs: &str) -> Ordering {
+    match (numeric_version_parts(lhs), numeric_version_parts(rhs)) {
+        (Some(lhs_parts), Some(rhs_parts)) => lhs_parts.cmp(&rhs_parts),
+        _ => lhs.cmp(rhs),
+    }
+}
+
+fn numeric_version_parts(version: &str) -> Option<Vec<u64>> {
+    let parts = version
+        .split('.')
+        .map(str::trim)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn existing_revision_dir(skills_dir: &Path, skill_name: &str, revision: &SkillRevision) -> PathBuf {
@@ -677,6 +803,13 @@ fn skill_dir_name(skill_dir: &Path) -> Result<String, LifecycleError> {
         .and_then(|name| name.to_str())
         .map(ToString::to_string)
         .ok_or_else(|| format!("invalid skill directory: {}", skill_dir.display()))
+}
+
+fn source_skill_name(skill_dir: &Path) -> Result<String, LifecycleError> {
+    match read_skill_source_summary(skill_dir)? {
+        Some(summary) => Ok(summary.name),
+        None => skill_dir_name(skill_dir),
+    }
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LifecycleError> {
@@ -769,6 +902,28 @@ mod tests {
                 .get(key)
                 .map(|value| Zeroizing::new(value.clone()))
         }
+    }
+
+    // Local fixture helper for canonical-vs-legacy source directory resolution
+    // tests. Promote to a shared test utility if another lifecycle module needs
+    // the same alias-directory setup.
+    fn write_test_skill_in_dir(
+        skills_dir: &Path,
+        dir_name: &str,
+        manifest_name: &str,
+        version: &str,
+    ) -> std::io::Result<()> {
+        let skill_dir = skills_dir.join(dir_name);
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(
+            skill_dir.join("manifest.toml"),
+            versioned_manifest_toml(manifest_name, version),
+        )?;
+        fs::write(
+            skill_dir.join(format!("{manifest_name}.wasm")),
+            invocable_wasm_bytes(),
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -955,6 +1110,23 @@ mod tests {
             active.revision.manifest_hash,
             initial.revision.manifest_hash
         );
+    }
+
+    #[test]
+    fn load_startup_skills_prefers_canonical_directory_over_legacy_alias() {
+        let tmp = TempDir::new().expect("tempdir");
+        write_test_skill_in_dir(tmp.path(), "weather", "weather", "1.0.0")
+            .expect("write canonical skill");
+        write_test_skill_in_dir(tmp.path(), "weather-skill", "weather", "2.0.0")
+            .expect("write legacy alias skill");
+
+        let mut manager = new_manager(tmp.path());
+        manager.load_startup_skills().expect("load startup skills");
+
+        let active = manager.active("weather").expect("active weather");
+        assert_eq!(active.revision.version, "1.0.0");
+        assert_eq!(manager.statuses().len(), 1);
+        assert_eq!(manager.statuses()[0].name, "weather");
     }
 
     #[test]

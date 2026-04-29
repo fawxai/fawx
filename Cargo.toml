@@ -28,6 +28,7 @@ members = [
     "engine/crates/fx-improve",
     "engine/crates/fx-transactions",
     "engine/crates/fx-scratchpad",
+    "engine/crates/llama-cpp-sys",
     "engine/crates/fx-preprocess",
     "engine/crates/fawx-ripcord",
     "engine/crates/fx-ripcord",

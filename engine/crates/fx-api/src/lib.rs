@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub(crate) mod audit;
 pub(crate) mod auth_store;
 pub mod bundle;
 pub(crate) mod config_redaction;
@@ -76,6 +77,7 @@ pub struct RunConfig {
     pub port: u16,
     pub http_config: HttpConfig,
     pub data_dir: PathBuf,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     pub telegram: Option<Arc<TelegramChannel>>,
     pub webhook_channels: Vec<Arc<WebhookChannel>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
@@ -172,6 +174,7 @@ pub async fn run(
         ripcord: config.ripcord.clone(),
         fleet_manager: fleet_manager.clone(),
         cron_store: config.cron_store.clone(),
+        credential_store: config.credential_store.clone(),
         experiment_registry,
         improvement_provider: config.improvement_provider.clone(),
         telemetry: default_telemetry(&config.data_dir),

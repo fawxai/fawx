@@ -44,6 +44,8 @@ pub struct ConfigSummary {
     pub max_iterations: u32,
     pub max_history: usize,
     pub memory_enabled: bool,
+    #[serde(default)]
+    pub tool_invocations_remaining: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -14,7 +14,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Fawx Configuration
 
 [general]
 # data_dir = "~/.fawx"
-# max_iterations = 10
+# max_iterations = 20
 # max_history = 20
 # thinking = "adaptive"  # "high" | "low" | "adaptive" | "off"
 
@@ -196,7 +196,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             data_dir: None,
-            max_iterations: 10,
+            max_iterations: 20,
             max_history: 20,
             thinking: None,
         }

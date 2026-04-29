@@ -34,6 +34,7 @@ pub(crate) const DISABLE_TOOL_STRIPPING_AFTER_NUDGE: u16 = u16::MAX;
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u16 = 3;
 const DEFAULT_MAX_CYCLE_FAILURES: u16 = 15;
 const DEFAULT_MAX_NO_PROGRESS: u16 = 3;
+const DEFAULT_EXTERNAL_ACTION_GATE_FAILURE_LIFT_THRESHOLD: u8 = 2;
 #[cfg(test)]
 const DEFAULT_MAX_TOOL_RETRIES: u8 = 2;
 const DEFAULT_SIGNAL_FEEDBACK_LOOKBACK_CYCLES: u8 = 3;
@@ -269,6 +270,11 @@ pub struct TerminationConfig {
     /// through with a warning signal.
     #[serde(default = "default_root_turn_completion_retry_limit")]
     pub root_turn_completion_retry_limit: u8,
+
+    /// Failed attempts at a pending external action before the action gate
+    /// opens wider so the agent can inspect and repair prerequisites.
+    #[serde(default = "default_external_action_gate_failure_lift_threshold")]
+    pub external_action_gate_failure_lift_threshold: u8,
 }
 
 fn default_synthesize_on_exhaustion() -> bool {
@@ -297,6 +303,9 @@ fn default_max_repeated_failure_streak() -> u16 {
 }
 fn default_root_turn_completion_retry_limit() -> u8 {
     2
+}
+fn default_external_action_gate_failure_lift_threshold() -> u8 {
+    DEFAULT_EXTERNAL_ACTION_GATE_FAILURE_LIFT_THRESHOLD
 }
 fn default_signal_feedback_enabled() -> bool {
     true
@@ -335,6 +344,8 @@ impl Default for TerminationConfig {
                 default_observation_only_round_strip_after_nudge(),
             max_repeated_failure_streak: default_max_repeated_failure_streak(),
             root_turn_completion_retry_limit: default_root_turn_completion_retry_limit(),
+            external_action_gate_failure_lift_threshold:
+                default_external_action_gate_failure_lift_threshold(),
         }
     }
 }
@@ -2052,6 +2063,29 @@ mod tests {
         let config: BudgetConfig = serde_json::from_str(json).unwrap();
 
         assert_eq!(config.termination.root_turn_completion_retry_limit, 5);
+    }
+
+    #[test]
+    fn budget_config_deserializes_external_action_gate_failure_lift_threshold() {
+        let json = r#"{
+            "max_llm_calls": 7,
+            "max_tool_invocations": 9,
+            "max_tokens": 1234,
+            "max_cost_cents": 55,
+            "max_wall_time_ms": 123456,
+            "max_recursion_depth": 6,
+            "termination": {
+                "external_action_gate_failure_lift_threshold": 4
+            }
+        }"#;
+        let config: BudgetConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            config
+                .termination
+                .external_action_gate_failure_lift_threshold,
+            4
+        );
     }
 
     #[test]

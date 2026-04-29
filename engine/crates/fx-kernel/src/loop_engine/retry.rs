@@ -17,6 +17,7 @@ pub(super) struct RetryTracker {
     no_progress: HashMap<ToolCallKey, NoProgressState>,
     completed_successes: HashMap<ToolCallKey, CompletedSuccessState>,
     mutation_generation: u64,
+    compaction_epoch: u64,
     mutation_families: HashMap<MutationFamilyKey, MutationFamilyState>,
 }
 
@@ -37,6 +38,7 @@ struct MutationFamilyState {
 struct CompletedSuccessState {
     classification: ToolCallClassification,
     mutation_generation: u64,
+    compaction_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +237,7 @@ impl RetryTracker {
                 ToolCallClassification::Mutation | ToolCallClassification::Orchestration => true,
                 ToolCallClassification::Observation => {
                     state.mutation_generation == self.mutation_generation
+                        && state.compaction_epoch == self.compaction_epoch
                 }
             };
             if duplicate_success {
@@ -274,6 +277,13 @@ impl RetryTracker {
         RetryVerdict::Allow
     }
 
+    /// Called when context compaction fires. Increments the epoch so that
+    /// pre-compaction observation dedup entries no longer block re-reads —
+    /// the evidence they represent is no longer in the conversation.
+    pub(super) fn notify_compaction(&mut self) {
+        self.compaction_epoch = self.compaction_epoch.saturating_add(1);
+    }
+
     pub(super) fn record_results(
         &mut self,
         calls: &[ToolCall],
@@ -308,6 +318,7 @@ impl RetryTracker {
             CompletedSuccessState {
                 classification,
                 mutation_generation: self.mutation_generation,
+                compaction_epoch: self.compaction_epoch,
             },
         );
     }

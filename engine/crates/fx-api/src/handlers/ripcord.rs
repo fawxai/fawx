@@ -217,6 +217,7 @@ mod tests {
             ripcord: Some(journal),
             fleet_manager: None,
             cron_store: None,
+            credential_store: None,
             experiment_registry: {
                 let registry = crate::experiment_registry::ExperimentRegistry::new(
                     std::env::temp_dir().as_path(),

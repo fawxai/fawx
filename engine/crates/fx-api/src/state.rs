@@ -373,6 +373,7 @@ pub struct HttpState {
     pub ripcord: Option<Arc<fx_ripcord::RipcordJournal>>,
     pub fleet_manager: Option<Arc<Mutex<FleetManager>>>,
     pub cron_store: Option<fx_cron::SharedCronStore>,
+    pub credential_store: Option<Arc<fx_auth::credential_store::EncryptedFileCredentialStore>>,
     pub experiment_registry:
         Arc<tokio::sync::Mutex<crate::experiment_registry::ExperimentRegistry>>,
     pub improvement_provider: Option<Arc<dyn fx_llm::CompletionProvider + Send + Sync>>,

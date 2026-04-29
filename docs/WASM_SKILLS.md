@@ -59,6 +59,11 @@ Capabilities are enforced at runtime. Skills cannot access resources they haven'
 
 ## Skill Lifecycle
 
+For the canonical authoring contract used by generated skills and code review,
+including input shape, settings-backed secrets, `kv_get` credential bridging, and
+structured failure requirements, see
+[`docs/specs/wasm-skill-authoring-contract.md`](specs/wasm-skill-authoring-contract.md).
+
 ### Recommended Workflows
 
 - Local dev project: `fawx skill build <project>`
@@ -173,6 +178,21 @@ let failure = StructuredFailure::new(
 let output_json = serde_json::to_string(&failure).unwrap();
 set_output(&output_json);
 ```
+
+Skills that complete external side effects should include structured success
+diagnostics under `__fawx_diagnostics` so the kernel can close the matching
+root-turn contract:
+
+```rust
+use fx_protocol::{ExternalActionEvidence, StructuredToolDiagnostics};
+
+let diagnostics = StructuredToolDiagnostics {
+    external_actions: vec![ExternalActionEvidence::github_pr_comment(Some(comment_url))],
+};
+```
+
+`ExternalActionEvidence` and `StructuredToolDiagnostics` are shared ABI types
+defined in `engine/crates/fx-protocol/src/lib.rs`.
 
 ### Build And Install
 

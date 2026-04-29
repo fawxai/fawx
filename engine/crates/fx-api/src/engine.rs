@@ -167,7 +167,7 @@ pub trait AppEngine: Send + Sync {
     /// Update the thinking level and return the applied value.
     fn set_thinking_level(&mut self, level: &str) -> Result<ThinkingLevelDto, anyhow::Error>;
 
-    /// List loaded skills, descriptions, and their exposed tool names.
+    /// List server-loaded skills, descriptions, and their exposed tool names.
     fn skill_summaries(&self) -> Vec<SkillSummaryDto>;
 
     /// List redacted auth provider configuration status.

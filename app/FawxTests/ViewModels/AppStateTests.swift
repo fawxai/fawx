@@ -816,7 +816,7 @@ final class AppStateTests: XCTestCase {
       <dict>
           <key>ProgramArguments</key>
           <array>
-              <string>/Users/joseph/fawx/target/release/fawx</string>
+              <string>/Users/fawx/fawx/target/release/fawx</string>
               <string>serve</string>
               <string>--port</string>
               <string>8400</string>
@@ -834,7 +834,7 @@ final class AppStateTests: XCTestCase {
       <dict>
           <key>ProgramArguments</key>
           <array>
-              <string>/Users/joseph/fawx/target/release/fawx</string>
+              <string>/Users/fawx/fawx/target/release/fawx</string>
               <string>serve</string>
               <string>--http</string>
               <string>--port</string>
@@ -995,7 +995,7 @@ final class AppStateTests: XCTestCase {
             {
               "id": "ws-general",
               "name": "General",
-              "path": "/Users/joseph/.fawx/general",
+              "path": "/Users/fawx/.fawx/general",
               "kind": "general",
               "repo": null,
               "last_opened_at": 1710000000
@@ -1003,10 +1003,10 @@ final class AppStateTests: XCTestCase {
             {
               "id": "ws-repo",
               "name": "Repository",
-              "path": "/Users/joseph/fawx",
+              "path": "/Users/fawx/fawx",
               "kind": "repository",
               "repo": {
-                "root": "/Users/joseph/fawx",
+                "root": "/Users/fawx/fawx",
                 "vcs": "git",
                 "current_branch": "dev",
                 "default_branch": "main",
@@ -1104,10 +1104,10 @@ final class AppStateTests: XCTestCase {
             {
               "id": "ws-repo",
               "name": "Repository",
-              "path": "/Users/joseph/fawx",
+              "path": "/Users/fawx/fawx",
               "kind": "repository",
               "repo": {
-                "root": "/Users/joseph/fawx",
+                "root": "/Users/fawx/fawx",
                 "vcs": "git",
                 "current_branch": "dev",
                 "default_branch": "main",
@@ -1247,10 +1247,10 @@ final class AppStateTests: XCTestCase {
             {
               "id": "ws-repo",
               "name": "Repository",
-              "path": "/Users/joseph/fawx",
+              "path": "/Users/fawx/fawx",
               "kind": "repository",
               "repo": {
-                "root": "/Users/joseph/fawx",
+                "root": "/Users/fawx/fawx",
                 "vcs": "git",
                 "current_branch": "dev",
                 "default_branch": "main",

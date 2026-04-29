@@ -217,6 +217,7 @@ fn runtime_info_with_routing_tools(
             max_iterations: 3,
             max_history: 20,
             memory_enabled: false,
+            tool_invocations_remaining: 0,
         },
         authority: None,
         version: "test".to_string(),

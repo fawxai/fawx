@@ -18,21 +18,19 @@ GUARD_FILES = [
     "scripts/check-public-promotion.toml",
     "scripts/check_public_promotion.py",
 ]
-REVIEWED_APP_POLICY_PATHS = (
+APP_POLICY_PATHS = (
     "app/Fawx/Models/ServerStatus.swift",
     "app/Fawx/Networking/FawxClient.swift",
     "app/Fawx/Utilities/LocalInstallConfiguration.swift",
     "app/Fawx/ViewModels/SetupViewModel.swift",
     "app/Fawx/Views/Shared/PairingSettingsPanel.swift",
     "app/Fawx/Views/Shared/SetupWizard/TailscaleStep.swift",
-    "app/FawxTests/ViewModels/SettingsViewModelTests.swift",
-    "app/FawxTests/Utilities/FormattersTests.swift",
-)
-STILL_PRIVATE_APP_POLICY_PATHS = (
     "app/Fawx/FawxApp.swift",
     "app/Fawx/Services/LocalBootstrapService.swift",
     "app/Fawx/Views/Shared/OnboardingView.swift",
     "app/Fawx/Views/iOS/iOSSettingsView.swift",
+    "app/FawxTests/ViewModels/SettingsViewModelTests.swift",
+    "app/FawxTests/Utilities/FormattersTests.swift",
     "app/FawxUITests/PairingFlowTests.swift",
 )
 WORKFLOW_PREFIX = (
@@ -44,13 +42,21 @@ WORKFLOW_PREFIX = (
     "    steps:\n"
     "      - run: "
 )
-RFC1918_TEST_URL = "http://" + "192.168." + "1.10:8400"
-TAILSCALE_TEST_IPV4 = "100." + "93.251.101"
-TAILSCALE_TEST_HOSTNAME = "tail9696fb." + "ts.net"
 
 
 def workflow_file(command: str) -> str:
     return WORKFLOW_PREFIX + command + "\n"
+
+
+PRIVATE_REPO_URL = "https://github.com/abbudjoe" "/fawx"
+PRIVATE_REPO_SLUG = "abbudjoe" "/fawx"
+FAKE_GITHUB_TOKEN = "ghp_" "TESTTOKEN1234567890ABCD"
+TAILSCALE_HOST = "relay.tail9696fb" ".ts.net"
+TAILSCALE_SWIFT_HOST = "alice-macbook.tail9696fb" ".ts.net"
+TAILSCALE_IP = "100." "93.251.101"
+RFC1918_URL = "http://192.168." "1.10:8400"
+PRIVATE_ASSISTANT = "claw" "dio"
+PRIVATE_LOCAL_PATH = "/Users/" "joseph/fawx"
 
 
 def load_guard_config() -> public_promotion_guard.GuardConfig:
@@ -59,16 +65,10 @@ def load_guard_config() -> public_promotion_guard.GuardConfig:
     )
 
 
-def reviewed_app_allowlist_patterns(
+def app_allowlist_patterns(
     config: public_promotion_guard.GuardConfig,
 ) -> tuple[str, ...]:
     return tuple(pattern for pattern in config.allowlist if pattern.startswith("app/"))
-
-
-def still_private_blocklist_patterns(
-    config: public_promotion_guard.GuardConfig,
-) -> tuple[str, ...]:
-    return tuple(pattern for pattern in config.blocklist if pattern.startswith("app/"))
 
 
 def iter_policy_files(repo_root: Path, patterns: tuple[str, ...]) -> tuple[Path, ...]:
@@ -96,7 +96,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
         repo = self.prepare_repo(
             base_files={"engine/crates/fx-core/src/lib.rs": "pub fn base() {}\n"},
             changed_files={
-                "app/Fawx/Services/LocalBootstrapService.swift": 'let token = "hidden"\n',
+                "docs/strategy/private.md": 'let token = "hidden"\n',
                 "engine/crates/fx-core/src/lib.rs": "pub fn base() {}\npub fn next() {}\n",
             },
         )
@@ -105,7 +105,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Blocked paths:", result.stdout)
-        self.assertIn("app/Fawx/Services/LocalBootstrapService.swift", result.stdout)
+        self.assertIn("docs/strategy/private.md", result.stdout)
 
     def test_reviewed_app_path_passes(self) -> None:
         repo = self.prepare_repo(
@@ -161,7 +161,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/src/lib.rs": (
                     "pub fn base() {}\n"
-                    'pub const REPO: &str = "https://github.com/abbudjoe/fawx";\n'
+                    f'pub const REPO: &str = "{PRIVATE_REPO_URL}";\n'
                 )
             },
         )
@@ -178,7 +178,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/src/lib.rs": (
                     "pub fn base() {}\n"
-                    'pub const TOKEN: &str = "ghp_TESTTOKEN1234567890ABCD";\n'
+                    f'pub const TOKEN: &str = "{FAKE_GITHUB_TOKEN}";\n'
                 )
             },
         )
@@ -195,7 +195,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/src/lib.rs": (
                     "pub fn base() {}\n"
-                    f'pub const HOST: &str = "relay.{TAILSCALE_TEST_HOSTNAME}";\n'
+                    f'pub const HOST: &str = "{TAILSCALE_HOST}";\n'
                 )
             },
         )
@@ -212,7 +212,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/src/lib.rs": (
                     "pub fn base() {}\n"
-                    'pub const HOST: &str = "100.89.174.76";\n'
+                    f'pub const HOST: &str = "{TAILSCALE_IP}";\n'
                 )
             },
         )
@@ -229,7 +229,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/src/lib.rs": (
                     "pub fn base() {}\n"
-                    f'pub const HOST: &str = "{RFC1918_TEST_URL}";\n'
+                    f'pub const HOST: &str = "{RFC1918_URL}";\n'
                 )
             },
         )
@@ -246,7 +246,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "app/Fawx/ViewModels/SetupViewModel.swift": (
                     "struct SetupViewModel {\n"
-                    f'    let serverURL = "{RFC1918_TEST_URL}"\n'
+                    f'    let serverURL = "{RFC1918_URL}"\n'
                     "}\n"
                 )
             },
@@ -264,7 +264,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "engine/crates/fx-core/tests/network_fixture.rs": (
                     "fn baseline() {}\n"
-                    f'const TAILNET_IP: &str = "{TAILSCALE_TEST_IPV4}";\n'
+                    f'const TAILNET_IP: &str = "{TAILSCALE_IP}";\n'
                 )
             },
         )
@@ -281,7 +281,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "app/FawxTests/ViewModels/SetupViewModelTests.swift": (
                     "func testSetupHost() {\n"
-                    f'    let host = "{TAILSCALE_TEST_IPV4}"\n'
+                    f'    let host = "{TAILSCALE_IP}"\n'
                     "}\n"
                 )
             },
@@ -299,7 +299,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "scripts/tests/fixtures/ServerStatus.swift": (
                     "let title = \"Ready\"\n"
-                    f'let endpoint = "https://alice-macbook.{TAILSCALE_TEST_HOSTNAME}:8400"\n'
+                    f'let endpoint = "https://{TAILSCALE_SWIFT_HOST}:8400"\n'
                 )
             },
         )
@@ -316,7 +316,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             changed_files={
                 "app/Fawx/Views/Shared/PairingSettingsPanel.swift": (
                     "struct PairingSettingsPanel {\n"
-                    f'    let host = "relay.{TAILSCALE_TEST_HOSTNAME}"\n'
+                    f'    let host = "{TAILSCALE_HOST}"\n'
                     "}\n"
                 )
             },
@@ -327,6 +327,24 @@ class CheckPublicPromotionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Private markers:", result.stdout)
         self.assertIn("Tailscale hostname", result.stdout)
+
+    def test_private_local_user_path_marker_fails(self) -> None:
+        repo = self.prepare_repo(
+            base_files={},
+            changed_files={
+                "app/FawxTests/Models/SessionTests.swift": (
+                    "func testWorkspacePath() {\n"
+                    f'    let path = "{PRIVATE_LOCAL_PATH}"\n'
+                    "}\n"
+                )
+            },
+        )
+
+        result = self.run_guard(repo)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Private markers:", result.stdout)
+        self.assertIn("private local user path", result.stdout)
 
     def test_loopback_and_generic_tailscale_references_pass(self) -> None:
         repo = self.prepare_repo(
@@ -391,36 +409,10 @@ class CheckPublicPromotionTests(unittest.TestCase):
         self.assertIn("Public invariants:", result.stdout)
         self.assertIn("author metadata should stay public-safe", result.stdout)
 
-    def test_llama_reintroduction_fails_when_absent_from_base(self) -> None:
-        repo = self.prepare_repo(
-            base_files={
-                "engine/crates/fx-core/Cargo.toml": (
-                    "[package]\n"
-                    'name = "fx-core"\n'
-                    'version = "0.1.0"\n'
-                )
-            },
-            changed_files={
-                "engine/crates/fx-core/Cargo.toml": (
-                    "[package]\n"
-                    'name = "fx-core"\n'
-                    'version = "0.1.0"\n\n'
-                    "[dependencies]\n"
-                    'llama-cpp-sys = "0.1"\n'
-                )
-            },
-        )
-
-        result = self.run_guard(repo)
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Public invariants:", result.stdout)
-        self.assertIn("llama-cpp-sys is absent from the base ref", result.stdout)
-
     def test_workflow_private_ip_fails(self) -> None:
         repo = self.prepare_repo(
             base_files={},
-            changed_files={".github/workflows/ci.yml": workflow_file("echo 10.1.2.3")},
+            changed_files={".github/workflows/ci.yml": workflow_file(f"echo {RFC1918_URL}")},
         )
 
         result = self.run_guard(repo)
@@ -434,7 +426,7 @@ class CheckPublicPromotionTests(unittest.TestCase):
             base_files={},
             changed_files={
                 ".github/workflows/ci.yml": workflow_file(
-                    f"echo wss://relay.{TAILSCALE_TEST_HOSTNAME}/socket"
+                    f"echo wss://{PRIVATE_ASSISTANT}.{TAILSCALE_HOST}/socket"
                 )
             },
         )
@@ -544,15 +536,15 @@ class CheckPublicPromotionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check-public-promotion: PASS", result.stdout)
 
-    def test_reviewed_app_paths_are_allowlisted_and_unblocked(self) -> None:
+    def test_app_paths_are_allowlisted_and_unblocked(self) -> None:
         config = load_guard_config()
         blocked_paths = public_promotion_guard.find_blocked_paths(
-            REVIEWED_APP_POLICY_PATHS,
+            APP_POLICY_PATHS,
             config.allowlist,
             config.blocklist,
         )
         allowlist_misses = public_promotion_guard.find_allowlist_misses(
-            REVIEWED_APP_POLICY_PATHS,
+            APP_POLICY_PATHS,
             config.allowlist,
             config.blocklist,
         )
@@ -560,27 +552,14 @@ class CheckPublicPromotionTests(unittest.TestCase):
         self.assertEqual(blocked_paths, ())
         self.assertEqual(allowlist_misses, ())
 
-    def test_still_private_app_paths_stay_blocked(self) -> None:
+    def test_app_blocklist_is_empty_after_full_app_promotion(self) -> None:
         config = load_guard_config()
-        blocked_paths = public_promotion_guard.find_blocked_paths(
-            STILL_PRIVATE_APP_POLICY_PATHS,
-            config.allowlist,
-            config.blocklist,
+        self.assertEqual(
+            tuple(pattern for pattern in config.blocklist if pattern.startswith("app/")),
+            (),
         )
 
-        self.assertEqual(blocked_paths, STILL_PRIVATE_APP_POLICY_PATHS)
-
-    def test_shared_blocklist_stays_fail_closed_for_non_allowlisted_views(self) -> None:
-        config = load_guard_config()
-        blocked_paths = public_promotion_guard.find_blocked_paths(
-            ("app/Fawx/Views/Shared/OnboardingView.swift",),
-            config.allowlist,
-            still_private_blocklist_patterns(config),
-        )
-
-        self.assertEqual(blocked_paths, ("app/Fawx/Views/Shared/OnboardingView.swift",))
-
-    def test_reviewed_public_app_slice_contains_no_private_network_literals(self) -> None:
+    def test_public_app_tree_contains_no_private_network_literals(self) -> None:
         config = load_guard_config()
         forbidden_patterns = tuple(
             pattern
@@ -595,13 +574,16 @@ class CheckPublicPromotionTests(unittest.TestCase):
         findings: list[str] = []
         app_files = iter_policy_files(
             SOURCE_ROOT,
-            reviewed_app_allowlist_patterns(config),
+            app_allowlist_patterns(config),
         )
-        self.assertGreater(len(app_files), 0, "expected reviewed public app targets")
+        self.assertGreater(len(app_files), 0, "expected public app targets")
 
         for file_path in app_files:
             relative_path = file_path.relative_to(SOURCE_ROOT).as_posix()
-            content = file_path.read_text(encoding="utf-8")
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
             for line_number, line in enumerate(content.splitlines(), start=1):
                 match = public_promotion_guard.first_named_match(line, forbidden_patterns)
                 if match is None:

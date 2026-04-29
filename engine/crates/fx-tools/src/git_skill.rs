@@ -272,9 +272,7 @@ impl GitSkill {
         validate_remote_name(remote)?;
         validate_branch_name(&branch)?;
         self.ensure_push_allowed(&branch)?;
-        let token = self.require_github_token()?;
-        self.run_git_with_token_auth(&["push", remote, &branch], &token, PUSH_TIMEOUT)
-            .await
+        self.run_git_push_with_auth(remote, &branch).await
     }
 
     async fn execute_pr_create(&self, arguments: &str) -> Result<String, String> {
@@ -330,6 +328,49 @@ impl GitSkill {
         })
     }
 
+    fn optional_github_token(&self) -> Option<Zeroizing<String>> {
+        self.github_token.as_ref().and_then(|provider| provider())
+    }
+
+    async fn run_git_push_with_auth(&self, remote: &str, branch: &str) -> Result<String, String> {
+        let args = ["push", remote, branch];
+        match self.run_git_with_ambient_auth(&args, PUSH_TIMEOUT).await {
+            Ok(output) => Ok(output),
+            Err(ambient_error) => {
+                if !is_git_auth_failure(&ambient_error) {
+                    return Err(ambient_error);
+                }
+                let Some(token) = self.optional_github_token() else {
+                    return Err(ambient_error);
+                };
+                self.run_git_with_token_auth(&args, &token, PUSH_TIMEOUT)
+                    .await
+            }
+        }
+    }
+
+    async fn run_git_with_ambient_auth(
+        &self,
+        args: &[&str],
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let working_dir = self.working_dir();
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&working_dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to spawn git: {error}"))?;
+        let output = wait_for_git_output(child, timeout_duration).await?;
+        parse_git_output(output, &working_dir, args)
+    }
+
     async fn run_git_with_token_auth(
         &self,
         args: &[&str],
@@ -358,6 +399,17 @@ impl GitSkill {
         let output = wait_for_git_output(child, timeout_duration).await?;
         parse_git_output(output, &working_dir, args)
     }
+}
+
+fn is_git_auth_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("authentication failed")
+        || lower.contains("invalid username or token")
+        || lower.contains("could not read username")
+        || lower.contains("could not read password")
+        || lower.contains("terminal prompts disabled")
+        || lower.contains("permission denied (publickey)")
+        || lower.contains("repository not found")
 }
 
 #[async_trait]
@@ -1623,14 +1675,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_push_requires_github_token() {
+    async fn git_push_allows_ambient_git_credentials_without_fawx_token() {
         let repo = init_test_repo();
         seed_initial_commit(&repo, "f.txt", "data\n");
+        run_git_ok(&repo, &["checkout", "-b", "dev"]);
+        let remote = init_push_remote(&repo);
         let skill = GitSkill::new(repo.path().to_path_buf(), None, None);
-        let error = run_tool(&skill, "git_push", serde_json::json!({}))
-            .await
-            .expect_err("push without token should fail");
-        assert!(error.contains("GitHub token not configured"));
+
+        run_tool(
+            &skill,
+            "git_push",
+            serde_json::json!({"remote": "origin", "branch": "dev"}),
+        )
+        .await
+        .expect("push should use ambient git credentials before Fawx token fallback");
+
+        let remote_path = remote.path().to_str().expect("utf8 remote path");
+        let output = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                remote_path,
+                "show-ref",
+                "--verify",
+                "refs/heads/dev",
+            ])
+            .output()
+            .expect("verify remote ref");
+        assert!(output.status.success(), "remote dev branch should exist");
+    }
+
+    #[test]
+    fn git_auth_failure_detects_github_credential_errors() {
+        assert!(is_git_auth_failure(
+            "remote: Invalid username or token. Password authentication is not supported"
+        ));
+        assert!(is_git_auth_failure(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+        assert!(!is_git_auth_failure(
+            "error: failed to push some refs to 'origin'"
+        ));
     }
 
     #[tokio::test]

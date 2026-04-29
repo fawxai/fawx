@@ -292,9 +292,13 @@ mod tests {
     fn show_uses_default_config_when_config_file_is_missing() {
         let temp = TempDir::new().expect("tempdir");
         let manager = ConfigManager::new(temp.path()).expect("manager");
+        let expected_max_iterations = format!(
+            "max_iterations = {}",
+            manager.config().general.max_iterations
+        );
         let output = show_config(manager.config()).expect("show defaults");
         assert!(output.contains("[general]"));
-        assert!(output.contains("max_iterations = 10"));
+        assert!(output.contains(&expected_max_iterations));
     }
 
     #[test]

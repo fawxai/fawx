@@ -472,6 +472,10 @@ impl<T: ToolExecutor> ToolExecutor for ProposalGateExecutor<T> {
         self.inner.clear_cache();
     }
 
+    fn notify_compaction(&self) {
+        self.inner.notify_compaction();
+    }
+
     fn cache_stats(&self) -> Option<ToolCacheStats> {
         self.inner.cache_stats()
     }

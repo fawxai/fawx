@@ -44,6 +44,7 @@ use crate::types::{
 use crate::validation::validate_tool_message_sequence;
 
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const WS_NORMAL_CLOSE_PREFIX: &str = "websocket normal close (1000)";
 const WS_POLICY_CLOSE_PREFIX: &str = "websocket policy close (1008)";
 const STREAM_REQUIRED_DETAIL: &str = "Stream must be set to true";
 const OPENAI_RESPONSES_FALLBACK_MODELS: &[&str] = &[
@@ -807,7 +808,9 @@ fn ws_error_message(frame: &Value) -> String {
 
 fn should_retry_http_after_ws_error(error: &LlmError) -> bool {
     matches!(error,
-        LlmError::Provider(message) if message.starts_with(WS_POLICY_CLOSE_PREFIX)
+        LlmError::Provider(message)
+            if message.starts_with(WS_NORMAL_CLOSE_PREFIX)
+                || message.starts_with(WS_POLICY_CLOSE_PREFIX)
     )
 }
 
@@ -819,6 +822,13 @@ fn ws_close_error(frame: Option<CloseFrame>) -> LlmError {
     if frame.code == CloseCode::Policy {
         return LlmError::Provider(format!(
             "{WS_POLICY_CLOSE_PREFIX}: {}",
+            close_reason_or_default(frame.reason.as_ref())
+        ));
+    }
+
+    if frame.code == CloseCode::Normal {
+        return LlmError::Provider(format!(
+            "{WS_NORMAL_CLOSE_PREFIX}: {}",
             close_reason_or_default(frame.reason.as_ref())
         ));
     }
@@ -2600,6 +2610,20 @@ mod tests {
         assert!(matches!(
             error,
             LlmError::Provider(message) if message.contains("1008")
+        ));
+    }
+
+    #[test]
+    fn normal_close_error_is_classified_for_http_retry() {
+        let error = ws_close_error(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        }));
+
+        assert!(should_retry_http_after_ws_error(&error));
+        assert!(matches!(
+            error,
+            LlmError::Provider(message) if message.contains("1000")
         ));
     }
 

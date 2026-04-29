@@ -1,0 +1,1197 @@
+import Observation
+import SwiftUI
+
+struct SkillsView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    @Bindable var skillsViewModel: SkillsViewModel
+    let isActive: Bool
+    let showsHeader: Bool
+    @State private var selectedSection: SkillsSection = .loadedOnServer
+    @State private var searchText = ""
+
+    init(skillsViewModel: SkillsViewModel, isActive: Bool = true, showsHeader: Bool = true) {
+        _skillsViewModel = Bindable(skillsViewModel)
+        self.isActive = isActive
+        self.showsHeader = showsHeader
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingXL) {
+                if showsHeader {
+                    header
+                }
+
+                sectionPicker
+                searchField
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(containerPadding)
+        }
+        .background(Color.fawxBackground)
+        .task(id: isActive) {
+            guard isActive else {
+                return
+            }
+            await skillsViewModel.refresh()
+        }
+        .task(id: "\(isActive)|\(selectedSection == .marketplace ? searchText : "__loaded__")") {
+            guard isActive, selectedSection == .marketplace else {
+                return
+            }
+
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else {
+                return
+            }
+            await skillsViewModel.searchMarketplace(query: searchText)
+        }
+        .refreshable {
+            await skillsViewModel.refresh()
+            if selectedSection == .marketplace {
+                await skillsViewModel.searchMarketplace(query: searchText)
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { skillsViewModel.editingSkill != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        skillsViewModel.cancelEditingPermissions()
+                    }
+                }
+            )
+        ) {
+            if let skill = skillsViewModel.editingSkill {
+                SkillPermissionsEditor(
+                    skill: skill,
+                    selectedCapabilities: skillsViewModel.skillPermissionsDraft,
+                    errorMessage: skillsViewModel.skillPermissionsErrorMessage,
+                    isSaving: skillsViewModel.savingSkillPermissionsName == skill.name,
+                    toggleCapability: { capability, enabled in
+                        skillsViewModel.setCapability(capability, enabled: enabled)
+                    },
+                    saveAction: {
+                        Task {
+                            await skillsViewModel.saveEditingPermissions()
+                        }
+                    },
+                    cancelAction: {
+                        skillsViewModel.cancelEditingPermissions()
+                    }
+                )
+                .fawxOpaqueModalPresentation()
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { skillsViewModel.editingSkillSettings != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        skillsViewModel.cancelEditingSettings()
+                    }
+                }
+            )
+        ) {
+            if let settings = skillsViewModel.editingSkillSettings {
+                SkillSettingsEditor(
+                    settings: settings,
+                    draftValues: skillsViewModel.skillSettingsDraft,
+                    clearedSecretKeys: skillsViewModel.clearedSkillSecretKeys,
+                    errorMessage: skillsViewModel.skillSettingsErrorMessage,
+                    isSaving: skillsViewModel.savingSkillSettingsName == settings.skillName,
+                    updateValue: { key, value in
+                        skillsViewModel.setSkillSettingValue(key, value: value)
+                    },
+                    clearSecret: { key in
+                        skillsViewModel.clearSecretSetting(key)
+                    },
+                    saveAction: {
+                        Task {
+                            await skillsViewModel.saveEditingSettings()
+                        }
+                    },
+                    cancelAction: {
+                        skillsViewModel.cancelEditingSettings()
+                    }
+                )
+                .fawxOpaqueModalPresentation()
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+            Text("Skills")
+                .font(FawxTypography.heading1)
+                .foregroundStyle(Color.fawxText)
+
+            Text(selectedSection.subtitle)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+    }
+
+    private var sectionPicker: some View {
+        Picker("Skill source", selection: $selectedSection) {
+            ForEach(SkillsSection.allCases, id: \.self) { section in
+                Text(section.title).tag(section)
+            }
+        }
+        .pickerStyle(.segmented)
+        .tint(.fawxAccent)
+        .accessibilityLabel("Skill source")
+    }
+
+    private var searchField: some View {
+        HStack(spacing: FawxSpacing.paddingSM) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Color.fawxTextSecondary)
+
+            TextField(searchPrompt, text: $searchText)
+                .textFieldStyle(.plain)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxText)
+                .accessibilityIdentifier("skillsSearchField")
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, FawxSpacing.paddingMD)
+        .padding(.vertical, FawxSpacing.paddingSM)
+        .fawxSurface(.field)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch selectedSection {
+        case .loadedOnServer:
+            loadedSkillsContent
+        case .builtInTools:
+            builtInToolsContent
+        case .marketplace:
+            MarketplaceView(skillsViewModel: skillsViewModel, searchText: searchText)
+        }
+    }
+
+    @ViewBuilder
+    private var loadedSkillsContent: some View {
+        if skillsViewModel.isLoading && skillsViewModel.skills.isEmpty {
+            ProgressView("Loading skills...")
+                .foregroundStyle(Color.fawxTextSecondary)
+                .frame(maxWidth: .infinity, minHeight: 280)
+        } else if let errorMessage = skillsViewModel.errorMessage, skillsViewModel.skills.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "exclamationmark.triangle",
+                title: "Could not load skills",
+                message: errorMessage,
+                actionTitle: "Try Again",
+                action: {
+                    Task {
+                        await skillsViewModel.refresh()
+                    }
+                }
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else if installableSkills.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "puzzlepiece.extension",
+                title: LoadedSkillsCopy.serverLoaded.emptyTitle,
+                message: LoadedSkillsCopy.serverLoaded.emptyMessage
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else if filteredInstallableSkills.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "magnifyingglass",
+                title: "No matching skills",
+                message: "Try a different search term."
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else {
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                if !showsHeader {
+                    Text(LoadedSkillsCopy.serverLoaded.subtitle)
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+
+                LazyVGrid(columns: gridColumns, spacing: FawxSpacing.paddingMD) {
+                    ForEach(filteredInstallableSkills) { skill in
+                        SkillCardView(
+                            skill: skill,
+                            state: SkillCardState(
+                                isRemoving: skillsViewModel.removingSkillNames.contains(skill.name),
+                                isLoadingSettings: skillsViewModel.loadingSkillSettingsName == skill.name,
+                                isSavingSettings: skillsViewModel.savingSkillSettingsName == skill.name,
+                                isSavingPermissions: skillsViewModel.savingSkillPermissionsName == skill.name
+                            ),
+                            actions: SkillCardActions(
+                                editSettings: {
+                                    Task {
+                                        await skillsViewModel.beginEditingSettings(for: skill)
+                                    }
+                                },
+                                editPermissions: {
+                                    skillsViewModel.beginEditingPermissions(for: skill)
+                                },
+                                remove: {
+                                    Task {
+                                        await skillsViewModel.removeInstalledSkill(named: skill.name)
+                                    }
+                                }
+                            )
+                        )
+                    }
+                }
+                .accessibilityIdentifier("skillsGrid")
+                .accessibilityElement(children: .contain)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var builtInToolsContent: some View {
+        if skillsViewModel.isLoading && skillsViewModel.skills.isEmpty {
+            ProgressView("Loading built-in tools...")
+                .foregroundStyle(Color.fawxTextSecondary)
+                .frame(maxWidth: .infinity, minHeight: 280)
+        } else if let errorMessage = skillsViewModel.errorMessage, skillsViewModel.skills.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "exclamationmark.triangle",
+                title: "Could not load built-in tools",
+                message: errorMessage,
+                actionTitle: "Try Again",
+                action: {
+                    Task {
+                        await skillsViewModel.refresh()
+                    }
+                }
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else if builtInTools.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "hammer",
+                title: BuiltInToolsCopy.serverLoaded.emptyTitle,
+                message: BuiltInToolsCopy.serverLoaded.emptyMessage
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else if filteredBuiltInTools.isEmpty {
+            SkillsPlaceholderView(
+                systemImage: "magnifyingglass",
+                title: "No matching built-in tools",
+                message: "Try a different search term."
+            )
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else {
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                if !showsHeader {
+                    Text(BuiltInToolsCopy.serverLoaded.subtitle)
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+
+                LazyVGrid(columns: gridColumns, spacing: FawxSpacing.paddingMD) {
+                    ForEach(filteredBuiltInTools) { skill in
+                        BuiltInToolCardView(skill: skill)
+                    }
+                }
+                .accessibilityIdentifier("builtInToolsGrid")
+                .accessibilityElement(children: .contain)
+            }
+        }
+    }
+
+    private var installableSkills: [SkillSummary] {
+        skillsViewModel.skills.filter(\.isInstallableSkill)
+    }
+
+    private var builtInTools: [SkillSummary] {
+        skillsViewModel.skills.filter(\.isBuiltin)
+    }
+
+    private var filteredInstallableSkills: [SkillSummary] {
+        filtered(skills: installableSkills)
+    }
+
+    private var filteredBuiltInTools: [SkillSummary] {
+        filtered(skills: builtInTools)
+    }
+
+    private func filtered(skills: [SkillSummary]) -> [SkillSummary] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.isEmpty == false else {
+            return skills
+        }
+
+        let normalizedQuery = query.localizedLowercase
+        return skills.filter { skill in
+            let haystacks = [
+                skill.name,
+                skill.displayName,
+                skill.displayDescription ?? "",
+                skill.tools.joined(separator: " "),
+                skill.capabilities.joined(separator: " "),
+            ]
+
+            return haystacks.contains { value in
+                value.localizedLowercase.contains(normalizedQuery)
+            }
+        }
+    }
+
+    private var searchPrompt: String {
+        switch selectedSection {
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.searchPrompt
+        case .builtInTools:
+            BuiltInToolsCopy.serverLoaded.searchPrompt
+        case .marketplace:
+            "Search marketplace skills"
+        }
+    }
+
+    private var gridColumns: [GridItem] {
+#if os(macOS)
+        return [
+            GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingMD),
+            GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingMD),
+        ]
+#else
+        if horizontalSizeClass == .regular {
+            return [
+                GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingMD),
+                GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingMD),
+            ]
+        }
+        return [GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingMD)]
+#endif
+    }
+
+    private var containerPadding: CGFloat {
+        FawxSpacing.paddingLG
+    }
+}
+
+private struct SkillCardState {
+    let isRemoving: Bool
+    let isLoadingSettings: Bool
+    let isSavingSettings: Bool
+    let isSavingPermissions: Bool
+}
+
+private struct SkillCardActions {
+    let editSettings: () -> Void
+    let editPermissions: () -> Void
+    let remove: () -> Void
+}
+
+private struct SkillCardView: View {
+    let skill: SkillSummary
+    let state: SkillCardState
+    let actions: SkillCardActions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+            HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+                RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                    .fill(Color.fawxAccentSubtle)
+                    .frame(width: 32, height: 32)
+                    .overlay {
+                        Image(systemName: "puzzlepiece.extension.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.fawxAccent)
+                    }
+
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                    Text(skill.displayName)
+                        .font(FawxTypography.heading2)
+                        .foregroundStyle(Color.fawxText)
+                        .lineLimit(1)
+
+                    SkillStatusPill(
+                        label: skill.loadedStatusLabel,
+                        tone: skill.hasStaleSource ? .warning : .loaded
+                    )
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Text(skill.displayDescription ?? "\(skill.tools.count) tools available on this server.")
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let staleSourceMessage = skill.staleSourceMessage {
+                Text(staleSourceMessage)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxWarning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: FawxSpacing.paddingSM) {
+                Label("\(skill.tools.count) tools", systemImage: "wrench.and.screwdriver")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+
+                Spacer(minLength: 0)
+            }
+
+            FlowLayout(spacing: FawxSpacing.paddingXS) {
+                ForEach(previewTools, id: \.self) { tool in
+                    ToolChip(label: tool)
+                }
+
+                if remainingToolCount > 0 {
+                    ToolChip(label: "+\(remainingToolCount) more")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                Text("Permissions")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+
+                if skill.capabilities.isEmpty {
+                    Text("No extra permissions requested.")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                } else {
+                    FlowLayout(spacing: FawxSpacing.paddingXS) {
+                        ForEach(skill.capabilities, id: \.self) { capability in
+                            PermissionChip(label: humanizedCapability(capability), tone: .neutral)
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Button(state.isLoadingSettings ? "Loading..." : (state.isSavingSettings ? "Saving..." : "Settings")) {
+                    actions.editSettings()
+                }
+                .buttonStyle(.bordered)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
+
+                Button(state.isSavingPermissions ? "Saving..." : "Edit Permissions") {
+                    actions.editPermissions()
+                }
+                .buttonStyle(.bordered)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
+
+                Spacer(minLength: 0)
+
+                SkillStatusPill(
+                    label: skill.loadedStatusLabel,
+                    tone: skill.hasStaleSource ? .warning : .loaded
+                )
+
+                Spacer(minLength: 0)
+
+                Button(state.isRemoving ? "Removing..." : "Remove", role: .destructive) {
+                    actions.remove()
+                }
+                .buttonStyle(.bordered)
+                .disabled(state.isRemoving || state.isSavingPermissions || state.isLoadingSettings || state.isSavingSettings)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(FawxSpacing.paddingLG)
+        .fawxSurface(.field)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("skillCard_\(skill.name)")
+    }
+
+    private var previewTools: [String] {
+        Array(skill.tools.prefix(4))
+    }
+
+    private var remainingToolCount: Int {
+        max(skill.tools.count - previewTools.count, 0)
+    }
+
+}
+
+private struct BuiltInToolCardView: View {
+    let skill: SkillSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+            HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+                RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius)
+                    .fill(Color.fawxSurfaceActive.opacity(FawxOpacity.surfaceMuted))
+                    .frame(width: 32, height: 32)
+                    .overlay {
+                        Image(systemName: "hammer.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                    Text(skill.displayName)
+                        .font(FawxTypography.heading2)
+                        .foregroundStyle(Color.fawxText)
+                        .lineLimit(1)
+
+                    SkillStatusPill(label: "Built-in", tone: .inactive)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Text(skill.displayDescription ?? "\(skill.tools.count) native tools available on this server.")
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: FawxSpacing.paddingSM) {
+                Label("\(skill.tools.count) tools", systemImage: "wrench.and.screwdriver")
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+
+                Spacer(minLength: 0)
+            }
+
+            FlowLayout(spacing: FawxSpacing.paddingXS) {
+                ForEach(previewTools, id: \.self) { tool in
+                    ToolChip(label: tool)
+                }
+
+                if remainingToolCount > 0 {
+                    ToolChip(label: "+\(remainingToolCount) more")
+                }
+            }
+
+            Text("Native tools are bundled with Fawx and cannot be installed, removed, or edited from Skills.")
+                .font(FawxTypography.status)
+                .foregroundStyle(Color.fawxTextSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(FawxSpacing.paddingLG)
+        .fawxSurface(.field)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("builtInToolCard_\(skill.name)")
+    }
+
+    private var previewTools: [String] {
+        Array(skill.tools.prefix(4))
+    }
+
+    private var remainingToolCount: Int {
+        max(skill.tools.count - previewTools.count, 0)
+    }
+}
+
+struct LoadedSkillsCopy: Equatable {
+    let sectionTitle: String
+    let subtitle: String
+    let searchPrompt: String
+    let emptyTitle: String
+    let emptyMessage: String
+    let statusLabel: String
+
+    static let serverLoaded = Self(
+        sectionTitle: "Installed",
+        subtitle: "Installed skills",
+        searchPrompt: "Search installed skills",
+        emptyTitle: "No installed skills",
+        emptyMessage: "Install skills from Marketplace. Built-in tools now live in their own view.",
+        statusLabel: "Installed"
+    )
+}
+
+struct BuiltInToolsCopy: Equatable {
+    let sectionTitle: String
+    let subtitle: String
+    let searchPrompt: String
+    let emptyTitle: String
+    let emptyMessage: String
+
+    static let serverLoaded = Self(
+        sectionTitle: "Built-in",
+        subtitle: "Native tools bundled with Fawx",
+        searchPrompt: "Search built-in tools",
+        emptyTitle: "No built-in tools reported",
+        emptyMessage: "Built-in tools appear here when the running Fawx server reports source = builtin via /v1/skills."
+    )
+}
+
+enum SkillsSection: CaseIterable {
+    case loadedOnServer
+    case builtInTools
+    case marketplace
+
+    var title: String {
+        switch self {
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.sectionTitle
+        case .builtInTools:
+            BuiltInToolsCopy.serverLoaded.sectionTitle
+        case .marketplace:
+            "Marketplace"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .loadedOnServer:
+            LoadedSkillsCopy.serverLoaded.subtitle
+        case .builtInTools:
+            BuiltInToolsCopy.serverLoaded.subtitle
+        case .marketplace:
+            "Signed marketplace skills"
+        }
+    }
+}
+
+private struct SkillStatusPill: View {
+    enum Tone {
+        case loaded
+        case inactive
+        case warning
+    }
+
+    let label: String
+    let tone: Tone
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, FawxSpacing.paddingSM)
+            .padding(.vertical, 5)
+            .background(foregroundColor.opacity(0.12))
+            .clipShape(Capsule())
+    }
+
+    private var foregroundColor: Color {
+        switch tone {
+        case .loaded:
+            Color.fawxSuccess
+        case .inactive:
+            Color.fawxTextSecondary
+        case .warning:
+            Color.fawxWarning
+        }
+    }
+}
+
+private struct ToolChip: View {
+    let label: String
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 11, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.fawxTextSecondary)
+            .padding(.horizontal, FawxSpacing.paddingSM)
+            .padding(.vertical, 6)
+            .background(Color.fawxSurface)
+            .clipShape(Capsule())
+    }
+}
+
+private struct PermissionChip: View {
+    enum Tone {
+        case neutral
+        case warning
+    }
+
+    let label: String
+    let tone: Tone
+
+    private var foregroundColor: Color {
+        switch tone {
+        case .neutral:
+            return Color.fawxTextSecondary
+        case .warning:
+            return Color.fawxWarning
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch tone {
+        case .neutral:
+            return Color.fawxSurfaceActive
+        case .warning:
+            return Color.fawxWarning.opacity(0.12)
+        }
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, FawxSpacing.paddingSM)
+            .padding(.vertical, 6)
+            .background(backgroundColor)
+            .clipShape(Capsule())
+    }
+}
+
+private func humanizedCapability(_ rawValue: String) -> String {
+    rawValue
+        .replacingOccurrences(of: "_", with: " ")
+        .replacingOccurrences(of: "-", with: " ")
+        .localizedCapitalized
+}
+
+private struct FlowLayout: Layout {
+    let spacing: CGFloat
+
+    init(spacing: CGFloat) {
+        self.spacing = spacing
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var currentLineHeight: CGFloat = 0
+        var requiredWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > maxWidth, currentX > 0 {
+                currentX = 0
+                currentY += currentLineHeight + spacing
+                currentLineHeight = 0
+            }
+
+            requiredWidth = max(requiredWidth, currentX + size.width)
+            currentLineHeight = max(currentLineHeight, size.height)
+            currentX += size.width + spacing
+        }
+
+        return CGSize(
+            width: requiredWidth,
+            height: currentY + currentLineHeight
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var currentLineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > bounds.maxX, currentX > bounds.minX {
+                currentX = bounds.minX
+                currentY += currentLineHeight + spacing
+                currentLineHeight = 0
+            }
+
+            subview.place(
+                at: CGPoint(x: currentX, y: currentY),
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+
+            currentX += size.width + spacing
+            currentLineHeight = max(currentLineHeight, size.height)
+        }
+    }
+}
+
+struct SkillsPlaceholderView: View {
+    let systemImage: String
+    let title: String
+    let message: String
+    var actionTitle: String?
+    var action: (() -> Void)?
+
+    var body: some View {
+        VStack(spacing: FawxSpacing.paddingMD) {
+            Image(systemName: systemImage)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(Color.fawxAccent.opacity(0.35))
+
+            Text(title)
+                .font(FawxTypography.heading2)
+                .foregroundStyle(Color.fawxText)
+
+            Text(message)
+                .font(FawxTypography.chatBody)
+                .foregroundStyle(Color.fawxTextSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct SkillPermissionsEditor: View {
+    let skill: SkillSummary
+    let selectedCapabilities: Set<String>
+    let errorMessage: String?
+    let isSaving: Bool
+    let toggleCapability: (String, Bool) -> Void
+    let saveAction: () -> Void
+    let cancelAction: () -> Void
+
+    private let editableCapabilities = SkillCapabilityOption.allCases
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        Text(skill.name)
+                            .font(FawxTypography.heading1)
+                            .foregroundStyle(Color.fawxText)
+
+                        Text("Choose what this skill is allowed to access. These changes update the installed manifest and require a server restart to affect the running skill.")
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                    LazyVGrid(columns: capabilityColumns, alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        ForEach(editableCapabilities) { capability in
+                            SkillCapabilityRow(
+                                option: capability,
+                                isEnabled: selectedCapabilities.contains(capability.rawValue)
+                            ) { enabled in
+                                toggleCapability(capability.rawValue, enabled)
+                            }
+                        }
+                    }
+
+                    if !skill.unsupportedCapabilities.isEmpty {
+                        VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                            Text("Unsupported in-app permissions")
+                                .font(FawxTypography.sidebarTitle)
+                                .foregroundStyle(Color.fawxWarning)
+
+                            Text("This skill also declares advanced permissions that still need CLI editing.")
+                                .font(FawxTypography.chatBody)
+                                .foregroundStyle(Color.fawxTextSecondary)
+
+                            FlowLayout(spacing: FawxSpacing.paddingXS) {
+                                ForEach(skill.unsupportedCapabilities, id: \.self) { capability in
+                                    PermissionChip(label: humanizedCapability(capability), tone: .warning)
+                                }
+                            }
+                        }
+                        .padding(FawxSpacing.paddingMD)
+                        .background(Color.fawxWarning.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: FawxSpacing.cornerRadius))
+                    }
+
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxError)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(FawxSpacing.paddingLG)
+            }
+            .background(Color.fawxBackground)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: cancelAction)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "Saving..." : "Save", action: saveAction)
+                        .disabled(isSaving)
+                }
+            }
+        }
+#if os(macOS)
+        .frame(width: 640, height: 620)
+#endif
+#if os(iOS)
+        .presentationDetents([.medium, .large])
+#endif
+    }
+
+    private var capabilityColumns: [GridItem] {
+#if os(macOS)
+        [
+            GridItem(.flexible(minimum: 180), spacing: FawxSpacing.paddingSM),
+            GridItem(.flexible(minimum: 180), spacing: FawxSpacing.paddingSM),
+        ]
+#else
+        [GridItem(.flexible(minimum: 240), spacing: FawxSpacing.paddingSM)]
+#endif
+    }
+}
+
+private struct SkillSettingsEditor: View {
+    let settings: SkillSettingsResponse
+    let draftValues: [String: String]
+    let clearedSecretKeys: Set<String>
+    let errorMessage: String?
+    let isSaving: Bool
+    let updateValue: (String, String) -> Void
+    let clearSecret: (String) -> Void
+    let saveAction: () -> Void
+    let cancelAction: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingLG) {
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                        Text(settings.skillName)
+                            .font(FawxTypography.heading1)
+                            .foregroundStyle(Color.fawxText)
+
+                        Text("These values are stored on the server and applied immediately to future skill runs. Secret values stay encrypted and are never shown back in full.")
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxTextSecondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: FawxSpacing.paddingMD) {
+                        ForEach(settings.schema.fields) { field in
+                            settingRow(for: field)
+                        }
+                    }
+
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(FawxTypography.chatBody)
+                            .foregroundStyle(Color.fawxError)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(FawxSpacing.paddingLG)
+            }
+            .background(Color.fawxBackground)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: cancelAction)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "Saving..." : "Save", action: saveAction)
+                        .disabled(isSaving)
+                }
+            }
+        }
+#if os(macOS)
+        .frame(width: 620, height: 620)
+#endif
+#if os(iOS)
+        .presentationDetents([.medium, .large])
+#endif
+    }
+
+    @ViewBuilder
+    private func settingRow(for field: SkillSettingsField) -> some View {
+        VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+            HStack(alignment: .firstTextBaseline, spacing: FawxSpacing.paddingSM) {
+                Text(field.label)
+                    .font(FawxTypography.sidebarTitle)
+                    .foregroundStyle(Color.fawxText)
+
+                if field.required {
+                    Text("Required")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxWarning)
+                }
+
+                if field.fieldType == .secret, isExistingSecretConfigured(for: field) {
+                    Text("Stored")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxSuccess)
+                }
+            }
+
+            if let helpText = field.helpText?.nonEmpty {
+                Text(helpText)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+            }
+
+            switch field.fieldType {
+            case .text:
+                TextField(
+                    field.placeholder ?? field.label,
+                    text: Binding(
+                        get: { draftValues[field.key] ?? "" },
+                        set: { updateValue(field.key, $0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+
+            case .secret:
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingSM) {
+                    SecureField(
+                        field.placeholder ?? "Enter a new value",
+                        text: Binding(
+                            get: { draftValues[field.key] ?? "" },
+                            set: { updateValue(field.key, $0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack(spacing: FawxSpacing.paddingSM) {
+                        Text(secretHint(for: field))
+                            .font(FawxTypography.status)
+                            .foregroundStyle(Color.fawxTextSecondary)
+
+                        Spacer(minLength: 0)
+
+                        if isExistingSecretConfigured(for: field) {
+                            Button("Clear") {
+                                clearSecret(field.key)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+
+            case .boolean:
+                Toggle(
+                    isOn: Binding(
+                        get: { (draftValues[field.key] ?? "false") == "true" },
+                        set: { updateValue(field.key, $0 ? "true" : "false") }
+                    )
+                ) {
+                    Text("Enabled")
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxText)
+                }
+                .toggleStyle(.switch)
+                .tint(.fawxAccent)
+
+            case .unknown(let rawType):
+                VStack(alignment: .leading, spacing: FawxSpacing.paddingXS) {
+                    Text("Update Fawx to edit this field.")
+                        .font(FawxTypography.chatBody)
+                        .foregroundStyle(Color.fawxText)
+
+                    Text("Unsupported setting type: \(rawType)")
+                        .font(FawxTypography.status)
+                        .foregroundStyle(Color.fawxTextSecondary)
+                }
+            }
+        }
+        .padding(FawxSpacing.paddingMD)
+        .fawxSurface(.field)
+    }
+
+    private func isExistingSecretConfigured(for field: SkillSettingsField) -> Bool {
+        guard field.fieldType == .secret else {
+            return false
+        }
+
+        return settings.values.first(where: { $0.key == field.key })?.isConfigured == true
+            && !clearedSecretKeys.contains(field.key)
+    }
+
+    private func secretHint(for field: SkillSettingsField) -> String {
+        if clearedSecretKeys.contains(field.key) {
+            return "This secret will be removed when you save."
+        }
+        if isExistingSecretConfigured(for: field) {
+            return "Leave blank to keep the current secret."
+        }
+        return "This secret is stored encrypted on the server."
+    }
+}
+
+private struct SkillCapabilityRow: View {
+    let option: SkillCapabilityOption
+    let isEnabled: Bool
+    let setEnabled: (Bool) -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: FawxSpacing.paddingMD) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(option.title)
+                    .font(FawxTypography.chatBody)
+                    .foregroundStyle(Color.fawxText)
+
+                Text(option.description)
+                    .font(FawxTypography.status)
+                    .foregroundStyle(Color.fawxTextSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { isEnabled },
+                    set: { newValue in
+                        setEnabled(newValue)
+                    }
+                )
+            )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(.fawxAccent)
+        }
+        .frame(maxWidth: .infinity, minHeight: 88, alignment: .topLeading)
+        .padding(FawxSpacing.paddingMD)
+        .fawxSurface(.field)
+    }
+}
+
+private enum SkillCapabilityOption: String, CaseIterable, Identifiable {
+    case network
+    case storage
+    case notifications
+    case sensors
+    case phoneActions = "phone_actions"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .network:
+            "Network"
+        case .storage:
+            "Storage"
+        case .notifications:
+            "Notifications"
+        case .sensors:
+            "Sensors"
+        case .phoneActions:
+            "Phone Actions"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .network:
+            "Allow outbound web requests and API calls."
+        case .storage:
+            "Allow persistent local storage owned by the skill."
+        case .notifications:
+            "Allow posting local notifications."
+        case .sensors:
+            "Allow reading device sensor data."
+        case .phoneActions:
+            "Allow privileged phone actions such as calling or messaging."
+        }
+    }
+}

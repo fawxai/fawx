@@ -1,15 +1,18 @@
 use std::path::{Path, PathBuf};
 
 use crate::skill_manifests::{
-    load_skill_settings, update_skill_capabilities, update_skill_settings,
-    ResolvedSkillSettingValue, ResolvedSkillSettings, SkillManifestError, SkillSettingUpdate,
+    load_skill_settings, load_skill_settings_with_store, update_skill_capabilities,
+    update_skill_settings, update_skill_settings_with_store, ResolvedSkillSettingValue,
+    ResolvedSkillSettings, SkillManifestError, SkillSettingUpdate,
 };
 use crate::state::HttpState;
 use crate::types::ErrorBody;
 use axum::extract::{Json, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use fx_marketplace::{InstallResult, MarketplaceError, SkillEntry};
-use fx_skills::manifest::SkillSettingsManifest;
+use fx_skills::manifest::{
+    SkillSettingFieldManifest, SkillSettingFieldType, SkillSettingsManifest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -76,9 +79,29 @@ pub struct SkillSettingValueResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SkillSettingsSchemaResponse {
+    pub version: u32,
+    pub fields: Vec<SkillSettingsFieldResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SkillSettingsFieldResponse {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "field_type")]
+    pub field_type: SkillSettingFieldType,
+    pub placeholder: Option<String>,
+    pub help_text: Option<String>,
+    pub required: bool,
+    pub min_length: Option<usize>,
+    pub max_length: Option<usize>,
+    pub pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SkillSettingsResponse {
     pub skill_name: String,
-    pub schema: SkillSettingsManifest,
+    pub schema: SkillSettingsSchemaResponse,
     pub values: Vec<SkillSettingValueResponse>,
 }
 
@@ -150,16 +173,20 @@ pub async fn handle_get_skill_settings(
     State(state): State<HttpState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<SkillSettingsResponse>, (StatusCode, Json<ErrorBody>)> {
-    let settings = load_skill_settings(&state.data_dir, &name)
-        .map_err(skill_manifest_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: format!("Skill '{name}' does not declare any settings"),
-                }),
-            )
-        })?;
+    let settings = (if let Some(store) = state.credential_store.as_deref() {
+        load_skill_settings_with_store(&state.data_dir, &name, store)
+    } else {
+        load_skill_settings(&state.data_dir, &name)
+    })
+    .map_err(skill_manifest_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("Skill '{name}' does not declare any settings"),
+            }),
+        )
+    })?;
 
     Ok(Json(SkillSettingsResponse::from(settings)))
 }
@@ -169,18 +196,19 @@ pub async fn handle_update_skill_settings(
     AxumPath(name): AxumPath<String>,
     Json(request): Json<UpdateSkillSettingsRequest>,
 ) -> Result<Json<UpdateSkillSettingsResponse>, (StatusCode, Json<ErrorBody>)> {
-    let settings = update_skill_settings(
-        &state.data_dir,
-        &name,
-        &request
-            .values
-            .into_iter()
-            .map(|value| SkillSettingUpdate {
-                key: value.key,
-                value: value.value,
-            })
-            .collect::<Vec<_>>(),
-    )
+    let updates = request
+        .values
+        .into_iter()
+        .map(|value| SkillSettingUpdate {
+            key: value.key,
+            value: value.value,
+        })
+        .collect::<Vec<_>>();
+    let settings = (if let Some(store) = state.credential_store.as_deref() {
+        update_skill_settings_with_store(&state.data_dir, &name, &updates, store)
+    } else {
+        update_skill_settings(&state.data_dir, &name, &updates)
+    })
     .map_err(skill_manifest_error)?;
 
     Ok(Json(UpdateSkillSettingsResponse {
@@ -326,11 +354,36 @@ impl From<ResolvedSkillSettingValue> for SkillSettingValueResponse {
     }
 }
 
+impl From<SkillSettingsManifest> for SkillSettingsSchemaResponse {
+    fn from(schema: SkillSettingsManifest) -> Self {
+        Self {
+            version: schema.version,
+            fields: schema.fields.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<SkillSettingFieldManifest> for SkillSettingsFieldResponse {
+    fn from(field: SkillSettingFieldManifest) -> Self {
+        Self {
+            key: field.key,
+            label: field.label,
+            field_type: field.field_type,
+            placeholder: field.placeholder,
+            help_text: field.help_text,
+            required: field.required,
+            min_length: field.min_length,
+            max_length: field.max_length,
+            pattern: field.pattern,
+        }
+    }
+}
+
 impl From<ResolvedSkillSettings> for SkillSettingsResponse {
     fn from(settings: ResolvedSkillSettings) -> Self {
         Self {
             skill_name: settings.skill_name,
-            schema: settings.schema,
+            schema: settings.schema.into(),
             values: settings.values.into_iter().map(Into::into).collect(),
         }
     }
