@@ -85,7 +85,7 @@ async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 crossterm = "0.28"
-ratatui = "0.29"
+ratatui = "0.30"
 tui-textarea = "0.7"
 
 # Logging
@@ -104,8 +104,8 @@ redb = "2.4"
 zeroize = "1.8"
 
 # WASM runtime (pinned exact to keep wasmtime + wasmtime-wasi in lockstep)
-wasmtime = "=40.0.4"
-wasmtime-wasi = "=40.0.4"
+wasmtime = "=44.0.1"
+wasmtime-wasi = "=44.0.1"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
